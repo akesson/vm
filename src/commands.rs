@@ -53,7 +53,7 @@ pub fn ls() -> Result<i32> {
         let status = prl_vm.map_or("missing!", |p| p.status.as_str());
         let ip = prl_vm.and_then(|p| p.ip()).unwrap_or("-");
         let checkout = match &repo {
-            Some(repo) => mapping::guest_repo_path(vm.os, &vm.work_root, &repo.name),
+            Some(repo) => mapping::guest_repo_path(&vm.work_root, &repo.name),
             None => "- (not in a git repo)".to_string(),
         };
         println!(
@@ -103,7 +103,7 @@ pub fn agent_path(vm: &VmConfig) -> String {
     match &vm.agent_path {
         Some(path) => path.clone(),
         None => match vm.os {
-            GuestOs::Windows => r"%USERPROFILE%\.vm\bin\vm.exe".to_string(),
+            GuestOs::Windows => "~/.vm/bin/vm.exe".to_string(),
             GuestOs::Linux | GuestOs::Macos => "~/.vm/bin/vm".to_string(),
         },
     }
@@ -113,8 +113,11 @@ pub fn agent_path(vm: &VmConfig) -> String {
 /// agent's stderr, or a deploy hint when the binary is missing.
 pub fn agent_call(vm: &VmConfig, target: &SshTarget, args: &[&str]) -> Result<String> {
     let agent = agent_path(vm);
+    // POSIX-quote values (e.g. 'C:\work\syncfs' would lose its backslashes
+    // in bash otherwise); the agent path stays bare so `~` expands.
+    let quoted: Vec<String> = args.iter().map(|a| ssh::shell_quote(a)).collect();
     let mut remote: Vec<&str> = vec![&agent];
-    remote.extend_from_slice(args);
+    remote.extend(quoted.iter().map(String::as_str));
     let out = ssh::run_capture(target, &remote)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -136,7 +139,7 @@ pub fn agent_call(vm: &VmConfig, target: &SshTarget, args: &[&str]) -> Result<St
 /// Full sync of the current repo to a guest. Returns the verified snapshot.
 pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync::Snapshot> {
     let repo = mapping::RepoLocation::discover()?;
-    let guest_repo = mapping::guest_repo_path(vm.os, &vm.work_root, &repo.name);
+    let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
     let started = Instant::now();
 
     // 1. Make sure the guest repository exists (idempotent, cheap).

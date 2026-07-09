@@ -26,12 +26,18 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
-    pub fn read_from(mut input: impl Read) -> Result<ExecRequest> {
-        let mut buf = String::new();
-        input
-            .read_to_string(&mut buf)
+    /// Read one newline-terminated JSON request. The stream is deliberately
+    /// NOT read to EOF: the host keeps it open for the lifetime of the
+    /// command, and the agent watches it — EOF means the host or connection
+    /// died, and the whole process tree must be torn down (sshd sends no
+    /// signal on disconnect for no-PTY sessions).
+    pub fn read_from(input: impl Read) -> Result<ExecRequest> {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(input)
+            .read_line(&mut line)
             .context("reading ExecRequest from stdin")?;
-        let req: ExecRequest = serde_json::from_str(&buf).context("parsing ExecRequest JSON")?;
+        let req: ExecRequest = serde_json::from_str(&line).context("parsing ExecRequest JSON")?;
         if req.version != PROTO_VERSION {
             bail!(
                 "protocol version mismatch: host sent v{}, agent speaks v{PROTO_VERSION} \

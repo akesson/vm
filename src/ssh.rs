@@ -56,6 +56,19 @@ pub fn git_ssh_command() -> String {
     s
 }
 
+/// Quote an argument for the remote POSIX shell. Every guest presents a
+/// POSIX shell over ssh — Windows via Git Bash as the sshd DefaultShell.
+/// Args made only of safe characters stay bare so a leading `~` still
+/// expands; anything else is single-quoted.
+pub fn shell_quote(arg: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_./~:@=+".contains(c);
+    if !arg.is_empty() && arg.chars().all(safe) {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
 /// Run a remote command, capturing output (for plumbing calls).
 pub fn run_capture(target: &SshTarget, remote: &[&str]) -> Result<Output> {
     ssh_command(target)

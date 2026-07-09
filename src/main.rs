@@ -2,7 +2,19 @@ mod cli;
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use vm::{commands, proto, sync};
+use vm::exec::host::ExecOptions;
+use vm::{commands, deploy, exec, proto, sync};
+
+impl From<cli::ExecOpts> for ExecOptions {
+    fn from(opts: cli::ExecOpts) -> ExecOptions {
+        ExecOptions {
+            no_sync: opts.no_sync,
+            writeback: opts.writeback,
+            shell: opts.shell,
+            cmd: opts.cmd,
+        }
+    }
+}
 
 fn main() {
     let cli = cli::Cli::parse();
@@ -43,7 +55,10 @@ fn run(cli: cli::Cli) -> Result<i32> {
             Ok(0)
         }
 
-        Exec(_) | Run(_) | GuestExec | Deploy { .. } => bail!("exec agent lands in phase 4"),
+        Exec(args) => exec::host::exec(&args.alias, &args.opts.into()),
+        Run(args) => exec::host::run(args.os, &args.opts.into()),
+        GuestExec => exec::guest::exec(),
+        Deploy { alias } => deploy::deploy(&alias),
         Shot { .. } | WithSnapshot(_) | Doctor { .. } | Clean { .. } => {
             bail!("this verb lands in phase 7")
         }

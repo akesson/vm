@@ -3,6 +3,8 @@
 
 pub mod commands;
 pub mod config;
+pub mod deploy;
+pub mod exec;
 pub mod mapping;
 pub mod prl;
 pub mod proto;
