@@ -24,16 +24,19 @@ it to the guest via git objects. You never copy files yourself.
 
 ```sh
 vm ls                          # aliases, VM state, guest checkout paths
-vm exec <alias> -- <cmd>…      # sync repo, run cmd in guest checkout
-vm exec <alias> --no-sync -- <cmd>…    # skip sync (state queries, quick re-runs)
-vm exec <alias> --writeback -- <cmd>…  # pull guest file changes back to host
-                                       # (for guest-side fixers: clippy --fix, fmt)
-vm run --os <windows|linux|macos> -- <cmd>…  # by OS; runs NATIVELY if host OS
-                                             # matches (CI-safe), else routes to VM
+vm exec <target> -- <cmd>…     # sync repo, run cmd in guest checkout;
+                               # target = alias OR os name (windows|linux|macos)
+vm exec <target> --no-sync -- <cmd>…    # skip sync (state queries, quick re-runs)
+vm exec <target> --writeback -- <cmd>…  # pull guest file changes back to host
+                                        # (for guest-side fixers: clippy --fix, fmt)
 vm sync <alias>                # sync only
 vm start|stop|suspend <alias>  # lifecycle (start waits for ssh)
 vm deploy <alias>              # rebuild + install the guest agent (after vm src changes)
 ```
+
+**`vm` always executes in a VM — never on the host.** Even `vm exec macos`
+on a macOS host goes to the macOS VM. To run something natively, just run it;
+scripts that choose between native and VM do their own OS check.
 
 - Args after `--` arrive in the guest byte-identical (JSON over ssh, no shell
   quoting layer). `--shell` runs the command through `sh -c` / `cmd /C` instead.

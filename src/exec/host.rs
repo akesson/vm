@@ -1,4 +1,4 @@
-use crate::config::{Config, GuestOs, VmConfig};
+use crate::config::{Config, VmConfig};
 use crate::proto::{ExecRequest, PROTO_VERSION};
 use crate::{commands, mapping, prl, ssh, sync};
 use anyhow::{Context, Result};
@@ -15,22 +15,14 @@ pub struct ExecOptions {
     pub cmd: Vec<String>,
 }
 
-/// `vm exec <alias> -- cmd…`: sync, run in the guest checkout, propagate exit.
-pub fn exec(alias: &str, opts: &ExecOptions) -> Result<i32> {
+/// `vm exec <alias|os> -- cmd…`: sync, run in the guest checkout, propagate
+/// exit. The target is an alias or an OS name; either way it is always a VM
+/// — even when the OS named is the host's own — so a `vm` invocation never
+/// silently runs on the host (scripts that want native execution just run
+/// the command directly).
+pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
     let cfg = Config::load()?;
-    let vm = cfg.get(alias)?;
-    exec_in(alias, vm, opts)
-}
-
-/// `vm run --os <os> -- cmd…`: native passthrough when the host already is
-/// that OS (same mise task works on dev machine, in guests, and on CI);
-/// otherwise route to the configured VM.
-pub fn run(os: GuestOs, opts: &ExecOptions) -> Result<i32> {
-    if GuestOs::current() == os {
-        return run_native(opts);
-    }
-    let cfg = Config::load()?;
-    let (alias, vm) = cfg.find_by_os(os)?;
+    let (alias, vm) = cfg.resolve(target)?;
     exec_in(alias, vm, opts)
 }
 
@@ -117,29 +109,4 @@ fn writeback(
         eprintln!("vm ▸ {alias} ▸ writeback applied to host tree");
     }
     Ok(())
-}
-
-/// Passthrough: host OS already matches. Run in the current directory with
-/// untouched stdio and environment.
-fn run_native(opts: &ExecOptions) -> Result<i32> {
-    let mut cmd = if opts.shell {
-        let joined = opts.cmd.join(" ");
-        if cfg!(windows) {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", &joined]);
-            c
-        } else {
-            let mut c = std::process::Command::new("sh");
-            c.args(["-c", &joined]);
-            c
-        }
-    } else {
-        let mut c = std::process::Command::new(&opts.cmd[0]);
-        c.args(&opts.cmd[1..]);
-        c
-    };
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run {:?} natively", opts.cmd[0]))?;
-    Ok(status.code().unwrap_or(1))
 }

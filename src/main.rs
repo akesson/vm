@@ -55,8 +55,7 @@ fn run(cli: cli::Cli) -> Result<i32> {
             Ok(0)
         }
 
-        Exec(args) => exec::host::exec(&args.alias, &args.opts.into()),
-        Run(args) => exec::host::run(args.os, &args.opts.into()),
+        Exec(args) => exec::host::exec(&args.target, &args.opts.into()),
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),
         Shot { .. } | WithSnapshot(_) | Doctor { .. } | Clean { .. } => {

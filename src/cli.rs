@@ -1,8 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use vm::config::GuestOs;
-
 /// Run commands in Parallels VMs against a synced copy of the current repo.
 ///
 /// The host working tree is the single source of truth. Before every exec,
@@ -34,9 +32,6 @@ pub enum Command {
     Suspend { alias: String },
     /// Sync the current repo to a guest, then run a command in the guest checkout
     Exec(ExecArgs),
-    /// Run a command on a given OS: natively if the host OS matches,
-    /// otherwise in the VM configured for that OS
-    Run(RunArgs),
     /// Sync the current repo to a guest without running anything
     Sync { alias: String },
     /// Build and install the vm agent inside a guest
@@ -91,17 +86,9 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct ExecArgs {
-    /// VM alias from ~/.config/vm/config.toml
-    pub alias: String,
-    #[command(flatten)]
-    pub opts: ExecOpts,
-}
-
-#[derive(Args)]
-pub struct RunArgs {
-    /// Target OS; runs natively when the host OS matches
-    #[arg(long, value_enum)]
-    pub os: GuestOs,
+    /// VM alias from ~/.config/vm/config.toml, or an OS name
+    /// (windows | linux | macos) to pick the VM configured for that OS
+    pub target: String,
     #[command(flatten)]
     pub opts: ExecOpts,
 }
@@ -136,7 +123,7 @@ mod tests {
         let Command::Exec(exec) = cli.command else {
             panic!("expected exec");
         };
-        assert_eq!(exec.alias, "win");
+        assert_eq!(exec.target, "win");
         assert_eq!(exec.opts.cmd, ["cargo", "build", "--release"]);
         assert!(!exec.opts.shell);
     }
@@ -152,20 +139,23 @@ mod tests {
     }
 
     #[test]
-    fn run_targets_an_os() {
-        let cli = parse(&[
-            "vm", "run", "--os", "windows", "--", "cargo", "nextest", "run",
-        ]);
-        let Command::Run(run) = cli.command else {
-            panic!("expected run");
+    fn exec_target_can_be_an_os_name() {
+        let cli = parse(&["vm", "exec", "windows", "--", "cargo", "nextest", "run"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
         };
-        assert_eq!(run.os, GuestOs::Windows);
-        assert_eq!(run.opts.cmd, ["cargo", "nextest", "run"]);
+        assert_eq!(exec.target, "windows");
+        assert_eq!(exec.opts.cmd, ["cargo", "nextest", "run"]);
     }
 
     #[test]
     fn exec_requires_a_command() {
         assert!(Cli::try_parse_from(["vm", "exec", "win"]).is_err());
+    }
+
+    #[test]
+    fn exec_requires_a_target() {
+        assert!(Cli::try_parse_from(["vm", "exec"]).is_err());
     }
 
     #[test]

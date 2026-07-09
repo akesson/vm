@@ -39,15 +39,13 @@ pub enum GuestOs {
 }
 
 impl GuestOs {
-    /// The OS this `vm` process is running on, if it is one we target.
-    #[allow(dead_code)] // used from phase 4 (run --os passthrough)
-    pub fn current() -> GuestOs {
-        if cfg!(target_os = "windows") {
-            GuestOs::Windows
-        } else if cfg!(target_os = "macos") {
-            GuestOs::Macos
-        } else {
-            GuestOs::Linux
+    /// The OS names accepted as exec targets.
+    pub fn parse(s: &str) -> Option<GuestOs> {
+        match s {
+            "windows" => Some(GuestOs::Windows),
+            "linux" => Some(GuestOs::Linux),
+            "macos" => Some(GuestOs::Macos),
+            _ => None,
         }
     }
 }
@@ -83,8 +81,24 @@ impl Config {
         })
     }
 
+    /// Resolve an exec target: an alias, or an OS name (`windows` | `linux` |
+    /// `macos`) selecting the single VM configured for that OS. Aliases win
+    /// on collision. Never resolves to the host — `vm` always targets a VM.
+    pub fn resolve(&self, target: &str) -> Result<(&str, &VmConfig)> {
+        if let Some((alias, vm)) = self.vm.get_key_value(target) {
+            return Ok((alias.as_str(), vm));
+        }
+        if let Some(os) = GuestOs::parse(target) {
+            return self.find_by_os(os);
+        }
+        let known: Vec<&str> = self.vm.keys().map(String::as_str).collect();
+        bail!(
+            "unknown target '{target}' — expected a configured alias ({}) or an OS name (windows, linux, macos)",
+            known.join(", ")
+        )
+    }
+
     /// Find the (single) VM configured for an OS.
-    #[allow(dead_code)] // used from phase 4 (run --os)
     pub fn find_by_os(&self, os: GuestOs) -> Result<(&str, &VmConfig)> {
         let mut matches = self.vm.iter().filter(|(_, vm)| vm.os == os);
         let Some((alias, vm)) = matches.next() else {
@@ -154,6 +168,22 @@ mod tests {
         let cfg = Config::parse(SAMPLE).unwrap();
         let (alias, _) = cfg.find_by_os(GuestOs::Linux).unwrap();
         assert_eq!(alias, "lin");
+    }
+
+    #[test]
+    fn resolve_prefers_alias_then_falls_back_to_os_name() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        assert_eq!(cfg.resolve("win").unwrap().0, "win");
+        assert_eq!(cfg.resolve("windows").unwrap().0, "win");
+        assert_eq!(cfg.resolve("macos").unwrap().0, "mac");
+    }
+
+    #[test]
+    fn resolve_rejects_unknown_target_mentioning_both_forms() {
+        let cfg = Config::parse(SAMPLE).unwrap();
+        let err = cfg.resolve("ios").unwrap_err().to_string();
+        assert!(err.contains("lin, mac, win"), "{err}");
+        assert!(err.contains("windows, linux, macos"), "{err}");
     }
 
     #[test]
