@@ -99,11 +99,10 @@ mod tests {
     #[test]
     fn expand_home_expands_tilde() {
         let p = expand_home("~/work/repo").unwrap();
-        assert!(!p.to_string_lossy().contains('~'));
-        assert!(p.to_string_lossy().ends_with(if cfg!(windows) {
-            "work\\repo"
-        } else {
-            "work/repo"
-        }));
+        let p = p.to_string_lossy().replace('\\', "/");
+        // On Windows the home prefix uses `\` but the joined tail keeps `/`;
+        // compare separator-normalized.
+        assert!(!p.contains('~'));
+        assert!(p.ends_with("work/repo"));
     }
 }

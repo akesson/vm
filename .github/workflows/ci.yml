@@ -41,6 +41,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest,cargo-llvm-cov,cargo-binstall
-      - run: cargo binstall -y cargo-crap
+      - run: cargo binstall -y --force cargo-crap  # --force: rust-cache restores .crates.toml without the binary
       - run: cargo llvm-cov nextest --lcov --output-path target/lcov.info
       - run: cargo crap --lcov target/lcov.info
