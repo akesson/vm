@@ -7,9 +7,11 @@ use std::process::Command;
 /// plus where the current dir sits inside it (commands run in the corresponding
 /// guest directory).
 pub struct RepoLocation {
+    #[allow(dead_code)] // used from phase 3 (sync)
     pub root: PathBuf,
     pub name: String,
     /// Current dir relative to the repo root ("" when at the root)
+    #[allow(dead_code)] // used from phase 4 (exec cwd)
     pub rel: PathBuf,
 }
 
@@ -50,7 +52,21 @@ pub fn guest_repo_path(os: GuestOs, work_root: &str, repo_name: &str) -> String 
     format!("{root}{}{repo_name}", sep(os))
 }
 
+/// ssh:// URL for git push/fetch against the guest checkout's repository.
+/// `~/`-relative paths use git's `/~/` form (resolved by the remote shell);
+/// Windows drive paths become `/C:/…` with forward slashes.
+pub fn ssh_remote_url(user: &str, host: &str, guest_repo_path: &str) -> String {
+    let path = guest_repo_path.replace('\\', "/");
+    let path = match path {
+        p if p.starts_with("~/") => format!("/~/{}", &p[2..]),
+        p if p.starts_with('/') => p,
+        p => format!("/{p}"), // e.g. "C:/work/repo"
+    };
+    format!("ssh://{user}@{host}{path}")
+}
+
 /// Guest working directory for a host location inside the repo.
+#[allow(dead_code)] // used from phase 4 (exec)
 pub fn guest_cwd(os: GuestOs, work_root: &str, repo_name: &str, rel: &Path) -> Result<String> {
     let mut path = guest_repo_path(os, work_root, repo_name);
     for comp in rel.components() {
@@ -119,5 +135,21 @@ mod tests {
     #[test]
     fn cwd_rejects_parent_components() {
         assert!(guest_cwd(GuestOs::Linux, "~/w", "r", Path::new("../escape")).is_err());
+    }
+
+    #[test]
+    fn remote_urls_for_each_path_style() {
+        assert_eq!(
+            ssh_remote_url("parallels", "10.211.55.4", "~/work/syncfs"),
+            "ssh://parallels@10.211.55.4/~/work/syncfs"
+        );
+        assert_eq!(
+            ssh_remote_url("hakesson", "10.211.55.5", r"C:\work\syncfs"),
+            "ssh://hakesson@10.211.55.5/C:/work/syncfs"
+        );
+        assert_eq!(
+            ssh_remote_url("henrik", "mac-vm.local", "/Users/henrik/work/vm"),
+            "ssh://henrik@mac-vm.local/Users/henrik/work/vm"
+        );
     }
 }

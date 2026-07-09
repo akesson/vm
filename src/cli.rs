@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::config::GuestOs;
+use vm::config::GuestOs;
 
 /// Run commands in Parallels VMs against a synced copy of the current repo.
 ///
@@ -61,6 +61,13 @@ pub enum Command {
     /// Run a command described by an ExecRequest (JSON on stdin)
     #[command(name = "_exec", hide = true)]
     GuestExec,
+    /// Create and configure the local checkout repository if missing
+    #[command(name = "_sync-init", hide = true)]
+    GuestSyncInit {
+        /// Path of the guest checkout ('~/' prefix allowed)
+        #[arg(long)]
+        repo: String,
+    },
     /// Apply a synced commit to the local checkout and print its tree hash
     #[command(name = "_sync-apply", hide = true)]
     GuestSyncApply {

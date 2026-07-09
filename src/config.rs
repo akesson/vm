@@ -26,6 +26,7 @@ pub struct VmConfig {
     /// Hostname/IP override; by default the IP is discovered via prlctl
     pub host: Option<String>,
     /// Path of the vm agent binary in the guest (default: <home>/.vm/bin/vm[.exe])
+    #[allow(dead_code)] // used from phase 4 (deploy/exec)
     pub agent_path: Option<String>,
 }
 
@@ -39,6 +40,7 @@ pub enum GuestOs {
 
 impl GuestOs {
     /// The OS this `vm` process is running on, if it is one we target.
+    #[allow(dead_code)] // used from phase 4 (run --os passthrough)
     pub fn current() -> GuestOs {
         if cfg!(target_os = "windows") {
             GuestOs::Windows
@@ -82,6 +84,7 @@ impl Config {
     }
 
     /// Find the (single) VM configured for an OS.
+    #[allow(dead_code)] // used from phase 4 (run --os)
     pub fn find_by_os(&self, os: GuestOs) -> Result<(&str, &VmConfig)> {
         let mut matches = self.vm.iter().filter(|(_, vm)| vm.os == os);
         let Some((alias, vm)) = matches.next() else {
