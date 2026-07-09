@@ -104,6 +104,30 @@ pub fn capture(name: &str, file: &str) -> Result<()> {
     prlctl(&["capture", name, "--file", file]).map(drop)
 }
 
+/// Create a snapshot and return its id (a `{uuid}` string).
+pub fn snapshot_create(name: &str, snap_name: &str) -> Result<String> {
+    let out = prlctl(&["snapshot", name, "--name", snap_name])?;
+    parse_snapshot_id(&out)
+        .ok_or_else(|| anyhow::anyhow!("could not find a snapshot id in prlctl output: {out}"))
+}
+
+/// Roll the VM back to a snapshot (restores disk AND run state).
+pub fn snapshot_switch(name: &str, id: &str) -> Result<()> {
+    prlctl(&["snapshot-switch", name, "--id", id]).map(drop)
+}
+
+pub fn snapshot_delete(name: &str, id: &str) -> Result<()> {
+    prlctl(&["snapshot-delete", name, "--id", id]).map(drop)
+}
+
+/// prlctl prints e.g. `The snapshot with id {8b171e2f-…} has been successfully
+/// created.` — pull out the braced id.
+fn parse_snapshot_id(out: &str) -> Option<String> {
+    let start = out.find('{')?;
+    let end = out[start..].find('}')? + start;
+    Some(out[start..=end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +142,16 @@ mod tests {
         assert_eq!(vms.len(), 2);
         assert_eq!(vms[0].ip(), None);
         assert_eq!(vms[1].ip(), Some("10.211.55.4"));
+    }
+
+    #[test]
+    fn extracts_snapshot_id_from_prlctl_output() {
+        let out = "Creating the snapshot...\nThe snapshot with id {8b171e2f-4b7f-4e01-a689-a2d360d63e49} has been successfully created.\n";
+        assert_eq!(
+            parse_snapshot_id(out).as_deref(),
+            Some("{8b171e2f-4b7f-4e01-a689-a2d360d63e49}")
+        );
+        assert_eq!(parse_snapshot_id("no id here"), None);
     }
 
     #[test]

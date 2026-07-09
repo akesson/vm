@@ -199,3 +199,73 @@ pub fn suspend(alias: &str) -> Result<i32> {
     eprintln!("vm ▸ {alias} ▸ suspended");
     Ok(0)
 }
+
+/// `vm shot <alias> [file]`: screenshot the VM display. Useful for seeing GUI
+/// state ssh can't (TCC dialogs, login screens, stuck installers).
+pub fn shot(alias: &str, file: Option<std::path::PathBuf>) -> Result<i32> {
+    let cfg = Config::load()?;
+    let vm = cfg.get(alias)?;
+    let file = file.unwrap_or_else(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::path::PathBuf::from(format!("{alias}-{secs}.png"))
+    });
+    let path = file.to_string_lossy().into_owned();
+    prl::capture(&vm.parallels_name, &path)?;
+    eprintln!("vm ▸ {alias} ▸ screenshot ▸ {path}");
+    Ok(0)
+}
+
+/// `vm clean <alias>`: delete the guest checkout of the current repo. Only
+/// replica state is lost — the next exec/sync recreates it (cold build).
+pub fn clean(alias: &str) -> Result<i32> {
+    let cfg = Config::load()?;
+    let vm = cfg.get(alias)?;
+    let repo = mapping::RepoLocation::discover()?;
+    let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
+    prl::ensure_running(&vm.parallels_name)?;
+    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    let target = ssh_target(vm)?;
+    // All guests speak POSIX (Windows sshd shell is Git Bash).
+    let quoted = ssh::shell_quote(&guest_repo);
+    let out = ssh::run_capture(&target, &["rm", "-rf", &quoted])?;
+    if !out.status.success() {
+        bail!(
+            "removing {guest_repo} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    eprintln!("vm ▸ {alias} ▸ removed {guest_repo}");
+    Ok(0)
+}
+
+/// `vm with-snapshot <target> -- cmd…`: snapshot, run, roll back, delete the
+/// snapshot. The guest ends up exactly as it started — for destructive or
+/// state-polluting experiments (installers, registry edits, config trials).
+pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Result<i32> {
+    let cfg = Config::load()?;
+    let (alias, vm) = cfg.resolve(target)?;
+    if vm.os == GuestOs::Macos {
+        bail!("Parallels cannot snapshot macOS guests on Apple Silicon");
+    }
+    prl::ensure_running(&vm.parallels_name)?;
+    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+
+    let id = prl::snapshot_create(&vm.parallels_name, &format!("vm-with-snapshot-{alias}"))?;
+    eprintln!("vm ▸ {alias} ▸ snapshot {id} taken");
+    let run = crate::exec::host::exec(alias, opts);
+    // Roll back even when the command failed — that's the whole point.
+    let restore = prl::snapshot_switch(&vm.parallels_name, &id)
+        .and_then(|()| prl::snapshot_delete(&vm.parallels_name, &id));
+    match restore {
+        Ok(()) => eprintln!("vm ▸ {alias} ▸ rolled back to pre-run state"),
+        Err(err) => eprintln!(
+            "vm ▸ {alias} ▸ WARNING: rollback failed ({err:#}); snapshot {id} kept — \
+             restore manually with `prlctl snapshot-switch '{}' --id '{id}'`",
+            vm.parallels_name
+        ),
+    }
+    run
+}

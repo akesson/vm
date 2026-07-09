@@ -1,9 +1,9 @@
 mod cli;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
 use vm::exec::host::ExecOptions;
-use vm::{commands, deploy, exec, proto, sync};
+use vm::{commands, deploy, doctor, exec, proto, sync};
 
 impl From<cli::ExecOpts> for ExecOptions {
     fn from(opts: cli::ExecOpts) -> ExecOptions {
@@ -58,8 +58,9 @@ fn run(cli: cli::Cli) -> Result<i32> {
         Exec(args) => exec::host::exec(&args.target, &args.opts.into()),
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),
-        Shot { .. } | WithSnapshot(_) | Doctor { .. } | Clean { .. } => {
-            bail!("this verb lands in phase 7")
-        }
+        Shot { alias, file } => commands::shot(&alias, file),
+        WithSnapshot(args) => commands::with_snapshot(&args.target, &args.opts.into()),
+        Doctor { alias } => doctor::doctor(alias.as_deref()),
+        Clean { alias } => commands::clean(&alias),
     }
 }

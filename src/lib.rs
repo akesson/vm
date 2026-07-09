@@ -4,6 +4,7 @@
 pub mod commands;
 pub mod config;
 pub mod deploy;
+pub mod doctor;
 pub mod exec;
 pub mod mapping;
 pub mod prl;

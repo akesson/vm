@@ -32,6 +32,12 @@ vm exec <target> --writeback -- <cmd>…  # pull guest file changes back to host
 vm sync <alias>                # sync only
 vm start|stop|suspend <alias>  # lifecycle (start waits for ssh)
 vm deploy <alias>              # rebuild + install the guest agent (after vm src changes)
+vm doctor [alias]              # check prlctl/config/ssh/agent/git per guest (read-only)
+vm shot <alias> [file.png]     # screenshot the VM display (see GUI dialogs ssh can't)
+vm clean <alias>               # delete the guest checkout of this repo (next sync recreates)
+vm with-snapshot <target> -- <cmd>…  # snapshot, run, roll back — guest ends up
+                                     # untouched (win/lin only; reverts EVERYTHING
+                                     # since the snapshot, including the pre-run sync)
 ```
 
 **`vm` always executes in a VM — never on the host.** Even `vm exec macos`
