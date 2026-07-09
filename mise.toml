@@ -1,0 +1,36 @@
+[tools]
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-llvm-cov" = "latest"
+"cargo:cargo-crap" = "latest"
+
+[tasks.build]
+run = "cargo build"
+description = "Build the vm binary"
+
+[tasks.test]
+run = "cargo nextest run"
+description = "Run tests"
+
+[tasks.lint]
+usage = 'flag "--check" help="Check only, do not auto-fix"'
+run = '''
+if [ "${usage_check}" = "true" ]; then
+  cargo fmt --all -- --check
+  cargo clippy --all-targets -- -D warnings
+else
+  cargo fmt --all
+  cargo clippy --all-targets --fix --allow-dirty -- -D warnings
+fi
+'''
+description = "Format and lint (--check for CI mode)"
+
+[tasks.crap]
+run = """
+cargo llvm-cov nextest --lcov --output-path target/lcov.info
+cargo crap --lcov target/lcov.info
+"""
+description = "Rank complex-and-untested functions (CRAP metric)"
+
+[tasks.install]
+run = "cargo install --path . --locked"
+description = "Install vm into ~/.cargo/bin"
