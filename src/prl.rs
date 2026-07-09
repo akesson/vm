@@ -14,8 +14,13 @@ pub struct PrlVm {
 }
 
 impl PrlVm {
+    /// The guest's usable IP, or None while it has none yet. A waking VM
+    /// briefly reports only a link-local IPv6 (fe80::…) which isn't routable
+    /// without a zone id — treat that the same as "no IP yet" and keep
+    /// waiting for the DHCP address.
     pub fn ip(&self) -> Option<&str> {
-        (self.ip_configured != "-").then_some(self.ip_configured.as_str())
+        let ip = self.ip_configured.as_str();
+        (ip != "-" && !ip.starts_with("fe80:")).then_some(ip)
     }
 }
 
@@ -113,5 +118,18 @@ mod tests {
         assert_eq!(vms.len(), 2);
         assert_eq!(vms[0].ip(), None);
         assert_eq!(vms[1].ip(), Some("10.211.55.4"));
+    }
+
+    #[test]
+    fn link_local_ipv6_is_not_an_ip_yet() {
+        // Seen live: a resuming Windows guest reports its link-local IPv6
+        // before DHCP completes; ssh to it fails with "No route to host".
+        let vm = PrlVm {
+            uuid: "{x}".into(),
+            status: "running".into(),
+            ip_configured: "fe80::bcca:2118:95a7:5e25".into(),
+            name: "Windows 11".into(),
+        };
+        assert_eq!(vm.ip(), None);
     }
 }

@@ -39,7 +39,7 @@ pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
     {
         g.run(&["read-tree", head])?;
     }
-    g.run(&["add", "-A"])?;
+    add_all_with_lock_retry(&g)?;
     let tree = g.out(&["write-tree"])?;
 
     let commit = match &head {
@@ -47,6 +47,25 @@ pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
         None => g.commit_tree(&tree, None)?,
     };
     Ok(Snapshot { commit, tree })
+}
+
+/// Concurrent syncs to the same peer (parallel mise tasks) contend on the
+/// alternate index's .lock file; git fails instead of waiting. Retry briefly
+/// — snapshots are fast, so contention clears in well under a second.
+fn add_all_with_lock_retry(g: &Git) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match g.run(&["add", "-A"]) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.to_string().contains(".lock") => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err.context("snapshot index stayed locked for 20s"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Expand a leading `~/` against the platform home directory. Guest-side:

@@ -21,9 +21,13 @@ pub fn sync_to(
     };
     // Force-update: successive snapshots share a parent (host HEAD), so they
     // are never fast-forwards of each other. refs/sync/head is ours alone.
+    // --no-verify: this push is replication plumbing, not publishing — the
+    // repo's pre-push hook (test suites, lints…) must not run, and via
+    // exec wrappers it could even recurse back into `vm` itself.
     git.run(&[
         "push",
         "--quiet",
+        "--no-verify",
         remote_url,
         &format!("+{}:refs/sync/head", snap.commit),
     ])

@@ -248,6 +248,28 @@ fn writeback_of_unchanged_guest_is_a_noop() {
 }
 
 #[test]
+#[cfg(unix)] // hook script; the bypass logic itself is platform-independent
+fn sync_push_skips_pre_push_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+    let repos = setup();
+    // A pre-push hook that always fails — like a repo whose hook runs the
+    // full test suite (and might even recurse into `vm` itself). Sync pushes
+    // are replication plumbing and must bypass it.
+    let hook_dir = repos.host.join(".githooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("pre-push");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho 'pre-push hook must not run' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    git(&repos.host, &["config", "core.hooksPath", ".githooks"]);
+
+    sync(&repos); // fails if the hook fires
+}
+
+#[test]
 fn sync_works_in_repo_with_no_commits() {
     let tmp = tempfile::tempdir().unwrap();
     let host_dir = tmp.path().join("fresh");

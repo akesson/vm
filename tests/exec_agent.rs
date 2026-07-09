@@ -48,7 +48,10 @@ fn runs_argv_in_cwd_and_captures_output() {
 fn propagates_nonzero_exit_codes() {
     let tmp = tempfile::tempdir().unwrap();
     // `vm definitely-not-a-verb` exits 2 (clap usage error).
-    let (code, _) = agent_exec(&[VM_BIN, "definitely-not-a-verb"], tmp.path().to_str().unwrap());
+    let (code, _) = agent_exec(
+        &[VM_BIN, "definitely-not-a-verb"],
+        tmp.path().to_str().unwrap(),
+    );
     assert_eq!(code, 2);
 }
 
