@@ -1,7 +1,8 @@
 //! Linux tier-0 checks: session-bus discovery (with the systemd
 //! `/run/user/<uid>/bus` fallback a bare ssh env needs), the AT-SPI
 //! accessibility bus, and whether the registry root has any accessible
-//! applications.
+//! applications. Tier-1: spawn a zenity fixture window and find it through
+//! the registry by title.
 
 use atspi::connection::AccessibilityConnection;
 use atspi::zbus;
@@ -141,6 +142,90 @@ async fn run_inner() -> Report {
         ),
         Err(e) => r.fail("registry-children", format!("cannot read child count: {e}")),
     }
+    if !r.ok() {
+        return r;
+    }
 
+    fixture_check(&mut r, &conn).await;
     r
+}
+
+/// Tier-1: spawn a zenity dialog with a unique title and find its frame
+/// through the AT-SPI registry — proves cross-process window discovery, not
+/// just that the bus answers.
+async fn fixture_check(r: &mut Report, conn: &AccessibilityConnection) {
+    let title = format!("a11y-fixture-{}", std::process::id());
+    let mut cmd = std::process::Command::new("zenity");
+    cmd.args(["--info", "--title", &title, "--text", "a11y-probe fixture"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // A bare ssh env has no display; the compositor's Wayland socket lives
+    // next to the session bus socket we already discovered.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+        let runtime_dir = format!("/run/user/{}", unsafe { libc::getuid() });
+        if std::path::Path::new(&runtime_dir)
+            .join("wayland-0")
+            .exists()
+        {
+            cmd.env("XDG_RUNTIME_DIR", &runtime_dir)
+                .env("WAYLAND_DISPLAY", "wayland-0");
+        } else {
+            cmd.env("DISPLAY", ":0");
+        }
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            r.fail("fixture-spawn", format!("cannot spawn zenity: {e}"));
+            return;
+        }
+    };
+    r.pass("fixture-spawn", format!("zenity pid {}", child.id()));
+
+    let found = find_frame(conn, &title).await;
+    let _ = child.kill();
+    let _ = child.wait();
+    match found {
+        Ok(Some(app)) => r.pass(
+            "fixture-window",
+            format!("found frame {title:?} under application {app:?}"),
+        ),
+        Ok(None) => r.fail(
+            "fixture-window",
+            format!("no frame named {title:?} appeared in the registry within 10s"),
+        ),
+        Err(e) => r.fail("fixture-window", format!("registry walk failed: {e}")),
+    }
+}
+
+/// Poll the registry (applications → their top-level frames) for a frame
+/// with the given name; returns the owning application's name.
+async fn find_frame(
+    conn: &AccessibilityConnection,
+    title: &str,
+) -> Result<Option<String>, atspi::AtspiError> {
+    use atspi::proxy::accessible::ObjectRefExt;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let root = conn.root_accessible_on_registry().await?;
+        for app_ref in root.get_children().await? {
+            let Ok(app) = app_ref.as_accessible_proxy(conn.connection()).await else {
+                continue;
+            };
+            for frame_ref in app.get_children().await.unwrap_or_default() {
+                let Ok(frame) = frame_ref.into_accessible_proxy(conn.connection()).await else {
+                    continue;
+                };
+                if frame.name().await.unwrap_or_default() == title {
+                    let app_name = app.name().await.unwrap_or_default();
+                    return Ok(Some(app_name));
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }

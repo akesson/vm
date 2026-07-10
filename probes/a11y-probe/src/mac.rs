@@ -1,6 +1,7 @@
 //! macOS tier-0 checks: window-server session, TCC Accessibility trust, and
 //! reading a known app's AX tree. The Dock is the target app — it is always
-//! running when a user is logged in at the console.
+//! running when a user is logged in at the console. Tier-1: spawn an
+//! osascript dialog and find its window through the AX API by title.
 
 use std::ptr::NonNull;
 
@@ -100,8 +101,79 @@ pub fn run() -> Report {
             format!("cannot read Dock AXChildren: {}", ax_err(err)),
         ),
     }
+    if !r.ok() {
+        return r;
+    }
 
+    fixture_check(&mut r);
     r
+}
+
+/// Tier-1: spawn an osascript dialog with a unique title and find its window
+/// through the AX API — proves cross-process window discovery against a
+/// process we started, not just reading the long-running Dock.
+fn fixture_check(r: &mut Report) {
+    let title = format!("a11y-fixture-{}", std::process::id());
+    let script = format!(
+        "display dialog \"a11y-probe fixture\" with title \"{title}\" \
+         buttons {{\"OK\"}} giving up after 30"
+    );
+    let mut child = match std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            r.fail("fixture-spawn", format!("cannot spawn osascript: {e}"));
+            return;
+        }
+    };
+    r.pass("fixture-spawn", format!("osascript pid {}", child.id()));
+
+    let found = find_window(child.id() as i32, &title);
+    let _ = child.kill();
+    let _ = child.wait();
+    if found {
+        r.pass("fixture-window", format!("found window {title:?} via AX"));
+    } else {
+        r.fail(
+            "fixture-window",
+            format!("no window titled {title:?} appeared in the AX tree within 10s"),
+        );
+    }
+}
+
+/// Poll the fixture process's AX element for a window with the given title.
+/// AX errors while polling are expected (the app element isn't ready until
+/// the dialog is up), so they just mean "keep waiting".
+fn find_window(pid: i32, title: &str) -> bool {
+    let app = unsafe { AXUIElement::new_application(pid) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(value) = copy_attribute(&app, "AXWindows")
+            && let Ok(windows) = value.downcast::<CFArray>()
+        {
+            let windows = unsafe { windows.cast_unchecked::<AXUIElement>() };
+            for i in 0..windows.len() {
+                let Some(window) = windows.get(i) else {
+                    continue;
+                };
+                let window_title = copy_attribute(&window, "AXTitle")
+                    .ok()
+                    .and_then(|t| t.downcast::<CFString>().ok())
+                    .map(|s| s.to_string());
+                if window_title.as_deref() == Some(title) {
+                    return true;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 fn dock_pid() -> Option<i32> {
