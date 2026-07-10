@@ -29,6 +29,9 @@ vm exec <target> -- <cmd>…     # sync repo, run cmd in guest checkout;
 vm exec <target> --no-sync -- <cmd>…    # skip sync (state queries, quick re-runs)
 vm exec <target> --writeback -- <cmd>…  # pull guest file changes back to host
                                         # (for guest-side fixers: clippy --fix, fmt)
+vm exec <target> -e NAME=value -- <cmd>…  # set env var for the guest command;
+                                          # -e NAME forwards the host's value.
+                                          # Repeatable; put -e before the --
 vm sync <alias>                # sync only
 vm start|stop <alias>          # lifecycle (start waits for ssh; stop refuses while
                                # other vm processes use the VM — --force overrides;
@@ -58,6 +61,10 @@ scripts that choose between native and VM do their own OS check.
 - Args after `--` arrive in the guest byte-identical (JSON to a guest agent,
   no shell quoting layer). `--shell` runs the command through `sh -c` /
   `cmd /C` instead.
+- `-e NAME=value` sets an env var for the guest process, and `-e NAME` forwards
+  the host's current value (errors if unset). It rides the same JSON channel as
+  the args — identical on `cmd` and `sh` guests, no `--shell` needed, process-
+  scoped. Don't forward `PATH` (it would shadow the guest's own tool paths).
 - Commands run where GUI automation works on every OS: Windows exec rides
   `prlctl exec` into the console session (ssh would land in session 0 with an
   empty desktop); unix guests go over ssh, which reaches AT-SPI / the AX API

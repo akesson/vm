@@ -164,6 +164,10 @@ pub struct ExecOpts {
     /// Run through the guest shell (enables pipes/redirection; argv is joined)
     #[arg(long)]
     pub shell: bool,
+    /// Set an env var for the guest command: `-e NAME=value`, or `-e NAME`
+    /// to forward the host's current value. Repeatable.
+    #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
+    pub env: Vec<String>,
     /// Command and arguments to run in the guest checkout
     #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
     pub cmd: Vec<String>,
@@ -196,6 +200,18 @@ mod tests {
         };
         assert!(exec.opts.no_sync);
         assert_eq!(exec.opts.cmd, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn exec_collects_repeated_env_flags_before_the_command() {
+        let cli = parse(&[
+            "vm", "exec", "win", "-e", "FOO=bar", "--env", "BAZ", "--", "cargo", "test",
+        ]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.env, ["FOO=bar", "BAZ"]);
+        assert_eq!(exec.opts.cmd, ["cargo", "test"]);
     }
 
     #[test]
