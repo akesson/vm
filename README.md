@@ -6,6 +6,7 @@ tool, installed on the host **and** in every guest.
 ```sh
 vm run --os windows -- cargo nextest run -p my-windows-crate
 vm exec lin -- cargo clippy --fix --writeback
+vm claude win "fix the test that only fails on Windows"
 vm ls
 ```
 
@@ -25,6 +26,19 @@ vm ls
   Windows exec: `prlctl exec` carries the command into the console session
   (ssh children land in session 0, where UIA and other GUI APIs see an empty
   desktop), so GUI automation works on all three guests with plain `vm exec`.
+
+## Claude in a VM
+
+`vm claude <target> "<prompt>"` runs Claude Code headless (`claude -p`) in
+the guest checkout. The VM is the permission boundary, so Claude runs with
+`--dangerously-skip-permissions` — it can do anything inside the guest, but
+the host tree only ever receives the writeback diff (on by default; opt out
+with `--no-writeback`). Add `--with-snapshot` to roll the guest itself back
+afterwards, so nothing survives the run but the diff. Extra flags after the
+prompt go to claude verbatim (e.g. `--model sonnet`).
+
+Requires the `claude` CLI installed and logged in inside the guest —
+`vm doctor` checks both.
 
 ## Setup
 

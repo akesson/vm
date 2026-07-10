@@ -160,6 +160,8 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             _ => r.fail("work_root", &format!("{} not writable", vm.work_root)),
         }
 
+        claude_checks(&mut r, &target);
+
         if vm.os == GuestOs::Windows {
             console_checks(&mut r, vm);
         }
@@ -172,6 +174,56 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
         eprintln!("vm ▸ doctor ▸ {} problem(s)", r.failures);
         Ok(1)
     }
+}
+
+/// `vm claude` needs the claude CLI installed and authenticated in the guest.
+/// Not installed → skip (the feature is optional); installed but without
+/// credentials → fail (a half-configured guest would only surface later as a
+/// confusing `vm claude` runtime error).
+fn claude_checks(r: &mut Report, target: &ssh::SshTarget) {
+    // Prepend the same per-user dirs the exec agent does (see
+    // exec::guest::augmented_path): non-interactive ssh gets a bare PATH
+    // that misses ~/.local/bin, where claude usually lives.
+    const PATH: &str = r#"PATH="$HOME/bin:$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.vm/bin:$PATH""#;
+    let version = format!("{PATH} claude --version");
+    match ssh::run_capture(target, &["sh", "-c", &ssh::shell_quote(&version)]) {
+        Ok(out) if out.status.success() => {
+            r.ok("claude", String::from_utf8_lossy(&out.stdout).trim());
+        }
+        _ => {
+            r.skip("claude", "not installed — needed only for `vm claude`");
+            return;
+        }
+    }
+    // A real probe call rather than a credentials-presence check: a stale
+    // OAuth login looks authenticated on disk and only 401s on use. Costs
+    // one haiku call and a few seconds — doctor's slowest check.
+    let auth = format!(r#"{PATH} claude -p --model haiku "say hi""#);
+    match ssh::run_capture(target, &["sh", "-c", &ssh::shell_quote(&auth)]) {
+        Ok(out) if out.status.success() => {
+            r.ok(
+                "claude auth",
+                &format!("probe replied: {}", first_line(&out.stdout)),
+            );
+        }
+        Ok(out) => {
+            let detail = if out.stderr.is_empty() {
+                first_line(&out.stdout)
+            } else {
+                first_line(&out.stderr)
+            };
+            r.fail(
+                "claude auth",
+                &format!("probe failed: {detail} — log in inside the guest (run `claude`)"),
+            );
+        }
+        Err(err) => r.fail("claude auth", &format!("probe failed: {err:#}")),
+    }
+}
+
+fn first_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.trim().lines().next().unwrap_or("(no output)").into()
 }
 
 /// Windows exec rides `prlctl exec --current-user` into the console session

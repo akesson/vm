@@ -45,6 +45,13 @@ pub enum Command {
     },
     /// Snapshot a VM, run a command, then roll back
     WithSnapshot(ExecArgs),
+    /// Run Claude Code headless in the guest checkout of the current repo
+    ///
+    /// Syncs the repo, runs `claude -p` with permission prompts bypassed —
+    /// the VM is the permission boundary — and applies source edits back to
+    /// the host tree (writeback) when it finishes. Requires the claude CLI
+    /// installed and authenticated in the guest (`vm doctor` verifies).
+    Claude(ClaudeArgs),
     /// Suspend VMs that no vm process is using and that have been idle a while
     /// (any `vm exec` resumes them in about a second)
     Reap {
@@ -110,6 +117,26 @@ pub struct ExecArgs {
 }
 
 #[derive(Args)]
+pub struct ClaudeArgs {
+    /// VM alias from ~/.config/vm/config.toml, or an OS name
+    /// (windows | linux | macos) to pick the VM configured for that OS
+    pub target: String,
+    /// Prompt for the headless run
+    pub prompt: String,
+    /// Snapshot the VM first and roll it back afterwards — the guest keeps
+    /// nothing; only the writeback diff survives the run
+    #[arg(long)]
+    pub with_snapshot: bool,
+    /// Leave Claude's source edits in the guest instead of applying them
+    /// back to the host tree
+    #[arg(long)]
+    pub no_writeback: bool,
+    /// Extra arguments passed to claude verbatim (e.g. --model sonnet)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub claude_args: Vec<String>,
+}
+
+#[derive(Args)]
 pub struct ExecOpts {
     /// Skip the pre-exec sync (run against the guest checkout as-is)
     #[arg(long)]
@@ -172,6 +199,43 @@ mod tests {
     #[test]
     fn exec_requires_a_target() {
         assert!(Cli::try_parse_from(["vm", "exec"]).is_err());
+    }
+
+    #[test]
+    fn claude_takes_prompt_then_passthrough_args() {
+        let cli = parse(&["vm", "claude", "lin", "fix the test", "--model", "sonnet"]);
+        let Command::Claude(args) = cli.command else {
+            panic!("expected claude");
+        };
+        assert_eq!(args.target, "lin");
+        assert_eq!(args.prompt, "fix the test");
+        assert_eq!(args.claude_args, ["--model", "sonnet"]);
+        assert!(!args.with_snapshot);
+        assert!(!args.no_writeback);
+    }
+
+    #[test]
+    fn claude_own_flags_parse_before_the_prompt() {
+        let cli = parse(&[
+            "vm",
+            "claude",
+            "lin",
+            "--with-snapshot",
+            "--no-writeback",
+            "do it",
+        ]);
+        let Command::Claude(args) = cli.command else {
+            panic!("expected claude");
+        };
+        assert!(args.with_snapshot);
+        assert!(args.no_writeback);
+        assert_eq!(args.prompt, "do it");
+        assert!(args.claude_args.is_empty());
+    }
+
+    #[test]
+    fn claude_requires_a_prompt() {
+        assert!(Cli::try_parse_from(["vm", "claude", "lin"]).is_err());
     }
 
     #[test]

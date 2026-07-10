@@ -63,12 +63,20 @@ fn run(cli: cli::Cli) -> Result<i32> {
             println!("{}", serde_json::to_string(&snap)?);
             Ok(0)
         }
-
         Exec(args) => exec::host::exec(&args.target, &args.opts.into()),
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),
         Shot { alias, file } => commands::shot(&alias, file),
         WithSnapshot(args) => commands::with_snapshot(&args.target, &args.opts.into()),
+        Claude(args) => vm::claude::run(
+            &args.target,
+            &vm::claude::ClaudeOptions {
+                prompt: args.prompt,
+                claude_args: args.claude_args,
+                with_snapshot: args.with_snapshot,
+                no_writeback: args.no_writeback,
+            },
+        ),
         Doctor { alias } => doctor::doctor(alias.as_deref()),
         Clean { alias } => commands::clean(&alias),
     }
