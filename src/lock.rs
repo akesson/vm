@@ -11,10 +11,17 @@
 //! holders touch it on acquire and on release (idle time counts from the end
 //! of a run, not the start). Exclusive holders never touch it, so a reap
 //! sweep does not reset the idle clock it is measuring.
+//!
+//! A second, unrelated lock lives here too: [`exclusive_path`] takes a
+//! blocking exclusive flock on an arbitrary file. The sync engine uses it to
+//! serialize the per-(repo, guest) sync critical section — see
+//! [`crate::sync::host::lock_sync`] — which the shared per-VM lock above
+//! deliberately does *not* do (parallel execs on one VM must stay parallel;
+//! only their sync phase needs a single writer).
 
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// A held lock; the flock is released when this is dropped.
@@ -41,15 +48,18 @@ fn lock_path(alias: &str) -> Result<PathBuf> {
     Ok(dir.join(alias))
 }
 
-fn open(alias: &str) -> Result<File> {
-    let path = lock_path(alias)?;
+fn open_path(path: &Path) -> Result<File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("cannot open lock file {}", path.display()))
+}
+
+fn open(alias: &str) -> Result<File> {
+    open_path(&lock_path(alias)?)
 }
 
 /// Register a use: blocks while an exclusive holder (stop/with-snapshot/reap)
@@ -74,6 +84,32 @@ pub fn try_exclusive(alias: &str) -> Result<Option<VmLock>> {
         file,
         touch_on_drop: false,
     }))
+}
+
+/// A held exclusive flock on an arbitrary path; released when dropped
+/// (closing the file descriptor drops the flock). Unlike [`VmLock`] it never
+/// touches the file's mtime.
+///
+/// The lock file is intentionally *never* deleted: flock is keyed on the open
+/// file's inode, so unlinking a held lock file and recreating it would let a
+/// second holder acquire a lock on the new inode while the first still holds
+/// the old one. Leave the file on disk forever, like `locks/<alias>`.
+#[must_use = "the lock is released as soon as the PathLock is dropped"]
+pub struct PathLock {
+    _file: File,
+}
+
+/// Take a blocking exclusive flock on `path` (created if absent). Returns once
+/// this process holds it exclusively. If another holder is in the way,
+/// `on_wait` fires once — before blocking — so the caller can explain the
+/// pause; it does not fire when the lock is free.
+pub fn exclusive_path(path: &Path, on_wait: impl FnOnce()) -> Result<PathLock> {
+    let file = open_path(path)?;
+    if !try_lock_exclusive(&file)? {
+        on_wait();
+        lock_exclusive_blocking(&file)?;
+    }
+    Ok(PathLock { _file: file })
 }
 
 /// When the VM was last used via `vm` (lock-file mtime), if ever.
@@ -104,6 +140,23 @@ fn try_lock_exclusive(file: &File) -> Result<bool> {
     Err(err).context("flock failed")
 }
 
+#[cfg(unix)]
+fn lock_exclusive_blocking(file: &File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // A blocking flock can be interrupted by a signal (EINTR) on macOS — retry
+    // rather than surfacing a spurious failure.
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err).context("flock failed");
+    }
+}
+
 // The host side only runs on macOS (Parallels); on Windows this code is only
 // compiled, never executed — locks degrade to no-ops.
 #[cfg(not(unix))]
@@ -114,6 +167,11 @@ fn lock_shared(_file: &File) -> Result<()> {
 #[cfg(not(unix))]
 fn try_lock_exclusive(_file: &File) -> Result<bool> {
     Ok(true)
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive_blocking(_file: &File) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -169,5 +227,30 @@ mod tests {
             let _a = shared("a").unwrap();
             assert!(try_exclusive("b").unwrap().is_some());
         })
+    }
+
+    /// A second `exclusive_path` on the same file must block until the first is
+    /// dropped. Made deterministic (no timing sleeps) by having the waiter's
+    /// `on_wait` signal a channel: the holder does not release until it has
+    /// seen that signal, which only fires when the waiter observed contention.
+    #[test]
+    fn exclusive_path_serializes_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.flock");
+
+        let held = exclusive_path(&path, || panic!("should not wait: lock is free")).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path2 = path.clone();
+        let waiter = std::thread::spawn(move || {
+            // Blocks inside until `held` is dropped; on_wait fires first.
+            let _w = exclusive_path(&path2, || tx.send(()).unwrap()).unwrap();
+        });
+
+        // The waiter reached contention (its on_wait fired) — so it is now
+        // blocked. Only then release, and it must be able to proceed.
+        rx.recv().expect("waiter reported contention");
+        drop(held);
+        waiter.join().expect("waiter acquired after release");
     }
 }

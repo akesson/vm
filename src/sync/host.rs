@@ -2,6 +2,31 @@ use super::{Git, Snapshot, snapshot};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+/// Serialize the whole sync/writeback critical section for one (host repo,
+/// peer). Concurrent `vm` invocations against the same guest — a `mise`
+/// fan-out running two `vm exec <guest> …` in parallel, say — otherwise race
+/// on three pieces of shared git state that each assume a single writer: the
+/// host-side alternate index `.git/vm-sync-index-<peer>` (its `.lock`), the
+/// `+…:refs/sync/head` force-push (a remote ref compare-and-swap), and the
+/// guest checkout the push is then reset onto.
+///
+/// The per-VM lock in [`crate::lock`] is *shared* and does not cover this: it
+/// only keeps stop/reap out. Holders take this after that shared lock (fixed
+/// order: VM lock → sync lock), so there is no deadlock cycle.
+///
+/// The lock file sits in the host repo's git dir next to the index it guards
+/// (worktree-aware via `--absolute-git-dir`); the `.flock` suffix keeps it
+/// distinct from git's own transient `*.lock` files. It is never deleted (see
+/// [`crate::lock::PathLock`]).
+pub fn lock_sync(repo_root: &Path, peer: &str) -> Result<crate::lock::PathLock> {
+    let path = Git::in_dir(repo_root)
+        .git_dir()?
+        .join(format!("vm-sync-{peer}.flock"));
+    crate::lock::exclusive_path(&path, || {
+        eprintln!("vm ▸ {peer} ▸ waiting for a concurrent sync of this repo…");
+    })
+}
+
 /// Snapshot the host repo for a given sync peer and push it to `remote_url`
 /// (an ssh:// URL for real guests; any git-accepted URL/path in tests).
 /// Returns the snapshot so the caller can ask the guest to apply

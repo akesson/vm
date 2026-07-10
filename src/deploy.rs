@@ -72,6 +72,11 @@ fn remote(target: &SshTarget, line: &str) -> Result<()> {
 }
 
 fn build_in_guest(alias: &str, target: &SshTarget, src: &Path, bin: &str) -> Result<()> {
+    // Serialize concurrent deploys of this alias against each other: they share
+    // the host source snapshot index (`vm-sync-index-deploy-<alias>`), the
+    // guest `~/.vm/src` checkout, and the `~/.vm/bin` install target. Held for
+    // the whole build so two deploys can't clobber each other's binary.
+    let _sync_guard = sync::host::lock_sync(src, &format!("deploy-{alias}"))?;
     remote(
         target,
         "mkdir -p ~/.vm/bin && { test -d ~/.vm/src/.git || git init -q ~/.vm/src; } \
