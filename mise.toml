@@ -16,13 +16,27 @@ usage = 'flag "--check" help="Check only, do not auto-fix"'
 run = '''
 if [ "${usage_check}" = "true" ]; then
   cargo fmt --all -- --check
-  cargo clippy --all-targets -- -D warnings
+  cargo clippy --workspace --all-targets -- -D warnings
 else
   cargo fmt --all
-  cargo clippy --all-targets --fix --allow-dirty -- -D warnings
+  cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings
 fi
 '''
 description = "Format and lint (--check for CI mode)"
+
+[tasks.a11y-probe]
+usage = 'arg "[target]" help="VM alias or OS (windows|linux|macos), or all" default="all"'
+run = '''
+targets="${usage_target}"
+if [ "$targets" = "all" ]; then targets="windows linux macos"; fi
+rc=0
+for t in $targets; do
+  echo "── a11y-probe ▸ $t ──"
+  vm exec "$t" -- cargo run -p a11y-probe --release || rc=1
+done
+exit $rc
+'''
+description = "Run the tier-0 accessibility probe inside guest VMs"
 
 [tasks.crap]
 run = """
