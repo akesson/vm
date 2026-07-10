@@ -1,6 +1,6 @@
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::ssh::SshTarget;
-use crate::{mapping, prl, ssh, sync};
+use crate::{lock, mapping, prl, ssh, sync};
 use anyhow::{Result, bail};
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,7 @@ pub fn ls() -> Result<i32> {
 pub fn start(alias: &str) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
+    let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
     let ip = prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = SshTarget {
@@ -174,6 +175,7 @@ pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync:
 pub fn sync_cmd(alias: &str) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
+    let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = ssh_target(vm)?;
@@ -181,19 +183,22 @@ pub fn sync_cmd(alias: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub fn stop(alias: &str, kill: bool) -> Result<i32> {
+pub fn stop(alias: &str, kill: bool, force: bool) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
+    let _claim = if force {
+        None
+    } else {
+        match lock::try_exclusive(alias)? {
+            Some(claim) => Some(claim),
+            None => bail!(
+                "'{alias}' is in use by another vm process — retry when idle, \
+                 or `vm stop {alias} --force`"
+            ),
+        }
+    };
     prl::stop(&vm.parallels_name, kill)?;
     eprintln!("vm ▸ {alias} ▸ stopped");
-    Ok(0)
-}
-
-pub fn suspend(alias: &str) -> Result<i32> {
-    let cfg = Config::load()?;
-    let vm = cfg.get(alias)?;
-    prl::suspend(&vm.parallels_name)?;
-    eprintln!("vm ▸ {alias} ▸ suspended");
     Ok(0)
 }
 
@@ -222,6 +227,7 @@ pub fn clean(alias: &str) -> Result<i32> {
     let vm = cfg.get(alias)?;
     let repo = mapping::RepoLocation::discover()?;
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
+    let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = ssh_target(vm)?;
@@ -244,12 +250,22 @@ pub fn clean(alias: &str) -> Result<i32> {
 pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Result<i32> {
     let cfg = Config::load()?;
     let (alias, vm) = cfg.resolve(target)?;
+    // Exclusive: rollback rewinds the whole VM (disk and memory), which would
+    // obliterate any concurrent run and silently undo its guest-side effects.
+    let Some(_claim) = lock::try_exclusive(alias)? else {
+        bail!(
+            "'{alias}' is in use by another vm process — with-snapshot needs the \
+             VM to itself (rollback would destroy the other run)"
+        );
+    };
     prl::ensure_running(&vm.parallels_name)?;
+    sweep_stale_snapshots(alias, &vm.parallels_name)?;
+    ensure_snapshot_headroom(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
 
     let id = prl::snapshot_create(&vm.parallels_name, &format!("vm-with-snapshot-{alias}"))?;
     eprintln!("vm ▸ {alias} ▸ snapshot {id} taken");
-    let run = crate::exec::host::exec(alias, opts);
+    let run = crate::exec::host::exec_unlocked(alias, opts);
     // Roll back even when the command failed — that's the whole point.
     let restore = prl::snapshot_switch(&vm.parallels_name, &id)
         .and_then(|()| prl::snapshot_delete(&vm.parallels_name, &id));
@@ -262,4 +278,87 @@ pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Res
         ),
     }
     run
+}
+
+/// Delete leftovers of with-snapshot runs that were killed before rollback
+/// (each is ~VM-RAM on disk and grows). Safe under the exclusive lock: no
+/// live run can own one. The dead run's guest-side effects were kept, so warn.
+fn sweep_stale_snapshots(alias: &str, name: &str) -> Result<()> {
+    for (id, snap) in prl::snapshot_list(name)? {
+        if snap.starts_with("vm-with-snapshot-") {
+            eprintln!(
+                "vm ▸ {alias} ▸ WARNING: deleting stale snapshot {snap} — a previous \
+                 with-snapshot run died before rolling back; its changes are still in the VM"
+            );
+            prl::snapshot_delete(name, &id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to snapshot when the volume holding the VM is short on space: a
+/// running-VM snapshot writes a memory image of roughly the VM's RAM, then
+/// grows a delta disk for as long as it exists — require 2× RAM free.
+fn ensure_snapshot_headroom(name: &str) -> Result<()> {
+    let details = prl::details(name)?;
+    match free_disk_bytes(&details.home) {
+        Some(free) => check_headroom(name, &details, free),
+        None => Ok(()),
+    }
+}
+
+fn check_headroom(name: &str, details: &prl::VmDetails, free: u64) -> Result<()> {
+    let need = details.memory_mb * 1024 * 1024 * 2;
+    if free < need {
+        bail!(
+            "not enough disk space to snapshot '{name}': {:.1} GiB free on the volume \
+             holding {}, but a snapshot wants ~{:.1} GiB (2× the VM's {:.1} GiB RAM)",
+            free as f64 / GIB,
+            details.home,
+            need as f64 / GIB,
+            details.memory_mb as f64 / 1024.0,
+        );
+    }
+    Ok(())
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// Free bytes available to this user on the volume containing `path`.
+/// None where the probe isn't available — the snapshot then proceeds
+/// unchecked rather than failing a healthy run.
+#[cfg(unix)]
+fn free_disk_bytes(path: &str) -> Option<u64> {
+    let c = std::ffi::CString::new(path).ok()?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } == 0)
+        .then(|| vfs.f_bavail as u64 * vfs.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_disk_bytes(_path: &str) -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn details(memory_mb: u64) -> prl::VmDetails {
+        prl::VmDetails {
+            home: "/Users/x/Parallels/macOS.macvm/".into(),
+            memory_mb,
+        }
+    }
+
+    #[test]
+    fn headroom_needs_twice_the_vm_ram() {
+        let d = details(20480); // 20 GiB RAM → wants 40 GiB free
+        let gib = 1u64 << 30;
+        assert!(check_headroom("mac", &d, 41 * gib).is_ok());
+        let err = check_headroom("mac", &d, 39 * gib).unwrap_err().to_string();
+        assert!(err.contains("39.0 GiB free"), "{err}");
+        assert!(err.contains("~40.0 GiB"), "{err}");
+        assert!(err.contains("20.0 GiB RAM"), "{err}");
+    }
 }

@@ -23,6 +23,18 @@ pub struct ExecOptions {
 pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
     let cfg = Config::load()?;
     let (alias, vm) = cfg.resolve(target)?;
+    // Registers this run as a use of the VM: stop/with-snapshot/reap keep
+    // their hands off until it finishes. Blocks briefly if one of those is
+    // mid-flight right now.
+    let _use = crate::lock::shared(alias)?;
+    exec_in(alias, vm, opts)
+}
+
+/// `exec` without registering a use — only for a caller that already holds
+/// the VM's exclusive lock (with-snapshot), where `exec` would deadlock.
+pub fn exec_unlocked(target: &str, opts: &ExecOptions) -> Result<i32> {
+    let cfg = Config::load()?;
+    let (alias, vm) = cfg.resolve(target)?;
     exec_in(alias, vm, opts)
 }
 

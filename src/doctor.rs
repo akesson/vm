@@ -63,6 +63,14 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             "~/.ssh/id_ed25519 missing — `ssh-keygen -t ed25519`",
         );
     }
+    if crate::reap::launchd_loaded() {
+        r.ok("reap timer", crate::reap::LAUNCHD_LABEL);
+    } else {
+        r.skip(
+            "reap timer",
+            "not installed — `vm reap --install` auto-suspends idle VMs",
+        );
+    }
 
     for (name, vm) in &cfg.vm {
         if alias.is_some_and(|a| a != name) {
@@ -73,6 +81,27 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             r.fail("vm", "not registered in Parallels (`prlctl list -a`)");
             continue;
         };
+        match prl::snapshot_list(&vm.parallels_name) {
+            Ok(snaps) => {
+                let stale: Vec<&str> = snaps
+                    .iter()
+                    .filter(|(_, n)| n.starts_with("vm-with-snapshot-"))
+                    .map(|(_, n)| n.as_str())
+                    .collect();
+                if !stale.is_empty() {
+                    r.fail(
+                        "snapshots",
+                        &format!(
+                            "stale from killed with-snapshot runs, wasting disk: {} — \
+                             next `vm with-snapshot {name}` sweeps them, or delete via \
+                             `prlctl snapshot-list`/`snapshot-delete`",
+                            stale.join(", ")
+                        ),
+                    );
+                }
+            }
+            Err(err) => r.fail("snapshots", &format!("{err:#}")),
+        }
         if prl_vm.status != "running" {
             r.skip(
                 "status",

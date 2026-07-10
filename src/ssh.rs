@@ -34,6 +34,12 @@ const SSH_OPTIONS: &[&str] = &[
     "ControlPath=~/.ssh/vm-cm-%C",
     "-o",
     "ControlPersist=600",
+    // Fail within ~a minute when the VM freezes mid-command (suspended or
+    // killed outside `vm`) — without keepalives the session hangs forever.
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=4",
     "-o",
     "LogLevel=ERROR",
 ];

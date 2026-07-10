@@ -32,8 +32,17 @@ fn run(cli: cli::Cli) -> Result<i32> {
     match cli.command {
         Ls => commands::ls(),
         Start { alias } => commands::start(&alias),
-        Stop { alias, kill } => commands::stop(&alias, kill),
-        Suspend { alias } => commands::suspend(&alias),
+        Stop { alias, kill, force } => commands::stop(&alias, kill, force),
+        Reap {
+            alias,
+            idle_minutes,
+            install,
+            uninstall,
+        } => match (install, uninstall) {
+            (true, _) => vm::reap::install(idle_minutes),
+            (_, true) => vm::reap::uninstall(),
+            _ => vm::reap::reap(alias.as_deref(), idle_minutes),
+        },
         Sync { alias } => commands::sync_cmd(&alias),
 
         // Guest-side plumbing verbs (invoked by a host `vm` over ssh)

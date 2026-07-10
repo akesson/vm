@@ -25,6 +25,7 @@ pub fn deploy(alias: &str) -> Result<i32> {
         );
     }
 
+    let _use = crate::lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = commands::ssh_target(vm)?;

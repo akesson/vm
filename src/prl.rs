@@ -95,8 +95,75 @@ pub fn stop(name: &str, kill: bool) -> Result<()> {
     prlctl(args).map(drop)
 }
 
+/// Suspend (RAM image to disk; `ensure_running` resumes in ~1s). Reap
+/// plumbing only — there is deliberately no `vm suspend` command.
 pub fn suspend(name: &str) -> Result<()> {
     prlctl(&["suspend", name]).map(drop)
+}
+
+/// Existing snapshots as (id, name) pairs.
+pub fn snapshot_list(name: &str) -> Result<Vec<(String, String)>> {
+    let json = prlctl(&["snapshot-list", name, "--json"])?;
+    parse_snapshot_list(&json)
+        .with_context(|| format!("unexpected `prlctl snapshot-list {name} --json` output"))
+}
+
+fn parse_snapshot_list(json: &str) -> Result<Vec<(String, String)>> {
+    #[derive(Deserialize)]
+    struct Snap {
+        name: String,
+    }
+    if json.trim().is_empty() {
+        return Ok(vec![]); // no snapshots → empty output, not `{}`
+    }
+    let map: std::collections::BTreeMap<String, Snap> = serde_json::from_str(json)?;
+    Ok(map.into_iter().map(|(id, s)| (id, s.name)).collect())
+}
+
+/// The subset of `prlctl list -i --json` a snapshot pre-check needs: where
+/// the VM lives on the host disk, and its RAM size (a running-VM snapshot
+/// writes a memory image of about that size, then grows a delta disk).
+#[derive(Debug)]
+pub struct VmDetails {
+    pub home: String,
+    pub memory_mb: u64,
+}
+
+pub fn details(name: &str) -> Result<VmDetails> {
+    let json = prlctl(&["list", "-i", name, "--json"])?;
+    parse_details(&json).with_context(|| format!("unexpected `prlctl list -i {name} --json` output"))
+}
+
+fn parse_details(json: &str) -> Result<VmDetails> {
+    #[derive(Deserialize)]
+    struct Info {
+        #[serde(rename = "Home")]
+        home: String,
+        #[serde(rename = "Hardware")]
+        hardware: Hardware,
+    }
+    #[derive(Deserialize)]
+    struct Hardware {
+        memory: Memory,
+    }
+    #[derive(Deserialize)]
+    struct Memory {
+        /// e.g. "20480Mb"
+        size: String,
+    }
+    let mut infos: Vec<Info> = serde_json::from_str(json)?;
+    let info = infos.pop().ok_or_else(|| anyhow::anyhow!("empty VM info list"))?;
+    let mb = info
+        .hardware
+        .memory
+        .size
+        .trim_end_matches("Mb")
+        .parse::<u64>()
+        .with_context(|| format!("cannot parse memory size '{}'", info.hardware.memory.size))?;
+    Ok(VmDetails {
+        home: info.home,
+        memory_mb: mb,
+    })
 }
 
 /// Screenshot the VM display to a PNG file.
@@ -152,6 +219,45 @@ mod tests {
             Some("{8b171e2f-4b7f-4e01-a689-a2d360d63e49}")
         );
         assert_eq!(parse_snapshot_id("no id here"), None);
+    }
+
+    #[test]
+    fn parses_snapshot_list_including_empty() {
+        assert_eq!(parse_snapshot_list("").unwrap(), vec![]);
+        assert_eq!(parse_snapshot_list("\n").unwrap(), vec![]);
+        // Real shape from Parallels 26.4.
+        let json = r#"{
+            "{351b744b-3b1b-422c-957f-cfeae36b472d}": {
+            "name": "vm-with-snapshot-lin",
+            "date": "2026-07-10 11:41:38",
+            "state": "poweron",
+            "current": true,
+            "parent": ""
+        }
+        }"#;
+        assert_eq!(
+            parse_snapshot_list(json).unwrap(),
+            vec![(
+                "{351b744b-3b1b-422c-957f-cfeae36b472d}".to_string(),
+                "vm-with-snapshot-lin".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_vm_details() {
+        // Trimmed from real `prlctl list -i --json` output (Parallels 26.4).
+        let json = r#"[{
+            "Name": "macOS",
+            "Home": "/Users/hakesson/Parallels/macOS.macvm/",
+            "Hardware": {
+                "cpu": {"cpus": 10},
+                "memory": {"size": "20480Mb", "auto": "off", "hotplug": false}
+            }
+        }]"#;
+        let d = parse_details(json).unwrap();
+        assert_eq!(d.home, "/Users/hakesson/Parallels/macOS.macvm/");
+        assert_eq!(d.memory_mb, 20480);
     }
 
     #[test]

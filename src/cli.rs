@@ -21,15 +21,16 @@ pub enum Command {
     Ls,
     /// Start (or resume) a VM and wait until it is reachable
     Start { alias: String },
-    /// Stop a VM gracefully
+    /// Stop a VM gracefully (refuses while other vm processes are using it)
     Stop {
         alias: String,
         /// Force power-off instead of a graceful shutdown
         #[arg(long)]
         kill: bool,
+        /// Stop even while other vm processes are using the VM
+        #[arg(long)]
+        force: bool,
     },
-    /// Suspend a VM
-    Suspend { alias: String },
     /// Sync the current repo to a guest, then run a command in the guest checkout
     Exec(ExecArgs),
     /// Sync the current repo to a guest without running anything
@@ -44,6 +45,21 @@ pub enum Command {
     },
     /// Snapshot a VM, run a command, then roll back
     WithSnapshot(ExecArgs),
+    /// Suspend VMs that no vm process is using and that have been idle a while
+    /// (any `vm exec` resumes them in about a second)
+    Reap {
+        /// Only consider this VM (default: all configured VMs)
+        alias: Option<String>,
+        /// Idle threshold in minutes, measured from the end of the last use
+        #[arg(long, default_value_t = 30)]
+        idle_minutes: u64,
+        /// Install a launchd job running `vm reap` every 5 minutes
+        #[arg(long, conflicts_with_all = ["uninstall", "alias"])]
+        install: bool,
+        /// Remove the launchd job
+        #[arg(long, conflicts_with = "alias")]
+        uninstall: bool,
+    },
     /// Diagnose host and guest setup
     Doctor {
         /// Check a single VM (default: all configured VMs)
