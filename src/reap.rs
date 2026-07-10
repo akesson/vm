@@ -1,7 +1,11 @@
 //! `vm reap` — suspend VMs that nobody is using.
 //!
 //! For each configured (or the named) VM: skip it while any `vm` process
-//! holds a use on it, skip it inside the idle window, otherwise suspend it.
+//! holds a use on it, skip it inside the idle window, skip it while someone
+//! is at its console (guest input idle below the window — manual GUI use
+//! leaves no trace in the lock files), otherwise suspend it. The console
+//! probe fails open: reclaiming RAM stays guaranteed, and a wrongly
+//! suspended VM costs one ~1s resume.
 //! Suspend, not stop: it frees the VM's host RAM, and the next `vm exec`
 //! resumes in about a second instead of paying a full boot.
 //!
@@ -44,6 +48,19 @@ pub fn reap(alias: Option<&str>, idle_minutes: u64) -> Result<i32> {
                 idle_minutes
             );
             continue;
+        }
+        match crate::idle::input_idle(vm) {
+            Ok(input) if input < idle_limit => {
+                eprintln!(
+                    "vm ▸ reap ▸ {name} console input {}m ago — kept",
+                    input.as_secs() / 60
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!(
+                "vm ▸ reap ▸ {name} input-idle probe failed ({err:#}) — suspending anyway"
+            ),
         }
         prl::suspend(&vm.parallels_name)?;
         eprintln!(

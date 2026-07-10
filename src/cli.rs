@@ -105,6 +105,9 @@ pub enum Command {
     /// Print the agent's protocol version and binary version
     #[command(name = "_version", hide = true)]
     GuestVersion,
+    /// Print milliseconds since the last local input event (reap's console-use probe)
+    #[command(name = "_idle", hide = true)]
+    GuestIdle,
 }
 
 #[derive(Args)]
@@ -253,5 +256,11 @@ mod tests {
         };
         assert_eq!(repo, "~/work/syncfs");
         assert_eq!(sha, "abc123");
+    }
+
+    #[test]
+    fn guest_idle_verb_parses() {
+        let cli = parse(&["vm", "_idle"]);
+        assert!(matches!(cli.command, Command::GuestIdle));
     }
 }

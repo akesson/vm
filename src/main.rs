@@ -63,6 +63,11 @@ fn run(cli: cli::Cli) -> Result<i32> {
             println!("{}", serde_json::to_string(&snap)?);
             Ok(0)
         }
+        GuestIdle => {
+            println!("{}", vm::idle::guest_idle_ms()?);
+            Ok(0)
+        }
+
         Exec(args) => exec::host::exec(&args.target, &args.opts.into()),
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),

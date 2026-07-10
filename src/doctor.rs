@@ -161,6 +161,7 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
         }
 
         claude_checks(&mut r, &target);
+        idle_checks(&mut r, name, vm);
 
         if vm.os == GuestOs::Windows {
             console_checks(&mut r, vm);
@@ -218,6 +219,25 @@ fn claude_checks(r: &mut Report, target: &ssh::SshTarget) {
             );
         }
         Err(err) => r.fail("claude auth", &format!("probe failed: {err:#}")),
+    }
+}
+
+/// Reap asks the guest agent for input idle before suspending, so manual GUI
+/// use is protected; verify that probe works. On Windows this exercises the
+/// console transport (GetLastInputInfo is per-session).
+fn idle_checks(r: &mut Report, name: &str, vm: &VmConfig) {
+    match crate::idle::input_idle(vm) {
+        Ok(idle) => r.ok(
+            "input idle",
+            &format!(
+                "{}m — reap won't suspend while you're at the console",
+                idle.as_secs() / 60
+            ),
+        ),
+        Err(err) => r.fail(
+            "input idle",
+            &format!("{err:#} — reap will suspend regardless of console use (`vm deploy {name}`?)"),
+        ),
     }
 }
 
