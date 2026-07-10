@@ -155,6 +155,11 @@ pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync:
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
     let started = Instant::now();
 
+    // Serialize the whole init→push→apply→verify section against any other
+    // sync of this repo to this guest (e.g. a parallel `vm exec` fan-out);
+    // released when this function returns.
+    let _sync_guard = sync::host::lock_sync(&repo.root, alias)?;
+
     // 1. Make sure the guest repository exists (idempotent, cheap).
     agent_call(vm, target, &["_sync-init", "--repo", &guest_repo])?;
 

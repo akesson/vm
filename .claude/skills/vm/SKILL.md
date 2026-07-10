@@ -98,7 +98,10 @@ on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and co
 - Don't stop VMs when done — the reap timer suspends idle VMs automatically,
   and any `vm exec` resumes a suspended VM in ~1s. Parallel `vm` invocations
   are safe: uses hold a shared per-VM lock; stop/with-snapshot/reap won't
-  fire while another vm process is using the VM.
+  fire while another vm process is using the VM. Parallel `vm exec` of the
+  *same* repo to the *same* guest (e.g. a `mise` fan-out) is safe too — the
+  syncs serialize behind a per-(repo, guest) lock, so a second one waits a
+  moment for the first rather than racing on the shared git snapshot.
 - First run of a mise-managed repo in a fresh guest checkout:
   `vm exec <alias> --no-sync -- mise trust` (then tools auto-install on first task).
 - `--writeback` applies the guest diff to the **host working tree** as a patch;

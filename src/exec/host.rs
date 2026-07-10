@@ -136,6 +136,11 @@ fn writeback(
     repo: &mapping::RepoLocation,
     base: &sync::Snapshot,
 ) -> Result<()> {
+    // Same critical section as the forward sync: the guest's writeback
+    // snapshot index and refs/sync/writeback, plus the patch applied back onto
+    // the host tree. Not held across the guest command run in between (parallel
+    // execs on one VM must stay parallel) — only around sync and writeback.
+    let _sync_guard = sync::host::lock_sync(&repo.root, alias)?;
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
     let json = commands::agent_call(vm, target, &["_tree", "--repo", &guest_repo])?;
     let wb: sync::Snapshot = serde_json::from_str(&json).context("parsing _tree reply")?;

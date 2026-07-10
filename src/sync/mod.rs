@@ -27,6 +27,10 @@ pub struct Snapshot {
 ///
 /// The commit is deterministic: same tree + same parent → same sha, which
 /// makes repeated syncs of an unchanged tree no-ops end to end.
+///
+/// Not internally synchronized: the alternate index's `.lock` tolerates no
+/// concurrent writer. Host-side callers serialize per (repo, peer) via
+/// [`host::lock_sync`]; the guest side has a single writer by construction.
 pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
     let index = git.git_dir()?.join(index_name);
     let g = git.with_index(index.clone());
@@ -39,7 +43,7 @@ pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
     {
         g.run(&["read-tree", head])?;
     }
-    add_all_with_lock_retry(&g)?;
+    g.run(&["add", "-A"])?;
     let tree = g.out(&["write-tree"])?;
 
     let commit = match &head {
@@ -47,25 +51,6 @@ pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
         None => g.commit_tree(&tree, None)?,
     };
     Ok(Snapshot { commit, tree })
-}
-
-/// Concurrent syncs to the same peer (parallel mise tasks) contend on the
-/// alternate index's .lock file; git fails instead of waiting. Retry briefly
-/// — snapshots are fast, so contention clears in well under a second.
-fn add_all_with_lock_retry(g: &Git) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
-        match g.run(&["add", "-A"]) {
-            Ok(()) => return Ok(()),
-            Err(err) if err.to_string().contains(".lock") => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(err.context("snapshot index stayed locked for 20s"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 /// Expand a leading `~/` against the platform home directory. Guest-side:
