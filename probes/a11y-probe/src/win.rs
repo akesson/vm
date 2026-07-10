@@ -1,7 +1,8 @@
 //! Windows tier-0 checks: which session / window station / desktop this
 //! process landed in (OpenSSH puts children in a non-interactive service
 //! session, and UIA cannot cross session boundaries), then whether UIA can
-//! reach a populated desktop from there.
+//! reach a populated desktop from there. Tier-1: spawn a WinForms fixture
+//! window and find it through UIA by title.
 
 use uiautomation::UIAutomation;
 use uiautomation::types::TreeScope;
@@ -127,8 +128,60 @@ pub fn run() -> Report {
         ),
         Err(e) => r.fail("uia-root-children", format!("cannot enumerate desktop children: {e}")),
     }
+    if !r.ok() {
+        return r;
+    }
 
+    fixture_check(&mut r, &automation);
     r
+}
+
+/// Tier-1: spawn a WinForms fixture window with a unique title and find it
+/// through UIA — proves cross-process window discovery, not just that the
+/// desktop root answers.
+fn fixture_check(r: &mut Report, automation: &UIAutomation) {
+    let title = format!("a11y-fixture-{}", std::process::id());
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         $f = New-Object System.Windows.Forms.Form; \
+         $f.Text = '{title}'; \
+         $f.ShowDialog()"
+    );
+    let mut child = match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            r.fail("fixture-spawn", format!("cannot spawn powershell: {e}"));
+            return;
+        }
+    };
+    r.pass("fixture-spawn", format!("powershell pid {}", child.id()));
+
+    let found = automation
+        .create_matcher()
+        .depth(2)
+        .timeout(10000)
+        .name(&title)
+        .find_first();
+    let _ = child.kill();
+    let _ = child.wait();
+    match found {
+        Ok(window) => {
+            let class = window.get_classname().unwrap_or_default();
+            r.pass(
+                "fixture-window",
+                format!("found window {title:?} class={class:?}"),
+            );
+        }
+        Err(e) => r.fail(
+            "fixture-window",
+            format!("no window named {title:?} appeared within 10s: {e}"),
+        ),
+    }
 }
 
 fn user_object_name(handle: HANDLE) -> Result<String, windows::core::Error> {
