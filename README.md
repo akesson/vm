@@ -81,6 +81,20 @@ work_root = "~/work"
 `vm doctor` checks host and guests; `vm deploy <alias>` builds and installs
 the agent inside a guest.
 
+A repo can declare per-repo setup in a committed `.vm.toml` at its root:
+
+```toml
+# Runs once in the guest checkout the first time it is created (and again after
+# `vm clean`), before the exec'd command — so a fresh checkout just works. A
+# nonzero exit fails the run (exit 125). Runs under the guest shell, so keep it
+# to a simple command.
+on_first_sync = "mise trust"
+```
+
+This removes the classic first-run gotcha of a mise-managed repo (a `mise
+trust` prompt inside the guest). The hook re-runs whenever the checkout is
+recreated, and once per checkout otherwise.
+
 ## Issues
 
 Bugs and rough edges go to

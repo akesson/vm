@@ -14,5 +14,6 @@ pub mod mapping;
 pub mod prl;
 pub mod proto;
 pub mod reap;
+pub mod repo_config;
 pub mod ssh;
 pub mod sync;

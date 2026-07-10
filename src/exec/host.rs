@@ -53,6 +53,11 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         Some(commands::sync_repo(alias, vm, &target)?)
     };
 
+    // Runs the repo's `on_first_sync` hook the first time this checkout exists
+    // (and after `vm clean`), before the user's command. No-op otherwise. Also
+    // covers `--no-sync` against a checkout that never ran it.
+    commands::first_sync_hook(alias, vm, &target, &repo)?;
+
     let cwd = mapping::guest_cwd(&vm.work_root, &repo.name, &repo.rel)?;
     let env = resolve_env(&opts.env, |name| std::env::var(name).ok())?;
     let req = ExecRequest {

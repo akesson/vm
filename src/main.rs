@@ -72,6 +72,7 @@ fn run(cli: cli::Cli) -> Result<i32> {
             println!("{}", serde_json::to_string(&snap)?);
             Ok(0)
         }
+        GuestFirstSync { repo, cmd } => exec::guest::first_sync(&repo, &cmd),
         GuestIdle => {
             println!("{}", vm::idle::guest_idle_ms()?);
             Ok(0)
