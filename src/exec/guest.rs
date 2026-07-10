@@ -52,6 +52,50 @@ pub fn exec() -> Result<i32> {
     Ok(exit_code(&status))
 }
 
+/// `vm _first-sync`: run the repo's `on_first_sync` hook in the checkout, once
+/// per checkout creation. A marker inside the checkout's `.git/` records a
+/// successful run; it survives ordinary re-syncs (`reset --hard` / `clean -fd`
+/// never touch `.git/` internals) but is gone whenever the checkout is
+/// recreated, so the hook re-runs after `vm clean`, a rebuilt guest, or a
+/// manual delete. Absent marker ⇒ run the hook; a nonzero hook exit leaves no
+/// marker, so it retries on the next exec/sync.
+pub fn first_sync(repo: &str, cmd: &str) -> Result<i32> {
+    let path = expand_home(repo)?;
+    let git_dir = path.join(".git");
+    if !git_dir.is_dir() {
+        // No checkout yet (e.g. `--no-sync` before any sync). Nothing to set up
+        // — the exec that follows reports the canonical "sync first?" itself.
+        return Ok(0);
+    }
+    let marker = git_dir.join("vm-first-sync-done");
+    if marker.exists() {
+        return Ok(0); // already set up
+    }
+
+    eprintln!("vm ▸ first-sync ▸ $ {cmd}");
+    // Same environment as a normal `vm exec` command, so per-user tool dirs
+    // (`mise`, `cargo`, …) resolve. Plain wait, not the stdin liveness watcher
+    // exec() uses: the host holds our stdin at /dev/null, so a watcher would see
+    // instant EOF and kill the hook. First-sync hooks are short setup steps.
+    let mut command = shell_command(cmd);
+    command
+        .current_dir(&path)
+        .env("PATH", augmented_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command
+        .status()
+        .with_context(|| format!("running first-sync hook {cmd:?} in {}", path.display()))?;
+
+    let code = exit_code(&status);
+    if code == 0 {
+        std::fs::write(&marker, format!("{cmd}\n"))
+            .with_context(|| format!("writing first-sync marker {}", marker.display()))?;
+    }
+    Ok(code)
+}
+
 /// The host holds our stdin open for the whole run. EOF (or error) means the
 /// host or the ssh connection died — sshd sends no signal for no-PTY
 /// sessions, so this is the only disconnect notification we get. Tear the
@@ -75,19 +119,24 @@ fn start_liveness_watcher() {
 
 fn build_command(req: &ExecRequest) -> Command {
     if req.shell {
-        let joined = req.argv.join(" ");
-        if cfg!(windows) {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", &joined]);
-            cmd
-        } else {
-            let mut cmd = Command::new("sh");
-            cmd.args(["-c", &joined]);
-            cmd
-        }
+        shell_command(&req.argv.join(" "))
     } else {
         let mut cmd = Command::new(&req.argv[0]);
         cmd.args(&req.argv[1..]);
+        cmd
+    }
+}
+
+/// A guest shell running `script`: `sh -c` on unix, `cmd /C` on Windows. Both
+/// the `--shell` exec path and the first-sync hook run their string this way.
+fn shell_command(script: &str) -> Command {
+    if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", script]);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
         cmd
     }
 }

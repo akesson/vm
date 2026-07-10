@@ -84,6 +84,19 @@ pub fn run_capture(target: &SshTarget, remote: &[&str]) -> Result<Output> {
         .context("failed to spawn ssh")
 }
 
+/// Run a remote command with its stdout/stderr streaming straight through, and
+/// return its exit status (ssh reports the remote command's own code). For a
+/// plumbing call whose output the user should see live — e.g. a first-sync hook.
+pub fn run_streamed(target: &SshTarget, remote: &[&str]) -> Result<std::process::ExitStatus> {
+    ssh_command(target)
+        .args(remote)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to spawn ssh")
+}
+
 /// Quick reachability probe (`ssh … true`).
 pub fn reachable(target: &SshTarget) -> bool {
     run_capture(target, &["true"])

@@ -80,7 +80,7 @@ scripts that choose between native and VM do their own OS check.
 
 ## Config
 
-`~/.config/vm/config.toml`:
+`~/.config/vm/config.toml` — machine-level VM inventory:
 
 ```toml
 [vm.win]
@@ -89,6 +89,17 @@ os = "windows"          # windows | linux | macos
 user = "hakesson"
 work_root = "~/work"
 # host = "10.0.0.5"     # optional IP override (else discovered via prlctl)
+```
+
+`.vm.toml` — optional, committed at the **repo root**, so the repo declares the
+one-time setup its guest checkout needs:
+
+```toml
+# Runs once in the guest checkout the first time it is created — and again after
+# `vm clean` or any other checkout recreation — before the exec'd command. A
+# nonzero exit fails the run (exit 125). Keep it to a simple command: it runs
+# under the guest shell (`sh -c` on unix, `cmd /C` on Windows).
+on_first_sync = "mise trust"
 ```
 
 ## Hit a bug in vm itself? File it
@@ -115,8 +126,10 @@ on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and co
   *same* repo to the *same* guest (e.g. a `mise` fan-out) is safe too — the
   syncs serialize behind a per-(repo, guest) lock, so a second one waits a
   moment for the first rather than racing on the shared git snapshot.
-- First run of a mise-managed repo in a fresh guest checkout:
-  `vm exec <alias> --no-sync -- mise trust` (then tools auto-install on first task).
+- First run of a mise-managed repo in a fresh guest checkout needs `mise trust`.
+  Set `on_first_sync = "mise trust"` in a committed `.vm.toml` (see Config) and
+  vm runs it automatically the first time each checkout is created — no manual
+  step. (Or, one-off: `vm exec <alias> --no-sync -- mise trust`.)
 - `--writeback` applies the guest diff to the **host working tree** as a patch;
   only use it for commands that deliberately edit sources.
 - Sync pushes bypass git hooks by design (`--no-verify`) — they are replication,

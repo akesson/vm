@@ -120,6 +120,16 @@ pub enum Command {
         #[arg(long)]
         repo: String,
     },
+    /// Run the repo's first-sync hook in the checkout, once per checkout creation
+    #[command(name = "_first-sync", hide = true)]
+    GuestFirstSync {
+        /// Path of the guest checkout ('~/' prefix allowed)
+        #[arg(long)]
+        repo: String,
+        /// The `on_first_sync` command from the repo's .vm.toml
+        #[arg(long)]
+        cmd: String,
+    },
     /// Print the agent's protocol version and binary version
     #[command(name = "_version", hide = true)]
     GuestVersion,
@@ -296,5 +306,22 @@ mod tests {
     fn guest_idle_verb_parses() {
         let cli = parse(&["vm", "_idle"]);
         assert!(matches!(cli.command, Command::GuestIdle));
+    }
+
+    #[test]
+    fn guest_first_sync_verb_parses() {
+        let cli = parse(&[
+            "vm",
+            "_first-sync",
+            "--repo",
+            "~/work/syncfs",
+            "--cmd",
+            "mise trust",
+        ]);
+        let Command::GuestFirstSync { repo, cmd } = cli.command else {
+            panic!("expected _first-sync");
+        };
+        assert_eq!(repo, "~/work/syncfs");
+        assert_eq!(cmd, "mise trust");
     }
 }

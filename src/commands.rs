@@ -188,6 +188,48 @@ pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync:
     Ok(snap)
 }
 
+/// Run the repo's `on_first_sync` hook (from `.vm.toml`) in the guest checkout,
+/// once per checkout creation; a no-op when the repo configures no hook or the
+/// checkout already ran it (the guest verb keeps the marker). Serialized per
+/// (repo, guest) via the same lock the sync path uses, so a parallel exec
+/// fan-out on a fresh checkout runs the hook exactly once. A nonzero hook exit
+/// is an infra failure (exit 125): vm couldn't ready the checkout, so the
+/// caller's command must not run.
+pub fn first_sync_hook(
+    alias: &str,
+    vm: &VmConfig,
+    target: &SshTarget,
+    repo: &mapping::RepoLocation,
+) -> Result<()> {
+    let Some(hook) = crate::repo_config::RepoConfig::load(&repo.root)?.on_first_sync else {
+        return Ok(());
+    };
+    let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
+    let _sync_guard = sync::host::lock_sync(&repo.root, alias)?;
+    let agent = agent_path(vm);
+    // Bare agent path so `~` expands in the remote shell; POSIX-quote the values
+    // (a Windows checkout path, or a hook with spaces) exactly like agent_call.
+    let (repo_q, cmd_q) = (ssh::shell_quote(&guest_repo), ssh::shell_quote(&hook));
+    let remote = [
+        agent.as_str(),
+        "_first-sync",
+        "--repo",
+        &repo_q,
+        "--cmd",
+        &cmd_q,
+    ];
+    let status = ssh::run_streamed(target, &remote)?;
+    if !status.success() {
+        bail!(
+            "first-sync hook failed (exit {}): {hook}\n  \
+             it ran in the guest checkout {guest_repo}; fix the hook in .vm.toml, \
+             or re-run with --no-sync to skip",
+            status.code().unwrap_or(-1)
+        );
+    }
+    Ok(())
+}
+
 /// `vm sync <alias>`: start the VM if needed, then sync.
 pub fn sync_cmd(alias: &str) -> Result<i32> {
     let cfg = Config::load()?;
@@ -197,6 +239,8 @@ pub fn sync_cmd(alias: &str) -> Result<i32> {
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = ssh_target(vm)?;
     sync_repo(alias, vm, &target)?;
+    let repo = mapping::RepoLocation::discover()?;
+    first_sync_hook(alias, vm, &target, &repo)?;
     Ok(0)
 }
 
