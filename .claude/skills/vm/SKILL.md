@@ -70,7 +70,8 @@ work_root = "~/work"
   only use it for commands that deliberately edit sources.
 - Sync pushes bypass git hooks by design (`--no-verify`) — they are replication,
   not publishing.
-- macOS guests (Apple Silicon): no snapshots, no suspend, no `prlctl exec` —
-  ssh only. Full Xcode is required in the guest for xcodebuild/XCUITest;
+- macOS guests (Apple Silicon): no `prlctl exec` — ssh only. Suspend and
+  snapshots need Parallels 19.1+/20+ with macOS 14+ on host and guest.
+  Full Xcode is required in the guest for xcodebuild/XCUITest;
   SPM `swift test` works with just the Command Line Tools.
 - "guest agent missing/outdated" errors → `vm deploy <alias>`.

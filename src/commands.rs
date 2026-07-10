@@ -192,9 +192,6 @@ pub fn stop(alias: &str, kill: bool) -> Result<i32> {
 pub fn suspend(alias: &str) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
-    if vm.os == GuestOs::Macos {
-        bail!("Parallels cannot suspend macOS guests on Apple Silicon; use `vm stop {alias}`");
-    }
     prl::suspend(&vm.parallels_name)?;
     eprintln!("vm ▸ {alias} ▸ suspended");
     Ok(0)
@@ -247,9 +244,6 @@ pub fn clean(alias: &str) -> Result<i32> {
 pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Result<i32> {
     let cfg = Config::load()?;
     let (alias, vm) = cfg.resolve(target)?;
-    if vm.os == GuestOs::Macos {
-        bail!("Parallels cannot snapshot macOS guests on Apple Silicon");
-    }
     prl::ensure_running(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
 

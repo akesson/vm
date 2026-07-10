@@ -28,7 +28,7 @@ pub enum Command {
         #[arg(long)]
         kill: bool,
     },
-    /// Suspend a VM (not supported for macOS guests on Apple Silicon)
+    /// Suspend a VM
     Suspend { alias: String },
     /// Sync the current repo to a guest, then run a command in the guest checkout
     Exec(ExecArgs),
@@ -42,7 +42,7 @@ pub enum Command {
         /// Output file (default: <alias>-<timestamp>.png in the current dir)
         file: Option<PathBuf>,
     },
-    /// Snapshot a VM, run a command, then roll back (not supported for macOS guests)
+    /// Snapshot a VM, run a command, then roll back
     WithSnapshot(ExecArgs),
     /// Diagnose host and guest setup
     Doctor {
