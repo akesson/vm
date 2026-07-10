@@ -31,9 +31,16 @@ vm exec <target> --writeback -- <cmd>…  # pull guest file changes back to host
                                         # (for guest-side fixers: clippy --fix, fmt)
 vm sync <alias>                # sync only
 vm start|stop <alias>          # lifecycle (start waits for ssh; stop refuses while
-                               # other vm processes use the VM — --force overrides)
+                               # other vm processes use the VM — --force overrides;
+                               # --kill hard-powers-off instead of graceful shutdown)
 vm reap [alias] [--idle-minutes N]  # suspend VMs idle ≥N min (default 30) and not in
-                                    # use; --install adds a launchd job every 5 min
+                                    # use; --install/--uninstall manage a launchd job
+                                    # that runs it every 5 min
+vm claude <target> "<prompt>" [claude flags…]  # headless `claude -p` in the guest
+                                     # checkout; the VM is the permission boundary.
+                                     # Writeback of source edits is ON by default
+                                     # (--no-writeback opts out); --with-snapshot
+                                     # rolls the guest back afterwards
 vm deploy <alias>              # rebuild + install the guest agent (after vm src changes)
 vm doctor [alias]              # check prlctl/config/ssh/agent/git per guest (read-only)
 vm shot <alias> [file.png]     # screenshot the VM display (see GUI dialogs ssh can't)

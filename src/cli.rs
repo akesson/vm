@@ -20,9 +20,13 @@ pub enum Command {
     /// List configured VMs: status, IP, and the guest checkout path of the current repo
     Ls,
     /// Start (or resume) a VM and wait until it is reachable
-    Start { alias: String },
+    Start {
+        /// VM alias from ~/.config/vm/config.toml
+        alias: String,
+    },
     /// Stop a VM gracefully (refuses while other vm processes are using it)
     Stop {
+        /// VM alias from ~/.config/vm/config.toml
         alias: String,
         /// Force power-off instead of a graceful shutdown
         #[arg(long)]
@@ -34,11 +38,18 @@ pub enum Command {
     /// Sync the current repo to a guest, then run a command in the guest checkout
     Exec(ExecArgs),
     /// Sync the current repo to a guest without running anything
-    Sync { alias: String },
+    Sync {
+        /// VM alias from ~/.config/vm/config.toml
+        alias: String,
+    },
     /// Build and install the vm agent inside a guest
-    Deploy { alias: String },
+    Deploy {
+        /// VM alias from ~/.config/vm/config.toml
+        alias: String,
+    },
     /// Save a screenshot of a VM's display
     Shot {
+        /// VM alias from ~/.config/vm/config.toml
         alias: String,
         /// Output file (default: <alias>-<timestamp>.png in the current dir)
         file: Option<PathBuf>,
@@ -73,7 +84,10 @@ pub enum Command {
         alias: Option<String>,
     },
     /// Remove the guest checkout of the current repo
-    Clean { alias: String },
+    Clean {
+        /// VM alias from ~/.config/vm/config.toml
+        alias: String,
+    },
 
     // Hidden guest-side verbs, invoked peer-to-peer by a host `vm` over ssh.
     /// Run a command described by an ExecRequest (JSON on stdin)

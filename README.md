@@ -4,8 +4,8 @@ Run commands in Parallels VMs against a synced copy of the current repo — one
 tool, installed on the host **and** in every guest.
 
 ```sh
-vm run --os windows -- cargo nextest run -p my-windows-crate
-vm exec lin -- cargo clippy --fix --writeback
+vm exec windows -- cargo nextest run -p my-windows-crate
+vm exec lin --writeback -- cargo clippy --fix
 vm claude win "fix the test that only fails on Windows"
 vm ls
 ```
