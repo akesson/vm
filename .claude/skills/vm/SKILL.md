@@ -78,6 +78,21 @@ work_root = "~/work"
 # host = "10.0.0.5"     # optional IP override (else discovered via prlctl)
 ```
 
+## Hit a bug in vm itself? File it
+
+If `vm` misbehaves — a command fails in a way that looks like a tool bug, these
+docs don't match what actually happens, or an obviously-needed workflow is
+missing — open an issue so it gets fixed (search existing ones first to avoid a
+dup):
+
+```sh
+gh issue create --repo akesson/vm --title "<short summary>" \
+  --body "<cmd you ran · what happened · what you expected · guest OS/target>"
+```
+
+Scope this to problems with `vm` the tool, **not** the project you're using it
+on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and command.
+
 ## Gotchas
 
 - Don't stop VMs when done — the reap timer suspends idle VMs automatically,

@@ -60,3 +60,12 @@ work_root = "~/work"
 
 `vm doctor` checks host and guests; `vm deploy <alias>` builds and installs
 the agent inside a guest.
+
+## Issues
+
+Bugs and rough edges go to
+[github.com/akesson/vm/issues](https://github.com/akesson/vm/issues). Claude
+sessions driving `vm` are encouraged to do the same: when the tool itself
+misbehaves — not the project it's running against — file it with
+`gh issue create --repo akesson/vm`, including the failing `vm ▸ …` breadcrumb
+and the guest OS. Check for an existing report first.
