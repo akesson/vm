@@ -12,6 +12,9 @@ pub struct ExecOptions {
     pub no_sync: bool,
     pub writeback: bool,
     pub shell: bool,
+    /// `NAME=value` / bare `NAME` specs from `-e`; resolved against the host
+    /// environment when the request is built.
+    pub env: Vec<String>,
     pub cmd: Vec<String>,
 }
 
@@ -51,10 +54,11 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     };
 
     let cwd = mapping::guest_cwd(&vm.work_root, &repo.name, &repo.rel)?;
+    let env = resolve_env(&opts.env, |name| std::env::var(name).ok())?;
     let req = ExecRequest {
         version: PROTO_VERSION,
         argv: opts.cmd.clone(),
-        env: BTreeMap::new(),
+        env,
         cwd: cwd.clone(),
         shell: opts.shell,
     };
@@ -116,6 +120,35 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     Ok(code)
 }
 
+/// Resolve `-e` specs into an explicit NAME→value map for the guest process.
+/// `NAME=value` sets the variable directly (the value may be empty or itself
+/// contain `=`). Bare `NAME` forwards the host's current value and errors if
+/// it is unset — an explicit request gets explicit feedback. On a duplicate
+/// name the last spec wins.
+fn resolve_env(
+    specs: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for spec in specs {
+        match spec.split_once('=') {
+            Some(("", _)) => bail!("-e {spec}: empty variable name"),
+            Some((name, value)) => {
+                env.insert(name.to_string(), value.to_string());
+            }
+            None => {
+                let value = lookup(spec).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "-e {spec}: not set on host (use -e {spec}=value to set it explicitly)"
+                    )
+                })?;
+                env.insert(spec.clone(), value);
+            }
+        }
+    }
+    Ok(env)
+}
+
 /// The host process that carries an ExecRequest to the guest agent. Unix
 /// guests go over ssh. Windows goes through `prlctl exec --current-user`
 /// instead: sshd puts children in session 0 on a non-interactive window
@@ -165,4 +198,72 @@ fn writeback(
         eprintln!("vm ▸ {alias} ▸ writeback applied to host tree");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host environment stub, so the tests never touch the real process env
+    /// (mutating it is `unsafe` on edition 2024 and races other tests).
+    fn host<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn explicit_assignment_sets_the_value() {
+        let env = resolve_env(&s(&["FOO=bar"]), host(&[])).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn value_may_contain_equals_signs() {
+        let env = resolve_env(&s(&["FOO=a=b"]), host(&[])).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("a=b"));
+    }
+
+    #[test]
+    fn empty_value_is_allowed() {
+        let env = resolve_env(&s(&["FOO="]), host(&[])).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn bare_name_forwards_the_host_value() {
+        let env = resolve_env(&s(&["FOO"]), host(&[("FOO", "from-host")])).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("from-host"));
+    }
+
+    #[test]
+    fn bare_name_unset_on_host_is_an_error() {
+        let err = resolve_env(&s(&["FOO"]), host(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FOO"), "{err}");
+        assert!(err.contains("not set on host"), "{err}");
+        assert!(err.contains("FOO=value"), "{err}");
+    }
+
+    #[test]
+    fn empty_name_is_an_error() {
+        let err = resolve_env(&s(&["=value"]), host(&[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty variable name"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_name_takes_the_last_spec() {
+        let env = resolve_env(&s(&["FOO=1", "FOO=2"]), host(&[])).unwrap();
+        assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
+    }
 }

@@ -24,6 +24,7 @@ pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
         no_sync: false,
         writeback: !opts.no_writeback,
         shell: false,
+        env: Vec::new(),
         cmd: argv(opts),
     };
     if opts.with_snapshot {

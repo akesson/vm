@@ -5,6 +5,7 @@ tool, installed on the host **and** in every guest.
 
 ```sh
 vm exec windows -- cargo nextest run -p my-windows-crate
+vm exec win -e RUST_BACKTRACE=1 -- cargo nextest run -p my-windows-crate
 vm exec lin --writeback -- cargo clippy --fix
 vm claude win "fix the test that only fails on Windows"
 vm ls

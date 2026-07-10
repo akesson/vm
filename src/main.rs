@@ -11,6 +11,7 @@ impl From<cli::ExecOpts> for ExecOptions {
             no_sync: opts.no_sync,
             writeback: opts.writeback,
             shell: opts.shell,
+            env: opts.env,
             cmd: opts.cmd,
         }
     }
