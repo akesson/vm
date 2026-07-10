@@ -70,7 +70,7 @@ pub fn run() -> Report {
         }
         Err(e) => r.info("thread-desktop", format!("GetThreadDesktop failed: {e}")),
     }
-    match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS.into()) } {
+    match unsafe { OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) } {
         Ok(_) => r.info("input-desktop", "input desktop is reachable"),
         Err(e) => r.info(
             "input-desktop",
