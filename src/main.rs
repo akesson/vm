@@ -21,8 +21,16 @@ fn main() {
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
+            // Every `Err` here is a vm-internal failure — a guest command's own
+            // nonzero exit rides the `Ok(code)` path instead — so the only
+            // question is whether it's the user's setup (usage, exit 2) or an
+            // operational fault (infra, exit 125). See `vm::exit`.
+            if err.downcast_ref::<vm::exit::UsageError>().is_some() {
+                eprintln!("vm: config error: {err:#}");
+                std::process::exit(vm::exit::USAGE);
+            }
             eprintln!("vm: error: {err:#}");
-            std::process::exit(1);
+            std::process::exit(vm::exit::INFRA);
         }
     }
 }

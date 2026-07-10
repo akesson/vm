@@ -21,7 +21,9 @@ impl RepoLocation {
             .output()
             .context("failed to run git")?;
         if !out.status.success() {
-            bail!("not inside a git repository (vm syncs the enclosing git repo)");
+            return Err(crate::exit::usage(
+                "not inside a git repository — run vm from within the repo you want to sync",
+            ));
         }
         let root = PathBuf::from(String::from_utf8(out.stdout)?.trim_end());
         let name = root

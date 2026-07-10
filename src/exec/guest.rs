@@ -24,8 +24,31 @@ pub fn exec() -> Result<i32> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = job::spawn_and_wait(cmd, start_liveness_watcher)
-        .with_context(|| format!("running {:?} in {}", req.argv.join(" "), cwd.display()))?;
+    let status = match job::spawn_and_wait(cmd, start_liveness_watcher) {
+        Ok(status) => status,
+        Err(err) => {
+            // A command that isn't found or isn't executable is the *command's*
+            // own result, not a vm failure — report it with the shell's own
+            // codes (127 / 126) on the Ok path, so it never collides with the
+            // infra exit code the host would otherwise read back. (The `--shell`
+            // path already yields these from sh/cmd itself.)
+            if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                match io.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        eprintln!("vm: command not found: {}", req.argv[0]);
+                        return Ok(127);
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        eprintln!("vm: command not executable: {}", req.argv[0]);
+                        return Ok(126);
+                    }
+                    _ => {}
+                }
+            }
+            return Err(err)
+                .with_context(|| format!("running {:?} in {}", req.argv.join(" "), cwd.display()));
+        }
+    };
     Ok(exit_code(&status))
 }
 

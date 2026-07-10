@@ -36,6 +36,10 @@ pub enum Command {
         force: bool,
     },
     /// Sync the current repo to a guest, then run a command in the guest checkout
+    ///
+    /// Exit status is the guest command's own, except vm's reserved codes:
+    /// 125 = vm infrastructure error (sync/agent/ssh/VM lifecycle), 2 =
+    /// usage/config error. See the README's "Exit codes" section.
     Exec(ExecArgs),
     /// Sync the current repo to a guest without running anything
     Sync {

@@ -56,9 +56,24 @@ fn propagates_nonzero_exit_codes() {
 }
 
 #[test]
-fn missing_cwd_is_a_clear_error() {
+fn missing_cwd_is_an_infra_error() {
+    // A working directory that doesn't exist means the sync never landed — a vm
+    // infra failure, so the agent exits with the reserved 125, not a guest code.
     let (code, _) = agent_exec(&[VM_BIN, "_version"], "/definitely/not/a/dir");
-    assert_ne!(code, 0);
+    assert_eq!(code, 125);
+}
+
+#[test]
+fn command_not_found_is_127_not_infra() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A command that doesn't exist is the *command's* own result (shell code
+    // 127), never vm's reserved infra code — the guest must not let 125 leak
+    // back to the host as if it were a real exit status.
+    let (code, _) = agent_exec(
+        &["vm-test-definitely-not-an-executable"],
+        tmp.path().to_str().unwrap(),
+    );
+    assert_eq!(code, 127);
 }
 
 #[test]
