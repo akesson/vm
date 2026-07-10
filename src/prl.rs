@@ -65,7 +65,10 @@ pub fn ensure_running(name: &str) -> Result<()> {
             eprintln!("vm ▸ resuming '{name}'…");
             prlctl(&["resume", name]).map(drop)
         }
-        other => bail!("VM '{name}' is in unexpected state '{other}'"),
+        other => bail!(
+            "VM '{name}' is in unexpected state '{other}' — expected running, stopped, \
+             suspended, or paused (see `prlctl list -a`)"
+        ),
     }
 }
 
@@ -78,7 +81,8 @@ pub fn wait_for_ip(name: &str, timeout: Duration) -> Result<String> {
         }
         if Instant::now() >= deadline {
             bail!(
-                "VM '{name}' did not report an IP within {}s",
+                "VM '{name}' did not report an IP within {}s — the guest may still be \
+                 booting, or Parallels Tools isn't running in it",
                 timeout.as_secs()
             );
         }

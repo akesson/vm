@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use crate::exit::usage;
+use anyhow::Result;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -61,9 +62,14 @@ impl Config {
 
     pub fn load() -> Result<Config> {
         let path = Self::path();
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("cannot read config at {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("invalid config at {}", path.display()))
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            usage(format!(
+                "cannot read config at {} ({e}) — create it, or point $VM_CONFIG at one",
+                path.display()
+            ))
+        })?;
+        Self::parse(&text)
+            .map_err(|e| usage(format!("invalid config at {} — {e:#}", path.display())))
     }
 
     pub fn parse(text: &str) -> Result<Config> {
@@ -74,10 +80,10 @@ impl Config {
     pub fn get(&self, alias: &str) -> Result<&VmConfig> {
         self.vm.get(alias).ok_or_else(|| {
             let known: Vec<&str> = self.vm.keys().map(String::as_str).collect();
-            anyhow::anyhow!(
+            usage(format!(
                 "unknown VM alias '{alias}' (configured: {})",
                 known.join(", ")
-            )
+            ))
         })
     }
 
@@ -92,25 +98,25 @@ impl Config {
             return self.find_by_os(os);
         }
         let known: Vec<&str> = self.vm.keys().map(String::as_str).collect();
-        bail!(
+        Err(usage(format!(
             "unknown target '{target}' — expected a configured alias ({}) or an OS name (windows, linux, macos)",
             known.join(", ")
-        )
+        )))
     }
 
     /// Find the (single) VM configured for an OS.
     pub fn find_by_os(&self, os: GuestOs) -> Result<(&str, &VmConfig)> {
         let mut matches = self.vm.iter().filter(|(_, vm)| vm.os == os);
         let Some((alias, vm)) = matches.next() else {
-            bail!(
+            return Err(usage(format!(
                 "no VM configured for os '{os:?}' in {}",
                 Self::path().display()
-            );
+            )));
         };
         if let Some((other, _)) = matches.next() {
-            bail!(
+            return Err(usage(format!(
                 "multiple VMs configured for os '{os:?}' ({alias}, {other}); use `vm exec <alias>`"
-            );
+            )));
         }
         Ok((alias.as_str(), vm))
     }

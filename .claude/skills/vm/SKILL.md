@@ -62,8 +62,14 @@ scripts that choose between native and VM do their own OS check.
   `prlctl exec` into the console session (ssh would land in session 0 with an
   empty desktop); unix guests go over ssh, which reaches AT-SPI / the AX API
   directly. So UIA/accessibility tests need no special flag — plain `vm exec`.
-- Exit codes propagate. Killing `vm` (Ctrl-C, SIGKILL, closed session) kills
-  the whole process tree in the guest — no orphaned compilers.
+- Exit codes propagate: a guest command's own exit code is what `vm` returns.
+  vm's *own* failures are reserved so a caller can tell "the command failed" from
+  "vm hiccuped": `125` = infra error (sync/agent/ssh/VM lifecycle; often
+  transient, may be worth a retry), `2` = usage/config error (bad target,
+  missing/invalid config, not in a git repo — fix it, don't retry). Caveats:
+  `255` and `127` stay ambiguous (ssh conn-fail vs a guest exit 255; agent
+  missing vs command-not-found). Killing `vm` (Ctrl-C, SIGKILL, closed session)
+  kills the whole process tree in the guest — no orphaned compilers.
 
 ## Config
 

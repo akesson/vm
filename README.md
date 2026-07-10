@@ -27,6 +27,25 @@ vm ls
   (ssh children land in session 0, where UIA and other GUI APIs see an empty
   desktop), so GUI automation works on all three guests with plain `vm exec`.
 
+## Exit codes
+
+`vm` passes a guest command's exit code straight through, and reserves two codes
+for its *own* failures so a caller — a shell, a `mise` fan-out — can tell "the
+command failed" from "vm failed" and retry only the latter:
+
+| Code | Meaning |
+|---|---|
+| `0` | the guest command succeeded |
+| `2` | **vm usage/config error** — bad invocation, unreadable or invalid config, unknown alias/target/OS, run outside a git repo. Fix your setup; retrying won't help. (Also clap's own argument-parse errors.) |
+| `125` | **vm infrastructure error** — sync, agent, ssh/transport, or VM lifecycle. vm itself failed and the command may not have run; often transient, so a retry may help. |
+| `126` / `127` | guest command found-but-not-executable / not found |
+| other | the guest command's own exit code, untouched (signal death shows as `128 + signal`) |
+
+Two ambiguities are unavoidable and shared with `ssh`/`docker`: `255` can be an
+ssh connection failure *or* a guest command that itself exited 255, and `127`
+can be a missing guest agent *or* a genuine command-not-found. The `vm ▸ …`
+breadcrumb and the `vm: error:` / `vm: config error:` line disambiguate.
+
 ## Claude in a VM
 
 `vm claude <target> "<prompt>"` runs Claude Code headless (`claude -p`) in

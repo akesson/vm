@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::proto::{ExecRequest, PROTO_VERSION};
 use crate::{commands, mapping, prl, ssh, sync};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Stdio;
@@ -80,12 +80,26 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     // the agent's watcher sees EOF, and the guest kills the child tree.
     let mut agent_stdin = child.stdin.take().expect("piped stdin");
     agent_stdin.write_all(request_line.as_bytes())?;
-    let status = child.wait()?;
+    let status = child.wait().context("waiting on the exec transport")?;
     drop(agent_stdin);
-    let code = status.code().unwrap_or(255);
+    let code = match status.code() {
+        Some(code) => code,
+        // No exit code means the transport itself was killed by a signal while
+        // this process survived (the connection dropped, or ssh/prlctl was
+        // signalled) — a vm infra failure, not a result from the guest command.
+        None => bail!(
+            "the exec transport to {alias} was killed before the guest reported an \
+             exit status — the connection dropped, or ssh/prlctl was signalled"
+        ),
+    };
 
+    // 127 now doubles as the guest reporting command-not-found (see
+    // exec/guest.rs), so keep the hint suggestive rather than assertive.
     if code == 127 {
-        eprintln!("vm ▸ {alias} ▸ exit 127 — is the agent installed? try `vm deploy {alias}`");
+        eprintln!(
+            "vm ▸ {alias} ▸ exit 127 — command not found in the guest \
+             (or the agent is missing — try `vm deploy {alias}`)"
+        );
     }
 
     if opts.writeback
