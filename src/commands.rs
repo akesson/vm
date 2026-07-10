@@ -110,6 +110,18 @@ pub fn agent_path(vm: &VmConfig) -> String {
     }
 }
 
+/// The agent path as invoked through the console-session transport
+/// (`prlctl exec`), which runs through cmd.exe rather than a POSIX shell:
+/// `~` never expands there, but `%USERPROFILE%` does, and path separators
+/// must be backslashes.
+pub fn agent_console_path(vm: &VmConfig) -> String {
+    let path = agent_path(vm);
+    match path.strip_prefix("~/") {
+        Some(rest) => format!(r"%USERPROFILE%\{}", rest.replace('/', r"\")),
+        None => path.replace('/', r"\"),
+    }
+}
+
 /// Invoke a hidden agent verb in the guest, capturing stdout. Fails with the
 /// agent's stderr, or a deploy hint when the binary is missing.
 pub fn agent_call(vm: &VmConfig, target: &SshTarget, args: &[&str]) -> Result<String> {
@@ -360,5 +372,31 @@ mod tests {
         assert!(err.contains("39.0 GiB free"), "{err}");
         assert!(err.contains("~40.0 GiB"), "{err}");
         assert!(err.contains("20.0 GiB RAM"), "{err}");
+    }
+
+    fn win_vm(agent_path: Option<&str>) -> VmConfig {
+        let toml = format!(
+            "parallels_name = \"W\"\nos = \"windows\"\nuser = \"u\"\nwork_root = 'C:\\work'\n{}",
+            agent_path.map_or(String::new(), |p| format!("agent_path = '{p}'\n"))
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn console_path_rewrites_tilde_for_cmd() {
+        // prlctl exec has no POSIX shell: `~` stays literal, %USERPROFILE%
+        // expands (via cmd), and cmd needs backslash separators.
+        assert_eq!(
+            agent_console_path(&win_vm(None)),
+            r"%USERPROFILE%\.vm\bin\vm.exe"
+        );
+    }
+
+    #[test]
+    fn console_path_keeps_absolute_paths_with_backslashes() {
+        assert_eq!(
+            agent_console_path(&win_vm(Some(r"C:\tools/vm.exe"))),
+            r"C:\tools\vm.exe"
+        );
     }
 }

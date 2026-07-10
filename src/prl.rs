@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// One VM as reported by `prlctl list -a --json`.
@@ -84,6 +84,28 @@ pub fn wait_for_ip(name: &str, timeout: Duration) -> Result<String> {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Base invocation for running a command in the guest's *console session*
+/// (the interactive desktop) via Parallels Tools, as the console-logged-in
+/// user. This is how Windows exec reaches session 1: ssh children land in
+/// session 0 on a non-interactive window station, where UIA and every other
+/// GUI API see an empty desktop. Caveats: argv is re-joined guest-side (no
+/// POSIX shell, so `~` never expands), and it requires a user logged in at
+/// the console.
+pub fn exec_console(name: &str) -> Command {
+    let mut cmd = Command::new("prlctl");
+    cmd.args(["exec", name, "--current-user"]);
+    cmd
+}
+
+/// Run a command in the console session, capturing output (for doctor).
+pub fn exec_console_capture(name: &str, args: &[&str]) -> Result<Output> {
+    exec_console(name)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run prlctl exec")
 }
 
 pub fn stop(name: &str, kill: bool) -> Result<()> {

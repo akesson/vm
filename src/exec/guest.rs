@@ -88,7 +88,31 @@ fn augmented_path() -> String {
         path.push_str(&format!("{home}{dirsep}{dir}{sep}"));
     }
     path.push_str(&current);
+    #[cfg(windows)]
+    if let Some(usr_bin) = git_usr_bin(&current) {
+        path.push(sep);
+        path.push_str(&usr_bin);
+    }
     path
+}
+
+/// Git for Windows' POSIX userland (`sh`, `bash`, `printf`, …). An ssh
+/// session has it implicitly because sshd's DefaultShell is Git Bash, but the
+/// console-session transport (prlctl exec) starts from the plain user
+/// environment. Append it — at the tail, so system32's `find`/`sort` keep
+/// winning — to make commands behave the same over both transports.
+#[cfg(windows)]
+fn git_usr_bin(path: &str) -> Option<String> {
+    // git.exe on PATH lives at <install>\cmd\git.exe; the userland is
+    // <install>\usr\bin.
+    std::env::split_paths(path)
+        .filter(|dir| dir.join("git.exe").is_file())
+        .filter_map(|dir| {
+            let usr_bin = dir.parent()?.join("usr").join("bin");
+            usr_bin.join("sh.exe").is_file().then_some(usr_bin)
+        })
+        .next()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn exit_code(status: &std::process::ExitStatus) -> i32 {

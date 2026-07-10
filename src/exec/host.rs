@@ -1,4 +1,4 @@
-use crate::config::{Config, VmConfig};
+use crate::config::{Config, GuestOs, VmConfig};
 use crate::proto::{ExecRequest, PROTO_VERSION};
 use crate::{commands, mapping, prl, ssh, sync};
 use anyhow::{Context, Result};
@@ -66,14 +66,12 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     );
     let started = Instant::now();
 
-    let mut child = ssh::ssh_command(&target)
-        .arg(commands::agent_path(vm))
-        .arg("_exec")
+    let mut child = agent_exec_command(vm, &target)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to spawn ssh")?;
+        .context("failed to spawn the exec transport")?;
     let mut request_line = serde_json::to_string(&req)?;
     request_line.push('\n');
     // Take stdin OUT of the Child: Child::wait() closes child.stdin before
@@ -102,6 +100,33 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         started.elapsed().as_secs_f32()
     );
     Ok(code)
+}
+
+/// The host process that carries an ExecRequest to the guest agent. Unix
+/// guests go over ssh. Windows goes through `prlctl exec --current-user`
+/// instead: sshd puts children in session 0 on a non-interactive window
+/// station, where UIA (and any GUI automation) sees an empty desktop, while
+/// Parallels Tools injects into the console session. Same agent, same
+/// protocol — stdout/stderr stream and stdin stays the liveness channel
+/// either way.
+fn agent_exec_command(vm: &VmConfig, target: &ssh::SshTarget) -> std::process::Command {
+    match vm.os {
+        GuestOs::Windows => {
+            let mut cmd = prl::exec_console(&vm.parallels_name);
+            // Through cmd.exe so %USERPROFILE% in the agent path expands.
+            cmd.args([
+                "cmd",
+                "/c",
+                &format!("{} _exec", commands::agent_console_path(vm)),
+            ]);
+            cmd
+        }
+        GuestOs::Linux | GuestOs::Macos => {
+            let mut cmd = ssh::ssh_command(target);
+            cmd.arg(commands::agent_path(vm)).arg("_exec");
+            cmd
+        }
+    }
 }
 
 fn writeback(

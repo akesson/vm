@@ -21,9 +21,10 @@ vm ls
 - **One-way by default.** Guests cannot corrupt the host tree; `--writeback`
   explicitly returns source changes made in the guest (e.g. `clippy --fix`).
 - **ssh is the transport, prlctl does what only it can**: VM lifecycle,
-  IP discovery, screenshots, snapshots, and first-time bootstrap.
-- `vm run --os <windows|linux|macos>` runs **natively** when the host already
-  is that OS — the same mise task works on a dev Mac, inside a VM, and on CI.
+  IP discovery, screenshots, snapshots, and first-time bootstrap — plus
+  Windows exec: `prlctl exec` carries the command into the console session
+  (ssh children land in session 0, where UIA and other GUI APIs see an empty
+  desktop), so GUI automation works on all three guests with plain `vm exec`.
 
 ## Setup
 

@@ -48,8 +48,13 @@ vm with-snapshot <target> -- <cmd>…  # snapshot, run, roll back — guest ends
 on a macOS host goes to the macOS VM. To run something natively, just run it;
 scripts that choose between native and VM do their own OS check.
 
-- Args after `--` arrive in the guest byte-identical (JSON over ssh, no shell
-  quoting layer). `--shell` runs the command through `sh -c` / `cmd /C` instead.
+- Args after `--` arrive in the guest byte-identical (JSON to a guest agent,
+  no shell quoting layer). `--shell` runs the command through `sh -c` /
+  `cmd /C` instead.
+- Commands run where GUI automation works on every OS: Windows exec rides
+  `prlctl exec` into the console session (ssh would land in session 0 with an
+  empty desktop); unix guests go over ssh, which reaches AT-SPI / the AX API
+  directly. So UIA/accessibility tests need no special flag — plain `vm exec`.
 - Exit codes propagate. Killing `vm` (Ctrl-C, SIGKILL, closed session) kills
   the whole process tree in the guest — no orphaned compilers.
 
@@ -78,8 +83,10 @@ work_root = "~/work"
   only use it for commands that deliberately edit sources.
 - Sync pushes bypass git hooks by design (`--no-verify`) — they are replication,
   not publishing.
-- macOS guests (Apple Silicon): no `prlctl exec` — ssh only. Snapshots need
-  Parallels 20+ with macOS 14+ on host and guest.
+- macOS guests (Apple Silicon): snapshots need Parallels 20+ with
+  macOS 14+ on host and guest.
   Full Xcode is required in the guest for xcodebuild/XCUITest;
   SPM `swift test` works with just the Command Line Tools.
+- Windows exec needs the config user logged in at the VM console (it runs in
+  that session); `vm doctor` checks this ("console user" / "console agent").
 - "guest agent missing/outdated" errors → `vm deploy <alias>`.
