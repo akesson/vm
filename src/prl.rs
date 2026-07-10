@@ -131,7 +131,8 @@ pub struct VmDetails {
 
 pub fn details(name: &str) -> Result<VmDetails> {
     let json = prlctl(&["list", "-i", name, "--json"])?;
-    parse_details(&json).with_context(|| format!("unexpected `prlctl list -i {name} --json` output"))
+    parse_details(&json)
+        .with_context(|| format!("unexpected `prlctl list -i {name} --json` output"))
 }
 
 fn parse_details(json: &str) -> Result<VmDetails> {
@@ -152,7 +153,9 @@ fn parse_details(json: &str) -> Result<VmDetails> {
         size: String,
     }
     let mut infos: Vec<Info> = serde_json::from_str(json)?;
-    let info = infos.pop().ok_or_else(|| anyhow::anyhow!("empty VM info list"))?;
+    let info = infos
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("empty VM info list"))?;
     let mb = info
         .hardware
         .memory

@@ -9,7 +9,7 @@ pub mod exec;
 pub mod lock;
 pub mod mapping;
 pub mod prl;
-pub mod reap;
 pub mod proto;
+pub mod reap;
 pub mod ssh;
 pub mod sync;
