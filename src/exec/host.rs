@@ -79,9 +79,9 @@ pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
 /// `exec` wraps it in a shared lock; `commands::with_snapshot` calls it while
 /// already holding the exclusive one (where a shared lock would deadlock).
 pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
-    prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name)?;
-    let target = commands::ssh_target(vm)?;
+    // Starts or resumes the VM if it is down, and says so — an exec never asks
+    // the caller to bring a VM up first.
+    let target = commands::bring_up(alias, vm)?;
     let repo = mapping::RepoLocation::discover()?;
 
     // The guest env (mise, …) that sets up and wraps this run: an explicit

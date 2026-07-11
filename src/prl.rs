@@ -52,24 +52,51 @@ pub fn find(name: &str) -> Result<PrlVm> {
         .ok_or_else(|| anyhow::anyhow!("no Parallels VM named '{name}' (see `prlctl list -a`)"))
 }
 
-/// Start or resume as appropriate; no-op when already running.
-pub fn ensure_running(name: &str) -> Result<()> {
+/// Start or resume as appropriate; no-op when already running. `true` if it
+/// had to act.
+///
+/// There is no `vm start` — every command that needs a guest brings it up
+/// itself — so this is the only place a wake is announced, and it always is:
+/// the caller is about to sit through a boot or a resume, and silence there
+/// reads as a hang. A VM that is already running is the common case and says
+/// nothing.
+pub fn ensure_running(alias: &str, name: &str) -> Result<bool> {
     let vm = find(name)?;
     match vm.status.as_str() {
-        "running" => Ok(()),
+        "running" => Ok(false),
         "stopped" => {
-            eprintln!("vm ▸ starting '{name}'…");
-            prlctl(&["start", name]).map(drop)
+            eprintln!("vm ▸ {alias} ▸ '{name}' is stopped — starting it…");
+            prlctl(&["start", name]).map(|_| true)
         }
-        "suspended" | "paused" => {
-            eprintln!("vm ▸ resuming '{name}'…");
-            prlctl(&["resume", name]).map(drop)
+        status @ ("suspended" | "paused") => {
+            eprintln!("vm ▸ {alias} ▸ '{name}' is {status} — resuming it…");
+            prlctl(&["resume", name]).map(|_| true)
         }
         other => bail!(
             "VM '{name}' is in unexpected state '{other}' — expected running, stopped, \
              suspended, or paused (see `prlctl list -a`)"
         ),
     }
+}
+
+/// A VM brought up: where to reach it, and whether vm had to wake it to get
+/// there. `woke` is what tells a caller the guest's services may still be
+/// coming up behind the IP (see `commands::bring_up`).
+pub struct Up {
+    pub ip: String,
+    pub woke: bool,
+}
+
+/// Bring the VM up if it isn't already, and wait until it reports an IP.
+///
+/// Announcing the wait is this function's job as much as performing it: a wake
+/// says what it is doing, and a long IP wait says where it has got to. A VM
+/// that was already up returns on the first look and prints nothing —
+/// `commands::bring_up` closes the loop with the readiness line.
+pub fn ensure_up(alias: &str, name: &str) -> Result<Up> {
+    let woke = ensure_running(alias, name)?;
+    let ip = wait_for_ip(alias, name)?;
+    Ok(Up { ip, woke })
 }
 
 /// How long a guest gets to report an IP once Parallels has it running.
@@ -136,7 +163,8 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
 }
 
 /// Wait until the guest reports an IP (Parallels Tools up / DHCP done),
-/// narrating any wait long enough to wonder about.
+/// narrating any wait long enough to wonder about. [`ensure_up`] announces the
+/// readiness that ends it.
 ///
 /// The VM's *status* is watched, not just its IP, because a VM that is not
 /// running can never report one — so sitting out the full timeout on a
@@ -144,25 +172,19 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
 /// ("the guest may still be booting"). And a VM can be down here even though
 /// `ensure_running` just brought it up: `vm reap` or a suspend from the
 /// Parallels GUI can put it back down while this loop is waiting on it.
-pub fn wait_for_ip(name: &str) -> Result<String> {
+fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
     let start = Instant::now();
     let mut next_beat = HEARTBEAT;
     loop {
         let vm = find(name)?;
         let waited = start.elapsed();
         match assess(name, &vm.status, vm.ip(), waited, IP_TIMEOUT) {
-            Step::Up(ip) => {
-                // Only worth a line if the caller was kept waiting for it.
-                if waited >= HEARTBEAT {
-                    eprintln!("vm ▸ '{name}' ready at {ip} after {}s", waited.as_secs());
-                }
-                return Ok(ip);
-            }
+            Step::Up(ip) => return Ok(ip),
             Step::Fail(msg) => bail!("{msg}"),
             Step::Wait => {
                 if waited >= next_beat {
                     eprintln!(
-                        "vm ▸ '{name}' {}, no IP yet — {}s of {}s",
+                        "vm ▸ {alias} ▸ '{name}' {}, no IP yet — {}s of {}s",
                         vm.status,
                         waited.as_secs(),
                         IP_TIMEOUT.as_secs()
@@ -197,17 +219,10 @@ pub fn exec_console_capture(name: &str, args: &[&str]) -> Result<Output> {
         .context("failed to run prlctl exec")
 }
 
-pub fn stop(name: &str, kill: bool) -> Result<()> {
-    let args: &[&str] = if kill {
-        &["stop", name, "--kill"]
-    } else {
-        &["stop", name]
-    };
-    prlctl(args).map(drop)
-}
-
-/// Suspend (RAM image to disk; `ensure_running` resumes in ~1s). Reap
-/// plumbing only — there is deliberately no `vm suspend` command.
+/// Suspend (RAM image to disk; [`ensure_running`] resumes in ~1s). Reap
+/// plumbing only — suspending is the *only* way vm ever puts a VM down, and it
+/// does so on its own schedule, so there is deliberately no `vm suspend` and no
+/// `vm stop`. A full power-off is a Parallels-level operation (`prlctl stop`).
 pub fn suspend(name: &str) -> Result<()> {
     prlctl(&["suspend", name]).map(drop)
 }

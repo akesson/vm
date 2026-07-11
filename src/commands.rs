@@ -15,7 +15,11 @@ impl std::fmt::Display for GuestOs {
     }
 }
 
-/// Resolve the address to ssh to: config override, or the IP Parallels reports.
+/// Resolve the address to ssh to *without* touching the VM: config override, or
+/// the IP Parallels already reports. For the read-only probes (`vm doctor`'s
+/// live checks, reap's console-idle probe), which only ever ask about a VM that
+/// is already running. Everything that intends to *use* a guest calls
+/// [`bring_up`] instead.
 pub fn ssh_target(vm: &VmConfig) -> Result<SshTarget> {
     let host = match &vm.host {
         Some(host) => host.clone(),
@@ -24,7 +28,7 @@ pub fn ssh_target(vm: &VmConfig) -> Result<SshTarget> {
             prl.ip()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "VM '{}' has no IP (status: {}); `vm start` it first",
+                        "VM '{}' has no IP (status: {})",
                         vm.parallels_name,
                         prl.status
                     )
@@ -36,6 +40,84 @@ pub fn ssh_target(vm: &VmConfig) -> Result<SshTarget> {
         user: vm.user.clone(),
         host,
     })
+}
+
+/// Bring the VM up — starting or resuming it as needed — and return the address
+/// to reach the guest at, ready to use. Every command that runs something in a
+/// guest goes through here.
+///
+/// This is why there is no `vm start`: a VM that is down is not an error state a
+/// caller has to resolve first, it is a VM one second away from being up, and
+/// the command that wants it says so and waits (see [`prl::ensure_up`]). The
+/// mirror image is `vm reap`, which suspends VMs nobody is using — together they
+/// mean VM lifecycle is never something a caller has to think about.
+///
+/// The caller is responsible for holding the VM's use lock (`lock::shared`)
+/// across the work that follows, so reap cannot suspend the VM back out from
+/// under it.
+pub fn bring_up(alias: &str, vm: &VmConfig) -> Result<SshTarget> {
+    let started = Instant::now();
+    let up = prl::ensure_up(alias, &vm.parallels_name)?;
+    let target = SshTarget {
+        user: vm.user.clone(),
+        host: vm.host.clone().unwrap_or(up.ip),
+    };
+    // An IP is not the same as a guest that will talk to us: a VM reports one as
+    // soon as Parallels Tools is up, which on a cold boot is well before sshd
+    // accepts connections — and every guest is cold-booted after a host reboot.
+    // Everything a command does next rides ssh (the sync, the agent, and even a
+    // Windows exec's sync), so wait for the door to actually open. Only after a
+    // wake: a VM that was already running has long since opened it, and probing
+    // a warm guest would put an ssh round-trip in front of every exec.
+    if up.woke {
+        wait_for_ssh(alias, &target);
+    }
+    if up.woke || started.elapsed() >= HEARTBEAT {
+        eprintln!(
+            "vm ▸ {alias} ▸ ready at {} ▸ {:.1}s",
+            target.host,
+            started.elapsed().as_secs_f32()
+        );
+    }
+    Ok(target)
+}
+
+/// A wait worth narrating, and the point past which a guest that has an IP but
+/// no ssh is more likely broken than slow.
+const HEARTBEAT: Duration = Duration::from_secs(10);
+const SSH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Wait for a freshly woken guest to accept ssh.
+///
+/// Advisory, not a gate: if ssh never comes up we let the caller's real work
+/// proceed and fail on its own terms. It will do so in a second, with the actual
+/// ssh error — a better answer than one this function could invent, and it keeps
+/// the odd guest that is reachable some other way (a Windows console exec with
+/// `--no-sync`) working instead of being blocked here on a door it never needed.
+fn wait_for_ssh(alias: &str, target: &SshTarget) {
+    let started = Instant::now();
+    let mut next_beat = HEARTBEAT;
+    while !ssh::reachable(target) {
+        if started.elapsed() >= SSH_TIMEOUT {
+            eprintln!(
+                "vm ▸ {alias} ▸ WARNING: no ssh at {} {}s after the guest came up — \
+                 continuing anyway (guest sshd not running? see `vm doctor {alias}`)",
+                target.destination(),
+                started.elapsed().as_secs()
+            );
+            return;
+        }
+        if started.elapsed() >= next_beat {
+            eprintln!(
+                "vm ▸ {alias} ▸ waiting for ssh at {} — {}s of {}s",
+                target.destination(),
+                started.elapsed().as_secs(),
+                SSH_TIMEOUT.as_secs()
+            );
+            next_beat = started.elapsed() + HEARTBEAT;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }
 
 pub fn ls() -> Result<i32> {
@@ -96,40 +178,6 @@ fn format_row<const N: usize>(row: &[String; N], widths: &[usize]) -> String {
         }
     }
     line
-}
-
-pub fn start(alias: &str) -> Result<i32> {
-    let cfg = Config::load()?;
-    let vm = cfg.get(alias)?;
-    let _use = lock::shared(alias)?;
-    prl::ensure_running(&vm.parallels_name)?;
-    let ip = prl::wait_for_ip(&vm.parallels_name)?;
-    let target = SshTarget {
-        user: vm.user.clone(),
-        host: vm.host.clone().unwrap_or(ip),
-    };
-
-    // Wait for sshd so a following `vm exec` never races the boot.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if ssh::reachable(&target) {
-            eprintln!(
-                "vm ▸ {alias} ({}) ▸ running ▸ ssh {}",
-                vm.parallels_name,
-                target.destination()
-            );
-            return Ok(0);
-        }
-        if Instant::now() >= deadline {
-            eprintln!(
-                "vm ▸ {alias} ▸ running, but ssh to {} not reachable after 60s \
-                 (guest sshd not set up? see `vm doctor {alias}`)",
-                target.destination()
-            );
-            return Ok(0);
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    }
 }
 
 /// The vm agent binary inside the guest. `~`/`%USERPROFILE%` are expanded by
@@ -265,15 +313,13 @@ pub fn first_sync_hook(
     Ok(())
 }
 
-/// `vm sync <alias> [--guest-env …]`: start the VM if needed, then sync (and
+/// `vm sync <alias> [--guest-env …]`: bring the VM up if needed, then sync (and
 /// run the guest env's first-sync setup, exactly as an exec would).
 pub fn sync_cmd(alias: &str, guest_env: Option<crate::guest_env::GuestEnv>) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
     let _use = lock::shared(alias)?;
-    prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name)?;
-    let target = ssh_target(vm)?;
+    let target = bring_up(alias, vm)?;
     let repo = mapping::RepoLocation::discover()?;
     let genv = crate::guest_env::resolve(guest_env, &repo.root);
     genv.announce(alias);
@@ -282,30 +328,18 @@ pub fn sync_cmd(alias: &str, guest_env: Option<crate::guest_env::GuestEnv>) -> R
     Ok(0)
 }
 
-pub fn stop(alias: &str, kill: bool, force: bool) -> Result<i32> {
-    let cfg = Config::load()?;
-    let vm = cfg.get(alias)?;
-    let _claim = if force {
-        None
-    } else {
-        match lock::try_exclusive(alias)? {
-            Some(claim) => Some(claim),
-            None => bail!(
-                "'{alias}' is in use by another vm process — retry when idle, \
-                 or `vm stop {alias} --force`"
-            ),
-        }
-    };
-    prl::stop(&vm.parallels_name, kill)?;
-    eprintln!("vm ▸ {alias} ▸ stopped");
-    Ok(0)
-}
-
 /// `vm shot <alias> [file]`: screenshot the VM display. Useful for seeing GUI
 /// state ssh can't (TCC dialogs, login screens, stuck installers).
+///
+/// Brings the VM up first — `prlctl capture` fails outright on a suspended VM —
+/// but does *not* wait for an IP the way [`bring_up`] does: a guest whose
+/// network or Parallels Tools never came up is precisely the guest whose screen
+/// is worth looking at, and it must not be the one command that refuses to.
 pub fn shot(alias: &str, file: Option<std::path::PathBuf>) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
+    let _use = lock::shared(alias)?;
+    prl::ensure_running(alias, &vm.parallels_name)?;
     let file = file.unwrap_or_else(|| {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -327,9 +361,7 @@ pub fn clean(alias: &str) -> Result<i32> {
     let repo = mapping::RepoLocation::discover()?;
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
     let _use = lock::shared(alias)?;
-    prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name)?;
-    let target = ssh_target(vm)?;
+    let target = bring_up(alias, vm)?;
     // All guests speak POSIX (Windows sshd shell is Git Bash).
     let quoted = ssh::shell_quote(&guest_repo);
     let out = ssh::run_capture(&target, &["rm", "-rf", &quoted])?;
@@ -361,10 +393,12 @@ pub fn with_snapshot(
              VM to itself (rollback would destroy the other run)"
         );
     };
-    prl::ensure_running(&vm.parallels_name)?;
+    // Fully up before the snapshot, not merely powered on: the memory image
+    // captures whatever state the guest is in, so snapshotting one that is still
+    // finding its feet is a state the rollback would faithfully restore.
+    bring_up(alias, vm)?;
     sweep_stale_snapshots(alias, &vm.parallels_name)?;
     ensure_snapshot_headroom(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name)?;
 
     let id = prl::snapshot_create(&vm.parallels_name, &format!("vm-with-snapshot-{alias}"))?;
     eprintln!("vm ▸ {alias} ▸ snapshot {id} taken");
