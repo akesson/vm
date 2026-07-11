@@ -1,4 +1,6 @@
 use crate::config::{Config, GuestOs, VmConfig};
+use crate::exit::usage;
+use crate::guest_env::{ActiveEnv, GuestEnv};
 use crate::proto::{ExecRequest, PROTO_VERSION};
 use crate::{commands, mapping, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
@@ -12,35 +14,41 @@ pub struct ExecOptions {
     pub no_sync: bool,
     pub writeback: bool,
     pub shell: bool,
+    /// Snapshot the VM, run, then roll it back. Takes the VM exclusively.
+    pub with_snapshot: bool,
     /// Run natively when the host OS already matches the target's os, instead
     /// of routing to the VM. See [`exec`].
     pub or_native: bool,
-    /// Prepend the repo's `.vm.toml` `wrap` prefix to the guest command. Set by
-    /// the `exec`/`with-snapshot` CLI paths; `vm claude` leaves it off so its
-    /// own `claude` argv is never wrapped.
-    pub apply_wrap: bool,
+    /// Explicit `--guest-env` choice; `None` auto-detects from the repo root.
+    pub guest_env: Option<GuestEnv>,
     /// `NAME=value` / bare `NAME` specs from `-e`; resolved against the host
     /// environment when the request is built.
     pub env: Vec<String>,
     pub cmd: Vec<String>,
 }
 
-/// `vm exec <alias|os> -- cmd…`: sync, run in the guest checkout, propagate
-/// exit. The target is an alias or an OS name; by default it is always a VM
-/// — even when the OS named is the host's own — so a `vm` invocation never
-/// silently runs on the host.
+/// `vm exec <alias> -- cmd…`: sync, run in the guest checkout, propagate exit.
+/// The target is a VM alias from the machine config, and by default the command
+/// always runs in that VM — even when its os is the host's own — so a `vm`
+/// invocation never silently runs on the host.
 ///
 /// `--or-native` opts into the one exception: when the host OS already matches
 /// the target's os, the command runs natively (no VM, no sync) with a loud
 /// banner so the location is never ambiguous. This is what lets one task drive
 /// a guest on a dev host and run in place on a CI runner that is already the
 /// target OS — where there is neither Parallels nor a machine config. To keep
-/// that CI path working without config, an OS-name target (`windows`) is
-/// matched before the config is even loaded; an alias target needs the config
-/// to learn its os (so aliases only take the native path on a configured host).
+/// that CI path working without config, a target *literally named* for an OS
+/// (`windows`/`linux`/`macos`) is matched against the host before the config is
+/// even loaded; any other alias needs the config to learn its os (so it only
+/// takes the native path on a configured host).
 pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
-    // Config-free native fast path: an OS-name target we can match against the
-    // host without the machine config (CI runners have neither config nor
+    // Validate `-e` before touching anything: a typo'd spec must not first cost
+    // a VM resume, a sync, and — under --with-snapshot — a snapshot and its
+    // rollback. Cheap and pure, so the real resolution below just redoes it.
+    resolve_env(&opts.env, |name| std::env::var(name).ok())?;
+
+    // Config-free native fast path: an os-literal target we can match against
+    // the host without the machine config (CI runners have neither config nor
     // Parallels, so loading it would fail before we could decide to go native).
     if opts.or_native
         && let Some(os) = GuestOs::parse(target)
@@ -49,32 +57,38 @@ pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
         return run_native(opts);
     }
     let cfg = Config::load()?;
-    let (alias, vm) = cfg.resolve(target)?;
-    // Alias target on a matching host: honor --or-native now that config has
-    // told us the alias's os.
+    let vm = cfg.get(target)?;
+    let alias = target;
+    // Alias on a matching host: honor --or-native now that config has told us
+    // the alias's os.
     if opts.or_native && vm.os == GuestOs::current() {
         return run_native(opts);
     }
-    // Registers this run as a use of the VM: stop/with-snapshot/reap keep
+    if opts.with_snapshot {
+        // Takes the VM exclusively and rolls it back around the run.
+        return commands::with_snapshot(alias, vm, opts);
+    }
+    // Registers this run as a use of the VM: stop/--with-snapshot/reap keep
     // their hands off until it finishes. Blocks briefly if one of those is
     // mid-flight right now.
     let _use = crate::lock::shared(alias)?;
     exec_in(alias, vm, opts)
 }
 
-/// `exec` without registering a use — only for a caller that already holds
-/// the VM's exclusive lock (with-snapshot), where `exec` would deadlock.
-pub fn exec_unlocked(target: &str, opts: &ExecOptions) -> Result<i32> {
-    let cfg = Config::load()?;
-    let (alias, vm) = cfg.resolve(target)?;
-    exec_in(alias, vm, opts)
-}
-
-fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
+/// The body of an exec against a resolved VM, without taking the VM's use lock.
+/// `exec` wraps it in a shared lock; `commands::with_snapshot` calls it while
+/// already holding the exclusive one (where a shared lock would deadlock).
+pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     prl::ensure_running(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = commands::ssh_target(vm)?;
     let repo = mapping::RepoLocation::discover()?;
+
+    // The guest env (mise, …) that sets up and wraps this run: an explicit
+    // `--guest-env`, else detected from the repo root. Announced before it does
+    // anything, so a detected env is never a silent behavior change.
+    let genv = crate::guest_env::resolve(opts.guest_env, &repo.root);
+    genv.announce(alias);
 
     let base = if opts.no_sync {
         None
@@ -82,30 +96,26 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         Some(commands::sync_repo(alias, vm, &target)?)
     };
 
-    // Runs the repo's `on_first_sync` hook the first time this checkout exists
-    // (and after `vm clean`), before the user's command. No-op otherwise. Also
-    // covers `--no-sync` against a checkout that never ran it.
-    commands::first_sync_hook(alias, vm, &target, &repo)?;
+    // The guest env's one-time setup (mise: `mise trust`) the first time this
+    // checkout exists — and after `vm clean`. No-op otherwise; also covers a
+    // `--no-sync` run against a checkout that never ran it.
+    commands::first_sync_hook(alias, vm, &target, &repo, &genv)?;
 
     let cwd = mapping::guest_cwd(&vm.work_root, &repo.name, &repo.rel)?;
     let env = resolve_env(&opts.env, |name| std::env::var(name).ok())?;
-    // Prepend the repo's `.vm.toml` `wrap` prefix (e.g. `mise exec --`) on the
-    // guest path only. Prepending in argv space (not a shell string) is
-    // quoting-safe — the elements ride to the guest as JSON. `vm claude` sets
-    // `apply_wrap = false`, so its own argv is never wrapped.
-    let argv = build_argv(opts, &repo.root)?;
+    let (argv, shell) = build_argv(&opts.cmd, &genv, vm.os, opts.shell);
     let req = ExecRequest {
         version: PROTO_VERSION,
         argv,
         env,
         cwd: cwd.clone(),
-        shell: opts.shell,
+        shell,
     };
 
     eprintln!(
         "vm ▸ {alias} ({}) ▸ {cwd} ▸ $ {}",
         vm.parallels_name,
-        req.argv.join(" ")
+        render_argv(&req.argv)
     );
     let started = Instant::now();
 
@@ -147,9 +157,19 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
 
     if opts.writeback
         && let Some(base) = &base
-        && code != 255
     {
-        writeback(alias, vm, &target, &repo, base)?;
+        // 255 is ambiguous — an ssh transport failure, or a guest command that
+        // itself exited 255 — so the guest's tree can't be trusted to be the
+        // result of a completed run. Skip the writeback, but say so: a silently
+        // missing diff would look like the command simply changed nothing.
+        if code == 255 {
+            eprintln!(
+                "vm ▸ {alias} ▸ writeback skipped — exit 255 may be a dropped connection \
+                 rather than the command's own status, so the guest tree is not trusted"
+            );
+        } else {
+            writeback(alias, vm, &target, &repo, base)?;
+        }
     }
 
     eprintln!(
@@ -159,26 +179,65 @@ fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     Ok(code)
 }
 
-/// The argv sent to the guest: the user's command, optionally with the repo's
-/// `.vm.toml` `wrap` prefix prepended. Wrap is a no-op unless `apply_wrap` is
-/// set and the repo declares one, so exec/with-snapshot get it and `vm claude`
-/// (which sets `apply_wrap = false`) does not.
-fn build_argv(opts: &ExecOptions, repo_root: &std::path::Path) -> Result<Vec<String>> {
-    if !opts.apply_wrap {
-        return Ok(opts.cmd.clone());
-    }
-    let wrap = crate::repo_config::RepoConfig::load(repo_root)?.wrap;
+/// The argv (and shell mode) sent to the guest: the user's command with the
+/// guest env's wrap prefix (mise: `mise exec --`) in front, so the checkout's
+/// tools resolve. Prepending in argv space — not a shell string — is
+/// quoting-safe: the elements ride to the guest as JSON.
+///
+/// `--shell` needs the wrap to go *around the shell*, not in front of its first
+/// word. The guest runs a `--shell` request by joining argv into one script, so
+/// a wrap merely prepended there would produce `sh -c "mise exec -- cd src &&
+/// pwd"`, where mise cannot exec a shell builtin, everything past the first pipe
+/// segment escapes the environment, and `exit 42` comes back as mise's own exit
+/// code of one. So when a wrap is active the host composes the guest's shell
+/// invocation itself — it knows the guest's OS from the config — and sends a
+/// plain argv, `mise exec -- sh -c "<script>"`, putting the script inside the env.
+fn build_argv(
+    cmd: &[String],
+    genv: &ActiveEnv,
+    guest_os: GuestOs,
+    shell: bool,
+) -> (Vec<String>, bool) {
+    let wrap = genv.wrap();
     if wrap.is_empty() {
-        return Ok(opts.cmd.clone());
+        // No env to wrap: leave `--shell` to the guest, exactly as before.
+        return (cmd.to_vec(), shell);
     }
-    let mut argv = wrap;
-    argv.extend(opts.cmd.iter().cloned());
-    Ok(argv)
+    let mut argv: Vec<String> = wrap.iter().map(|s| s.to_string()).collect();
+    if shell {
+        let (bin, flag) = match guest_os {
+            GuestOs::Windows => ("cmd", "/C"),
+            GuestOs::Linux | GuestOs::Macos => ("sh", "-c"),
+        };
+        argv.extend([bin.to_string(), flag.to_string(), cmd.join(" ")]);
+        return (argv, false);
+    }
+    argv.extend(cmd.iter().cloned());
+    (argv, false)
+}
+
+/// Render an argv for the `$ …` breadcrumb. Elements are separate strings all
+/// the way to the guest, so an element holding shell syntax (`--shell`'s script:
+/// `cd src && pwd`) must be shown quoted — joined bare it would read as though
+/// the `&&` split the command, which is exactly what it does *not* do.
+fn render_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if a.is_empty()
+                || a.contains(|c: char| c.is_whitespace() || "\"'`$&|;<>()*?".contains(c))
+            {
+                format!("'{}'", a.replace('\'', r"'\''"))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `--or-native` on a host that already is the target OS: run the command in
 /// place — current dir, inherited stdio, host environment plus any `-e` vars —
-/// with no VM, sync, or repo `wrap` (natively the environment is already
+/// with no VM, sync, or guest-env wrap (natively the environment is already
 /// whatever launched the command). A loud banner records that this run stayed
 /// on the host, so `--or-native` never hides where a command executed.
 fn run_native(opts: &ExecOptions) -> Result<i32> {
@@ -186,7 +245,7 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
     eprintln!(
         "vm ▸ native ({}) ▸ $ {}",
         GuestOs::current().as_str(),
-        opts.cmd.join(" ")
+        render_argv(&opts.cmd)
     );
     let mut cmd = if opts.shell {
         let joined = opts.cmd.join(" ");
@@ -216,6 +275,9 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
 /// contain `=`). Bare `NAME` forwards the host's current value and errors if
 /// it is unset — an explicit request gets explicit feedback. On a duplicate
 /// name the last spec wins.
+///
+/// A bad spec is the caller's own invocation (a typo, a variable they forgot to
+/// export), so it is a usage error: retrying it will never help.
 fn resolve_env(
     specs: &[String],
     lookup: impl Fn(&str) -> Option<String>,
@@ -223,15 +285,15 @@ fn resolve_env(
     let mut env = BTreeMap::new();
     for spec in specs {
         match spec.split_once('=') {
-            Some(("", _)) => bail!("-e {spec}: empty variable name"),
+            Some(("", _)) => return Err(usage(format!("-e {spec}: empty variable name"))),
             Some((name, value)) => {
                 env.insert(name.to_string(), value.to_string());
             }
             None => {
                 let value = lookup(spec).ok_or_else(|| {
-                    anyhow::anyhow!(
+                    usage(format!(
                         "-e {spec}: not set on host (use -e {spec}=value to set it explicitly)"
-                    )
+                    ))
                 })?;
                 env.insert(spec.clone(), value);
             }
@@ -353,55 +415,147 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_env_spec_is_a_usage_error_not_an_infra_one() {
+        // Exit 2 ("fix your invocation"), never 125 ("transient, retry me") — a
+        // typo'd spec is not going to fix itself on a second attempt.
+        for spec in [&["=value"][..], &["NOPE_NOT_SET_ANYWHERE"][..]] {
+            let err = resolve_env(&s(spec), host(&[])).unwrap_err();
+            assert!(
+                err.downcast_ref::<crate::exit::UsageError>().is_some(),
+                "{spec:?} should be a usage error, got: {err:#}"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_name_takes_the_last_spec() {
         let env = resolve_env(&s(&["FOO=1", "FOO=2"]), host(&[])).unwrap();
         assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
     }
 
-    /// Minimal ExecOptions for the argv/native tests.
-    fn opts(cmd: &[&str], apply_wrap: bool) -> ExecOptions {
+    /// Minimal ExecOptions for the native tests.
+    fn opts(cmd: &[&str]) -> ExecOptions {
         ExecOptions {
             no_sync: false,
             writeback: false,
             shell: false,
+            with_snapshot: false,
             or_native: false,
-            apply_wrap,
+            guest_env: None,
             env: Vec::new(),
             cmd: s(cmd),
         }
     }
 
-    fn repo_with_vm_toml(body: &str) -> tempfile::TempDir {
+    /// The ActiveEnv a repo root yields, without a `--guest-env` override.
+    fn detected(root: &std::path::Path) -> ActiveEnv {
+        crate::guest_env::resolve(None, root)
+    }
+
+    /// A repo root with a mise marker, so detection activates the wrap.
+    fn mise_root() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(".vm.toml"), body).unwrap();
+        std::fs::write(tmp.path().join("mise.toml"), "[tools]\n").unwrap();
         tmp
     }
 
     #[test]
-    fn build_argv_prepends_wrap_when_enabled() {
-        let tmp = repo_with_vm_toml("wrap = [\"mise\", \"exec\", \"--\"]");
-        let argv = build_argv(&opts(&["cargo", "test"], true), tmp.path()).unwrap();
+    fn build_argv_prepends_the_guest_envs_wrap() {
+        let tmp = mise_root();
+        let (argv, shell) = build_argv(
+            &s(&["cargo", "test"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
+            false,
+        );
         assert_eq!(argv, s(&["mise", "exec", "--", "cargo", "test"]));
+        assert!(!shell);
     }
 
     #[test]
-    fn build_argv_skips_wrap_when_apply_wrap_is_false() {
-        let tmp = repo_with_vm_toml("wrap = [\"mise\", \"exec\", \"--\"]");
-        let argv = build_argv(&opts(&["cargo", "test"], false), tmp.path()).unwrap();
+    fn build_argv_without_a_guest_env_is_the_bare_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (argv, _) = build_argv(
+            &s(&["cargo", "test"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
+            false,
+        );
         assert_eq!(argv, s(&["cargo", "test"]));
     }
 
     #[test]
-    fn build_argv_no_wrap_configured_is_the_bare_command() {
-        let tmp = repo_with_vm_toml("on_first_sync = \"mise trust\"");
-        let argv = build_argv(&opts(&["cargo", "test"], true), tmp.path()).unwrap();
+    fn build_argv_honors_guest_env_none_over_detection() {
+        let tmp = mise_root();
+        let genv = crate::guest_env::resolve(Some(GuestEnv::None), tmp.path());
+        let (argv, _) = build_argv(&s(&["cargo", "test"]), &genv, GuestOs::Linux, false);
         assert_eq!(argv, s(&["cargo", "test"]));
+    }
+
+    #[test]
+    fn shell_mode_puts_the_wrap_around_the_shell_not_its_first_word() {
+        // The bug this guards: prepending the wrap in argv space and letting the
+        // guest join it into a script yields `sh -c "mise exec -- cd src && pwd"`
+        // — mise cannot exec the `cd` builtin, and `exit 42` would come back as
+        // mise's exit 1. The whole script must run *inside* the env instead.
+        let tmp = mise_root();
+        let (argv, shell) = build_argv(
+            &s(&["cd src && pwd"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
+            true,
+        );
+        assert_eq!(
+            argv,
+            s(&["mise", "exec", "--", "sh", "-c", "cd src && pwd"])
+        );
+        // Composed here, so the guest execs this argv directly rather than
+        // re-joining it into a second shell.
+        assert!(!shell);
+    }
+
+    #[test]
+    fn shell_mode_uses_the_guests_shell_not_the_hosts() {
+        // The host may be macOS while the guest is Windows — the shell is picked
+        // from the target's os, never from cfg!(windows) here.
+        let tmp = mise_root();
+        let (argv, _) = build_argv(
+            &s(&["echo hi"]),
+            &detected(tmp.path()),
+            GuestOs::Windows,
+            true,
+        );
+        assert_eq!(argv, s(&["mise", "exec", "--", "cmd", "/C", "echo hi"]));
+    }
+
+    #[test]
+    fn render_argv_quotes_elements_that_hold_shell_syntax() {
+        // `$ mise exec -- sh -c cd src && pwd` would read as if the && ran
+        // outside the wrap; it is one argument, and must look like one.
+        assert_eq!(
+            render_argv(&s(&["mise", "exec", "--", "sh", "-c", "cd src && pwd"])),
+            "mise exec -- sh -c 'cd src && pwd'"
+        );
+        assert_eq!(render_argv(&s(&["cargo", "test"])), "cargo test");
+    }
+
+    #[test]
+    fn shell_mode_without_a_guest_env_is_left_to_the_guest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (argv, shell) = build_argv(
+            &s(&["exit 42"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
+            true,
+        );
+        assert_eq!(argv, s(&["exit 42"]));
+        assert!(shell, "the guest still runs it through its own shell");
     }
 
     #[cfg(unix)]
     #[test]
     fn run_native_propagates_the_exit_code() {
-        let mut o = opts(&["sh", "-c", "exit 3"], false);
+        let mut o = opts(&["sh", "-c", "exit 3"]);
         o.shell = false;
         assert_eq!(run_native(&o).unwrap(), 3);
     }
@@ -409,7 +563,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_native_shell_mode_joins_argv() {
-        let mut o = opts(&["exit", "7"], false);
+        let mut o = opts(&["exit", "7"]);
         o.shell = true;
         assert_eq!(run_native(&o).unwrap(), 7);
     }

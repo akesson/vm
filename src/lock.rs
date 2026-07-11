@@ -2,7 +2,7 @@
 //!
 //! Every command that uses a VM (exec, sync, deploy, clean, start) holds a
 //! shared flock on `~/.config/vm/locks/<alias>` for its duration; commands
-//! that take the VM away (stop, with-snapshot, reap) take an exclusive one.
+//! that take the VM away (stop, exec --with-snapshot, reap) take an exclusive one.
 //! An exclusive acquire succeeds exactly when no uses are in flight, and the
 //! kernel drops a holder's lock on process death — clean exit, panic, Ctrl-C
 //! or SIGKILL alike — so there are no stale counts to garbage-collect.
@@ -62,7 +62,7 @@ fn open(alias: &str) -> Result<File> {
     open_path(&lock_path(alias)?)
 }
 
-/// Register a use: blocks while an exclusive holder (stop/with-snapshot/reap)
+/// Register a use: blocks while an exclusive holder (stop/--with-snapshot/reap)
 /// finishes, then coexists with any number of other uses.
 pub fn shared(alias: &str) -> Result<VmLock> {
     let file = open(alias)?;

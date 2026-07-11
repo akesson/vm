@@ -11,9 +11,9 @@ impl From<cli::ExecOpts> for ExecOptions {
             no_sync: opts.no_sync,
             writeback: opts.writeback,
             shell: opts.shell,
+            with_snapshot: opts.with_snapshot,
             or_native: opts.or_native,
-            // exec and with-snapshot both flow through here; both wrap.
-            apply_wrap: true,
+            guest_env: opts.guest_env,
             env: opts.env,
             cmd: opts.cmd,
         }
@@ -55,7 +55,7 @@ fn run(cli: cli::Cli) -> Result<i32> {
             (_, true) => vm::reap::uninstall(),
             _ => vm::reap::reap(alias.as_deref(), idle_minutes),
         },
-        Sync { alias } => commands::sync_cmd(&alias),
+        Sync { alias, guest_env } => commands::sync_cmd(&alias, guest_env),
 
         // Guest-side plumbing verbs (invoked by a host `vm` over ssh)
         GuestVersion => {
@@ -85,7 +85,6 @@ fn run(cli: cli::Cli) -> Result<i32> {
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),
         Shot { alias, file } => commands::shot(&alias, file),
-        WithSnapshot(args) => commands::with_snapshot(&args.target, &args.opts.into()),
         Claude(args) => vm::claude::run(
             &args.target,
             &vm::claude::ClaudeOptions {
@@ -93,6 +92,8 @@ fn run(cli: cli::Cli) -> Result<i32> {
                 claude_args: args.claude_args,
                 with_snapshot: args.with_snapshot,
                 no_writeback: args.no_writeback,
+                env: args.env,
+                guest_env: args.guest_env,
             },
         ),
         Doctor { alias } => doctor::doctor(alias.as_deref()),

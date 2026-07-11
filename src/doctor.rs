@@ -54,6 +54,11 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             return Ok(1);
         }
     };
+    // A typo'd alias must not silently check nothing and report success — the
+    // per-VM loop below would simply match no VM.
+    if let Some(alias) = alias {
+        cfg.get(alias)?;
+    }
     let key = crate::sync::expand_home("~/.ssh/id_ed25519")?;
     if key.exists() {
         r.ok("ssh key", &key.display().to_string());
@@ -92,9 +97,9 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
                     r.fail(
                         "snapshots",
                         &format!(
-                            "stale from killed with-snapshot runs, wasting disk: {} — \
-                             next `vm with-snapshot {name}` sweeps them, or delete via \
-                             `prlctl snapshot-list`/`snapshot-delete`",
+                            "stale from killed --with-snapshot runs, wasting disk: {} — \
+                             the next `vm exec {name} --with-snapshot` sweeps them, or delete \
+                             via `prlctl snapshot-list`/`snapshot-delete`",
                             stale.join(", ")
                         ),
                     );

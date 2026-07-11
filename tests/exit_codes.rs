@@ -52,8 +52,15 @@ fn unreadable_config_is_a_usage_error() {
 #[test]
 fn unknown_target_is_a_usage_error() {
     let (_dir, path) = temp_config();
-    // 'bogus' is neither a configured alias nor an OS name → exit 2.
+    // 'bogus' is not a configured alias → exit 2.
     assert_eq!(run_vm(Some(&path), &["exec", "bogus", "--", "true"]), 2);
+}
+
+#[test]
+fn doctor_on_an_unknown_alias_is_a_usage_error() {
+    let (_dir, path) = temp_config();
+    // A typo must not check nothing and then report "all checks passed".
+    assert_eq!(run_vm(Some(&path), &["doctor", "nosuchvm"]), 2);
 }
 
 #[test]
@@ -62,4 +69,37 @@ fn vm_lifecycle_failure_is_an_infra_error() {
     // 'lin' resolves, but its Parallels VM does not exist (or prlctl is absent
     // in CI) → vm can't do its job → exit 125, distinct from any guest code.
     assert_eq!(run_vm(Some(&path), &["exec", "lin", "--", "true"]), 125);
+}
+
+/// Both cases below lean on 'lin' pointing at a VM that does not exist: reaching
+/// the VM at all yields 125 (the test above), so observing 2 proves the bad `-e`
+/// was caught *before* vm resumed a VM, ran a sync, or took a snapshot.
+#[test]
+fn a_malformed_env_spec_is_a_usage_error_caught_before_any_vm_work() {
+    let (_dir, path) = temp_config();
+    assert_eq!(
+        run_vm(Some(&path), &["exec", "lin", "-e", "=value", "--", "true"]),
+        2
+    );
+}
+
+#[test]
+fn forwarding_an_env_var_unset_on_the_host_is_a_usage_error() {
+    let (_dir, path) = temp_config();
+    // `-e NAME` asks to forward the host's value; if it has none, that is the
+    // caller's setup, not a transient fault — retrying can never fix it.
+    assert_eq!(
+        run_vm(
+            Some(&path),
+            &[
+                "exec",
+                "lin",
+                "-e",
+                "VM_TEST_DEFINITELY_UNSET",
+                "--",
+                "true"
+            ],
+        ),
+        2
+    );
 }
