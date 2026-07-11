@@ -11,6 +11,9 @@ impl From<cli::ExecOpts> for ExecOptions {
             no_sync: opts.no_sync,
             writeback: opts.writeback,
             shell: opts.shell,
+            or_native: opts.or_native,
+            // exec and with-snapshot both flow through here; both wrap.
+            apply_wrap: true,
             env: opts.env,
             cmd: opts.cmd,
         }

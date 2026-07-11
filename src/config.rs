@@ -49,6 +49,28 @@ impl GuestOs {
             _ => None,
         }
     }
+
+    /// The canonical OS-name string (inverse of [`GuestOs::parse`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GuestOs::Windows => "windows",
+            GuestOs::Linux => "linux",
+            GuestOs::Macos => "macos",
+        }
+    }
+
+    /// The OS this `vm` process is itself running on — the host. Used by
+    /// `exec --or-native` to decide whether the target OS is already the host,
+    /// so the command can skip the VM and run in place.
+    pub fn current() -> GuestOs {
+        if cfg!(target_os = "windows") {
+            GuestOs::Windows
+        } else if cfg!(target_os = "macos") {
+            GuestOs::Macos
+        } else {
+            GuestOs::Linux
+        }
+    }
 }
 
 impl Config {
@@ -200,6 +222,18 @@ mod tests {
         let cfg = Config::parse(&two).unwrap();
         let err = cfg.find_by_os(GuestOs::Windows).unwrap_err().to_string();
         assert!(err.contains("multiple"), "{err}");
+    }
+
+    #[test]
+    fn current_matches_the_build_target() {
+        let expected = if cfg!(target_os = "windows") {
+            GuestOs::Windows
+        } else if cfg!(target_os = "macos") {
+            GuestOs::Macos
+        } else {
+            GuestOs::Linux
+        };
+        assert_eq!(GuestOs::current(), expected);
     }
 
     #[test]

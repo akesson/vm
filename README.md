@@ -7,6 +7,7 @@ tool, installed on the host **and** in every guest.
 vm exec windows -- cargo nextest run -p my-windows-crate
 vm exec win -e RUST_BACKTRACE=1 -- cargo nextest run -p my-windows-crate
 vm exec lin --writeback -- cargo clippy --fix
+vm exec --or-native windows -- cargo nextest run  # native when the host is already Windows
 vm claude win "fix the test that only fails on Windows"
 vm ls
 ```
@@ -27,6 +28,34 @@ vm ls
   Windows exec: `prlctl exec` carries the command into the console session
   (ssh children land in session 0, where UIA and other GUI APIs see an empty
   desktop), so GUI automation works on all three guests with plain `vm exec`.
+
+## Native or VM (`--or-native`)
+
+By default `vm exec` **always** runs in a VM, even when the target names the
+host's own OS — so where a command runs is never ambiguous. `--or-native` opts
+into one exception: if the host OS already matches the target's os, the command
+runs **natively** (no VM, no sync) with a loud `vm ▸ native (…)` banner instead.
+
+This lets a single task runner entry drive a guest on a dev host and run in
+place on a CI runner that is already the target OS — where there is no Parallels
+and no machine config:
+
+```toml
+# mise.toml — same line on a Mac dev host (→ Windows guest) and on windows-latest (→ native)
+[tasks."win:test"]
+run = "vm exec --or-native windows -- cargo nextest run -p my-windows-crate"
+```
+
+- Use an **OS name** (`windows`/`linux`/`macos`) as the target for CI-portable
+  tasks: it is matched against the host **before** the machine config is loaded,
+  so it works on a runner that has neither config nor Parallels. An **alias**
+  (`win`) needs the machine config to learn its os, so it only takes the native
+  path on a configured host.
+- Omit the flag to **force the VM** even on a matching host — e.g. a macOS host
+  driving the macOS guest for UI tests (the whole reason that guest exists).
+- `--writeback` / `--no-sync` compose but are no-ops on the native path; the
+  repo `wrap` prefix (below) is **not** applied natively. `--or-native` cannot
+  be combined with `with-snapshot` (the host cannot be snapshotted).
 
 ## Exit codes
 
@@ -60,6 +89,25 @@ prompt go to claude verbatim (e.g. `--model sonnet`).
 Requires the `claude` CLI installed and logged in inside the guest —
 `vm doctor` checks both.
 
+## Install
+
+Prebuilt binaries are published per release with GitHub-triple asset names, so
+they install via `mise`'s `ubi` backend (or `ubi` directly). A `mise` tools
+block makes `vm` available for free (and cached) on both dev machines and CI
+runners:
+
+```toml
+# mise.toml
+[tools]
+"ubi:akesson/vm" = "latest"   # or pin a version, e.g. "0.1.0"
+```
+
+Or from source: `cargo install --path .` (or `mise run install`).
+
+Releases cover arm64 macOS/Linux/Windows and x86_64 Linux/Windows. Intel macOS
+(x86_64) is not published — install from source there. Deploy the matching agent
+into each guest with `vm deploy <alias>`.
+
 ## Setup
 
 Host config lives at `~/.config/vm/config.toml`:
@@ -89,6 +137,12 @@ A repo can declare per-repo setup in a committed `.vm.toml` at its root:
 # nonzero exit fails the run (exit 125). Runs under the guest shell, so keep it
 # to a simple command.
 on_first_sync = "mise trust"
+
+# Prefix prepended to every guest `vm exec` / `vm with-snapshot` command, so a
+# mise-managed guest checkout resolves its tools. Prepended in argv space (no
+# extra quoting) and applied on the guest path only — a `--or-native` run
+# already has the launching environment. `vm claude` is not wrapped.
+wrap = ["mise", "exec", "--"]
 ```
 
 This removes the classic first-run gotcha of a mise-managed repo (a `mise

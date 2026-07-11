@@ -178,6 +178,13 @@ pub struct ExecOpts {
     /// Run through the guest shell (enables pipes/redirection; argv is joined)
     #[arg(long)]
     pub shell: bool,
+    /// If the host OS already matches the target's os, run the command
+    /// natively (no VM, no sync, no guest) instead of in the guest — the same
+    /// task then works on a dev host driving a guest and on a CI runner that
+    /// is already the target OS. Omit it to force the VM even on a matching
+    /// host (e.g. a macOS host driving the mac guest for UI tests).
+    #[arg(long)]
+    pub or_native: bool,
     /// Set an env var for the guest command: `-e NAME=value`, or `-e NAME`
     /// to forward the host's current value. Repeatable.
     #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
@@ -236,6 +243,33 @@ mod tests {
         };
         assert_eq!(exec.target, "windows");
         assert_eq!(exec.opts.cmd, ["cargo", "nextest", "run"]);
+    }
+
+    #[test]
+    fn exec_parses_or_native() {
+        let cli = parse(&[
+            "vm",
+            "exec",
+            "windows",
+            "--or-native",
+            "--",
+            "cargo",
+            "test",
+        ]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert!(exec.opts.or_native);
+        assert_eq!(exec.opts.cmd, ["cargo", "test"]);
+    }
+
+    #[test]
+    fn exec_or_native_defaults_off() {
+        let cli = parse(&["vm", "exec", "win", "--", "echo", "hi"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert!(!exec.opts.or_native);
     }
 
     #[test]
