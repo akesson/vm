@@ -19,6 +19,14 @@ pub struct RepoConfig {
     /// manual delete). Runs before the exec'd command; a nonzero exit fails the
     /// run. See issue #6.
     pub on_first_sync: Option<String>,
+
+    /// Prefix prepended to every guest `vm exec` / `vm with-snapshot` command
+    /// (e.g. `["mise", "exec", "--"]` so a mise-managed guest checkout resolves
+    /// its tools). Applied on the guest path only — native `--or-native` runs
+    /// already have the launching environment. Prepended in argv space, so it
+    /// is quoting-safe. See issue #9.
+    #[serde(default)]
+    pub wrap: Vec<String>,
 }
 
 impl RepoConfig {
@@ -53,6 +61,23 @@ mod tests {
     #[test]
     fn empty_file_has_no_hook() {
         assert_eq!(RepoConfig::parse("").unwrap().on_first_sync, None);
+    }
+
+    #[test]
+    fn wrap_defaults_to_empty() {
+        assert!(RepoConfig::parse("").unwrap().wrap.is_empty());
+        assert!(
+            RepoConfig::parse("on_first_sync = \"mise trust\"")
+                .unwrap()
+                .wrap
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parses_wrap_list() {
+        let cfg = RepoConfig::parse("wrap = [\"mise\", \"exec\", \"--\"]").unwrap();
+        assert_eq!(cfg.wrap, ["mise", "exec", "--"]);
     }
 
     #[test]

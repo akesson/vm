@@ -24,6 +24,10 @@ pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
         no_sync: false,
         writeback: !opts.no_writeback,
         shell: false,
+        // claude is the permission boundary — it always runs in the VM, and its
+        // own `claude` argv is never subject to the repo's `wrap` prefix.
+        or_native: false,
+        apply_wrap: false,
         env: Vec::new(),
         cmd: argv(opts),
     };

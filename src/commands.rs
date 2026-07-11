@@ -309,6 +309,14 @@ pub fn clean(alias: &str) -> Result<i32> {
 /// snapshot. The guest ends up exactly as it started — for destructive or
 /// state-polluting experiments (installers, registry edits, config trials).
 pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Result<i32> {
+    if opts.or_native {
+        // with-snapshot rolls the *guest* back around the run; there is nothing
+        // to snapshot on the host, so the two are mutually exclusive.
+        return Err(crate::exit::usage(
+            "--or-native cannot be combined with with-snapshot: the host cannot be \
+             snapshotted, so a native run has nothing to roll back",
+        ));
+    }
     let cfg = Config::load()?;
     let (alias, vm) = cfg.resolve(target)?;
     // Exclusive: rollback rewinds the whole VM (disk and memory), which would

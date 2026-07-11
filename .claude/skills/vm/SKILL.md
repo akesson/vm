@@ -32,6 +32,10 @@ vm exec <target> --writeback -- <cmd>…  # pull guest file changes back to host
 vm exec <target> -e NAME=value -- <cmd>…  # set env var for the guest command;
                                           # -e NAME forwards the host's value.
                                           # Repeatable; put -e before the --
+vm exec --or-native <os> -- <cmd>…  # run natively (no VM) IF the host is already
+                                    # that OS, else route to the VM. Use an os name
+                                    # (windows|linux|macos) so it works config-free
+                                    # on CI. Omit it to force the VM.
 vm sync <alias>                # sync only
 vm start|stop <alias>          # lifecycle (start waits for ssh; stop refuses while
                                # other vm processes use the VM — --force overrides;
@@ -54,9 +58,15 @@ vm with-snapshot <target> -- <cmd>…  # snapshot, run, roll back — guest ends
                                      # the VM to itself and ~2×VM-RAM free disk)
 ```
 
-**`vm` always executes in a VM — never on the host.** Even `vm exec macos`
-on a macOS host goes to the macOS VM. To run something natively, just run it;
-scripts that choose between native and VM do their own OS check.
+**`vm` executes in a VM by default — never on the host.** Even `vm exec macos`
+on a macOS host goes to the macOS VM. The one opt-in exception is
+`--or-native`: with it, a command whose target os already matches the host runs
+natively (no VM, no sync), announced by a `vm ▸ native (…)` breadcrumb so the
+location is never hidden. This is for one task line that must work both on a dev
+host (→ guest) and on a CI runner that is already the target OS (→ native, where
+there is no Parallels or config). Use an os name as the target there so the
+native match needs no config; omit `--or-native` to force the VM even on a
+matching host (e.g. a macOS host driving the macOS guest for UI tests).
 
 - Args after `--` arrive in the guest byte-identical (JSON to a guest agent,
   no shell quoting layer). `--shell` runs the command through `sh -c` /
@@ -80,6 +90,11 @@ scripts that choose between native and VM do their own OS check.
 
 ## Config
 
+Install: prebuilt release binaries are ubi-installable — `"ubi:akesson/vm" =
+"latest"` in a `mise` `[tools]` block (arm64 macOS/Linux/Windows + x86_64
+Linux/Windows), or `cargo install --path .` from source. Deploy the guest agent
+with `vm deploy <alias>`.
+
 `~/.config/vm/config.toml` — machine-level VM inventory:
 
 ```toml
@@ -100,6 +115,12 @@ one-time setup its guest checkout needs:
 # nonzero exit fails the run (exit 125). Keep it to a simple command: it runs
 # under the guest shell (`sh -c` on unix, `cmd /C` on Windows).
 on_first_sync = "mise trust"
+
+# Prefix prepended to every guest `vm exec` / `vm with-snapshot` command (argv
+# space, no extra quoting), so a mise-managed guest checkout resolves its tools.
+# Guest path only — a `--or-native` run already has the launching env, and
+# `vm claude` is not wrapped.
+wrap = ["mise", "exec", "--"]
 ```
 
 ## Hit a bug in vm itself? File it
