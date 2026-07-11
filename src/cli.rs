@@ -9,6 +9,11 @@ use vm::guest_env::GuestEnv;
 /// and pushed to a per-guest native checkout, so guests always see exactly
 /// what is on disk on the host. Builds run on guest-local disk: no shared
 /// folders, no cross-platform artifact conflicts.
+///
+/// VM lifecycle takes care of itself: any command that needs a guest starts or
+/// resumes it first (a resume takes about a second, and vm says what it is
+/// waiting for), and `vm reap` suspends VMs nobody is using. There is nothing
+/// to start or stop by hand.
 #[derive(Parser)]
 #[command(name = "vm", version, about, max_term_width = 100)]
 pub struct Cli {
@@ -20,22 +25,6 @@ pub struct Cli {
 pub enum Command {
     /// List configured VMs: status, IP, and the guest checkout path of the current repo
     Ls,
-    /// Start (or resume) a VM and wait until it is reachable
-    Start {
-        /// VM alias from ~/.config/vm/config.toml
-        alias: String,
-    },
-    /// Stop a VM gracefully (refuses while other vm processes are using it)
-    Stop {
-        /// VM alias from ~/.config/vm/config.toml
-        alias: String,
-        /// Force power-off instead of a graceful shutdown
-        #[arg(long)]
-        kill: bool,
-        /// Stop even while other vm processes are using the VM
-        #[arg(long)]
-        force: bool,
-    },
     /// Sync the current repo to a guest, then run a command in the guest checkout
     ///
     /// Exit status is the guest command's own, except vm's reserved codes:
@@ -228,6 +217,17 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("should parse")
+    }
+
+    /// `vm start` and `vm stop` are gone. Every command that needs a guest brings
+    /// it up itself, and `vm reap` suspends the ones nobody is using — so the two
+    /// verbs did nothing a caller had to do, while implying they were a step one
+    /// had to remember. Pinned so they cannot quietly come back: a `start` in the
+    /// help text is an instruction to use it.
+    #[test]
+    fn there_are_no_lifecycle_verbs() {
+        assert!(Cli::try_parse_from(["vm", "start", "lin"]).is_err());
+        assert!(Cli::try_parse_from(["vm", "stop", "lin"]).is_err());
     }
 
     #[test]

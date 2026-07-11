@@ -1,7 +1,11 @@
 //! `vm doctor [alias]` — diagnose host and guest setup, one check per line.
 //!
-//! Read-only: never starts a VM or installs anything; a stopped VM simply
-//! skips its live checks with a hint.
+//! Installs nothing. It brings a VM up in exactly one case: when the caller
+//! *named* one (`vm doctor linux`), because the checks worth having — ssh,
+//! agent, git, claude — are the live ones, and there is no `vm start` to run
+//! first. A bare `vm doctor` surveys every configured VM, so it stays
+//! read-only: booting a whole fleet to look at it would be a worse surprise
+//! than skipping the guests that are down.
 
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::proto::{PROTO_VERSION, VersionInfo};
@@ -107,20 +111,43 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             }
             Err(err) => r.fail("snapshots", &format!("{err:#}")),
         }
-        if prl_vm.status != "running" {
+        // Named VM that is down: bring it up, since the caller asked about this
+        // one and the live checks are the point. The use lock keeps reap from
+        // suspending it again while we are checking it.
+        let _use;
+        let target = if prl_vm.status == "running" {
+            r.ok("status", "running");
+            match commands::ssh_target(vm) {
+                Ok(t) => t,
+                Err(err) => {
+                    r.fail("ip", &format!("{err:#}"));
+                    continue;
+                }
+            }
+        } else if alias.is_some() {
+            _use = crate::lock::shared(name)?;
+            match commands::bring_up(name, vm) {
+                Ok(target) => {
+                    r.ok("status", &format!("brought up (was {})", prl_vm.status));
+                    target
+                }
+                Err(err) => {
+                    r.fail(
+                        "status",
+                        &format!("{} — cannot bring it up: {err:#}", prl_vm.status),
+                    );
+                    continue;
+                }
+            }
+        } else {
             r.skip(
                 "status",
-                &format!("{} — `vm start {name}` for live checks", prl_vm.status),
+                &format!(
+                    "{} — live checks skipped; `vm doctor {name}` brings it up and runs them",
+                    prl_vm.status
+                ),
             );
             continue;
-        }
-        r.ok("status", "running");
-        let target = match commands::ssh_target(vm) {
-            Ok(t) => t,
-            Err(err) => {
-                r.fail("ip", &format!("{err:#}"));
-                continue;
-            }
         };
         if !ssh::reachable(&target) {
             r.fail(

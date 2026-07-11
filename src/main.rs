@@ -42,8 +42,6 @@ fn run(cli: cli::Cli) -> Result<i32> {
     use cli::Command::*;
     match cli.command {
         Ls => commands::ls(),
-        Start { alias } => commands::start(&alias),
-        Stop { alias, kill, force } => commands::stop(&alias, kill, force),
         Reap {
             alias,
             idle_minutes,

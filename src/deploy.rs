@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs};
 use crate::proto::{PROTO_VERSION, VersionInfo};
 use crate::ssh::SshTarget;
-use crate::{commands, mapping, prl, ssh, sync};
+use crate::{commands, mapping, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -25,9 +25,7 @@ pub fn deploy(alias: &str) -> Result<i32> {
     }
 
     let _use = crate::lock::shared(alias)?;
-    prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name)?;
-    let target = commands::ssh_target(vm)?;
+    let target = commands::bring_up(alias, vm)?;
     eprintln!(
         "vm ▸ {alias} ▸ deploying agent (build-in-guest from {})…",
         src.display()

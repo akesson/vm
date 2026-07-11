@@ -30,6 +30,35 @@ vm ls
   Windows exec: `prlctl exec` carries the command into the console session
   (ssh children land in session 0, where UIA and other GUI APIs see an empty
   desktop), so GUI automation works on all three guests with plain `vm exec`.
+- **VMs take care of themselves.** There is no `vm start` and no `vm stop`: see
+  below.
+
+## VM lifecycle
+
+A VM being down is not a state you have to fix before you can use it — it is a
+VM one second away from being up. So every command that needs a guest (`exec`,
+`sync`, `claude`, `deploy`, `clean`, `shot`, and `doctor <alias>`) starts or
+resumes it, and says so:
+
+```
+vm ▸ linux ▸ 'Ubuntu 24.04' is suspended — resuming it…
+vm ▸ linux ▸ ready at 10.211.55.4 ▸ 3.0s
+```
+
+A VM that is already running prints neither line — silence means there was
+nothing to wait for. A long wait is narrated as it goes (`vm ▸ macos ▸ 'macOS'
+running, no IP yet — 10s of 90s`), and a VM that is not coming up at all fails
+in ~15s rather than sitting out the full timeout.
+
+The other half is `vm reap`, which **suspends** VMs that no vm process is using
+and that have been idle a while (30m by default; `vm reap --install` runs it
+every 5 minutes from launchd). It leaves a VM alone while someone is typing at
+its console, so a guest you are driving by hand in the Parallels GUI is not
+pulled out from under you.
+
+Between the two, VM lifecycle is never a step anyone has to remember — which is
+why the verbs for it do not exist. Suspending is the only way vm puts a VM down;
+a full power-off is a Parallels operation (`prlctl stop`).
 
 ## Targets
 
