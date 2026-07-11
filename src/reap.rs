@@ -5,7 +5,12 @@
 //! is at its console (guest input idle below the window — manual GUI use
 //! leaves no trace in the lock files), otherwise suspend it. The console
 //! probe fails open: reclaiming RAM stays guaranteed, and a wrongly
-//! suspended VM costs one ~1s resume.
+//! suspended VM costs one resume (a few seconds).
+//!
+//! Idleness is measured from the per-VM lock file, which only `vm` touches —
+//! so a VM resumed by hand (`prlctl resume`) still looks idle here and gets
+//! suspended at the next sweep. That is working as intended, but it is worth
+//! knowing when a hand-resumed VM goes back down on its own.
 //! Suspend, not stop: it frees the VM's host RAM, and the next `vm exec`
 //! resumes in about a second instead of paying a full boot.
 //!
