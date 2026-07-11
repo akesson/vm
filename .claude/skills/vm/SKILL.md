@@ -42,6 +42,9 @@ vm exec <alias> --with-snapshot -- <cmd>…  # snapshot, run, roll back — the 
                                         # free disk). For destructive experiments
 vm exec <alias> --guest-env none -- <cmd>…  # run the bare command: no mise setup,
                                         # no `mise exec --` wrap (see Guest env)
+vm exec <alias> -- '<script>'  # ONE argument = a shell script in the guest:
+                               # pipes, &&, redirects, cd. Several args = exec'd
+                               # as given, byte-identical, no shell (see below)
 vm exec --or-native <os> -- <cmd>…      # run natively (no VM) IF the host is already
                                         # that OS, else route to the VM. The target
                                         # must literally be windows|linux|macos so it
@@ -78,12 +81,23 @@ be `windows`/`linux`/`macos`: that name is matched against the host *before* the
 config is read. Omit `--or-native` to force the VM even on a matching host (e.g.
 a macOS host driving the macOS guest for UI tests).
 
-- Args after `--` arrive in the guest byte-identical (JSON to a guest agent,
-  no shell quoting layer). `--shell` runs the command through `sh -c` /
-  `cmd /C` instead.
+- **Command form is decided by how many arguments you pass** (like a Dockerfile
+  `RUN`). **Several** arguments are exec'd exactly as given — they arrive in the
+  guest byte-identical (JSON to a guest agent, no shell quoting layer), so
+  `vm exec linux -- grep 'a|b' src/lib.rs` keeps its regex. **Exactly one**
+  argument is a *script*, run by the guest's own shell (`sh -c`, or `cmd /C` on
+  Windows), which is how you get pipes, `&&`, redirects and builtins:
+  `vm exec linux -- 'cd src && cargo test'`. There is no `--shell` flag (it was
+  removed; passing it is an exit-2 error that tells you this).
+  - Getting it wrong is usually harmless but silent: `-- echo a '&&' echo b` is
+    five arguments, so `&&` is printed by echo, not obeyed. vm prints a
+    `vm ▸ note:` when it spots that; the note is advice on stderr and never
+    changes what runs.
+  - The `$ …` breadcrumb always shows the **literal** command the guest runs —
+    wrap and shell included — so you can always see which form you got.
 - `-e NAME=value` sets an env var for the guest process, and `-e NAME` forwards
   the host's current value (errors if unset). It rides the same JSON channel as
-  the args — identical on `cmd` and `sh` guests, no `--shell` needed, process-
+  the args — identical on `cmd` and `sh` guests, no script form needed, process-
   scoped. Don't forward `PATH` (it would shadow the guest's own tool paths).
 - Commands run where GUI automation works on every OS: Windows exec rides
   `prlctl exec` into the console session (ssh would land in session 0 with an
@@ -115,11 +129,11 @@ vm ▸ windows ▸ guest env: mise (detected mise.toml) — `mise trust` on firs
 
 So `vm exec windows -- cargo test` really runs `mise exec -- cargo test` in the
 guest. `vm claude` is wrapped too, so the commands Claude runs inside the guest
-resolve the repo's tools. With `--shell`, the wrap goes *around* the shell
-(`mise exec -- sh -c '<script>'`), so builtins, pipes and exit codes all behave.
-Override with `--guest-env mise` (force) or `--guest-env none` (bare command, no
-setup, no wrap) on `exec` / `sync` / `claude`. There is **no per-repo config
-file** — an older `.vm.toml` with `on_first_sync` / `wrap` is obsolete and
+resolve the repo's tools. For a script (one argument) the wrap goes *around* the
+shell — `mise exec -- sh -c '<script>'` — so builtins, pipes and exit codes all
+behave. Override with `--guest-env mise` (force) or `--guest-env none` (bare
+command, no setup, no wrap) on `exec` / `sync` / `claude`. There is **no per-repo
+config file** — an older `.vm.toml` with `on_first_sync` / `wrap` is obsolete and
 ignored.
 
 **Expect the first wrapped exec in a fresh guest to be slow.** `mise exec`
@@ -174,6 +188,10 @@ on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and co
   *same* repo to the *same* guest (e.g. a `mise` fan-out) is safe too — the
   syncs serialize behind a per-(repo, guest) lock, so a second one waits a
   moment for the first rather than racing on the shared git snapshot.
+- A lone path with a **space in its filename** is the one place the one-argument
+  form bites: it is a script, so the shell splits it. Quote it for the shell
+  (`vm exec macos -- '"/Applications/My App/run"'`) or pass it in exec form. vm
+  notes this when the file actually exists.
 - `--writeback` applies the guest diff to the **host working tree** as a patch;
   only use it for commands that deliberately edit sources.
 - Sync pushes bypass git hooks by design (`--no-verify`) — they are replication,

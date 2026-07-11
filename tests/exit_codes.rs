@@ -84,6 +84,18 @@ fn a_malformed_env_spec_is_a_usage_error_caught_before_any_vm_work() {
 }
 
 #[test]
+fn the_removed_shell_flag_is_a_usage_error_caught_before_any_vm_work() {
+    let (_dir, path) = temp_config();
+    // clap cannot reject it (trailing_var_arg swallows it into the command), so
+    // vm does — and does it here, not after resuming a VM and syncing only to
+    // have the guest report "command not found: --shell".
+    assert_eq!(
+        run_vm(Some(&path), &["exec", "lin", "--shell", "--", "echo hi"]),
+        2
+    );
+}
+
+#[test]
 fn forwarding_an_env_var_unset_on_the_host_is_a_usage_error() {
     let (_dir, path) = temp_config();
     // `-e NAME` asks to forward the host's value; if it has none, that is the

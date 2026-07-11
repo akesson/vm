@@ -1,19 +1,33 @@
 //! The `vm _exec` agent driven exactly as the host drives it: one JSON line
 //! on stdin, stdin held open for the lifetime of the command (the liveness
 //! channel), exit code propagated. Runs in CI on all three OSes.
+//!
+//! The request is always a plain argv — the host composes any shell invocation
+//! before it goes on the wire, so a *script* reaches the agent already wrapped
+//! in `sh -c` / `cmd /C`, and these tests send it the same way.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use vm::proto::PROTO_VERSION;
 
 const VM_BIN: &str = env!("CARGO_BIN_EXE_vm");
 
 /// Drive `vm _exec` like the host does; returns (exit_code, stdout).
 fn agent_exec(argv: &[&str], cwd: &str) -> (i32, String) {
+    agent_exec_env(argv, cwd, &[])
+}
+
+/// `agent_exec` with `env` forwarded — what a `-e NAME=value` run puts on the wire.
+fn agent_exec_env(argv: &[&str], cwd: &str, env: &[(&str, &str)]) -> (i32, String) {
+    let env: serde_json::Map<String, serde_json::Value> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+        .collect();
     let req = serde_json::json!({
-        "version": 1,
+        "version": PROTO_VERSION,
         "argv": argv,
+        "env": env,
         "cwd": cwd,
-        "shell": false,
     });
     let mut child = Command::new(VM_BIN)
         .arg("_exec")
@@ -34,46 +48,14 @@ fn agent_exec(argv: &[&str], cwd: &str) -> (i32, String) {
     )
 }
 
-/// Like `agent_exec`, but with `env` forwarded and the guest shell enabled so
-/// the command can echo the variable back. Mirrors what a `-e NAME=value` run
-/// puts on the wire.
-fn agent_exec_env(argv: &[&str], cwd: &str, env: &[(&str, &str)]) -> (i32, String) {
-    let env: serde_json::Map<String, serde_json::Value> = env
-        .iter()
-        .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
-        .collect();
-    let req = serde_json::json!({
-        "version": 1,
-        "argv": argv,
-        "env": env,
-        "cwd": cwd,
-        "shell": true,
-    });
-    let mut child = Command::new(VM_BIN)
-        .arg("_exec")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("agent spawns");
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    writeln!(stdin, "{req}").unwrap();
-    let out = child.wait_with_output().expect("agent runs");
-    drop(stdin);
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-    )
-}
-
 #[cfg(unix)]
 #[test]
 fn forwarded_env_reaches_the_guest_process() {
     let tmp = tempfile::tempdir().unwrap();
-    // `sh -c 'printf %s $FOO'` echoes the forwarded value with no trailing
-    // newline, so the assertion is exact.
+    // The shell arrives as argv (the host wraps a script itself), and `printf`
+    // omits the trailing newline, so the assertion is exact.
     let (code, stdout) = agent_exec_env(
-        &["printf", "%s", "$FOO"],
+        &["sh", "-c", "printf %s $FOO"],
         tmp.path().to_str().unwrap(),
         &[("FOO", "bar")],
     );
@@ -87,7 +69,7 @@ fn forwarded_env_reaches_the_guest_process() {
     let tmp = tempfile::tempdir().unwrap();
     // `cmd /C echo %FOO%` expands the forwarded value (trailing CRLF trimmed).
     let (code, stdout) = agent_exec_env(
-        &["echo", "%FOO%"],
+        &["cmd", "/C", "echo %FOO%"],
         tmp.path().to_str().unwrap(),
         &[("FOO", "bar")],
     );
@@ -102,7 +84,24 @@ fn runs_argv_in_cwd_and_captures_output() {
     // exist on every CI OS. `_version` prints a JSON line.
     let (code, stdout) = agent_exec(&[VM_BIN, "_version"], tmp.path().to_str().unwrap());
     assert_eq!(code, 0);
-    assert!(stdout.contains("\"proto\":1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(&format!("\"proto\":{PROTO_VERSION}")),
+        "stdout: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn argv_is_never_run_through_a_shell() {
+    // The byte-fidelity promise the arity rule leans on: in exec form an
+    // argument holding shell syntax is data, not code. Were the agent to grow a
+    // shell back, this argument would be word-split at the `|`, `$(…)` would be
+    // substituted, and `>` would redirect — instead printf prints it verbatim.
+    let tmp = tempfile::tempdir().unwrap();
+    let literal = "a|b && $(echo pwned) > /dev/null";
+    let (code, stdout) = agent_exec(&["printf", "%s", literal], tmp.path().to_str().unwrap());
+    assert_eq!(code, 0);
+    assert_eq!(stdout, literal, "stdout: {stdout:?}");
 }
 
 #[test]
@@ -140,10 +139,9 @@ fn command_not_found_is_127_not_infra() {
 #[test]
 fn liveness_stdin_eof_kills_the_child_tree() {
     let req = serde_json::json!({
-        "version": 1,
+        "version": PROTO_VERSION,
         "argv": [VM_BIN, "_exec"], // grandchild that blocks forever reading stdin… (never gets a request)
         "cwd": ".",
-        "shell": false,
     });
     let mut child = Command::new(VM_BIN)
         .arg("_exec")

@@ -6,6 +6,7 @@ tool, installed on the host **and** in every guest.
 ```sh
 vm exec windows -- cargo nextest run -p my-windows-crate
 vm exec windows -e RUST_BACKTRACE=1 -- cargo nextest run -p my-windows-crate
+vm exec linux -- 'cd src && cargo clippy | head -20'   # one argument = a shell script
 vm exec linux --writeback -- cargo clippy --fix
 vm exec linux --with-snapshot -- ./install-something-destructive.sh
 vm exec --or-native windows -- cargo nextest run  # native when the host is already Windows
@@ -40,6 +41,38 @@ error listing what is configured.
 **Name each alias after its OS** (`windows`, `linux`, `macos`) unless you have a
 reason not to — that is what makes `--or-native` task lines portable to CI (see
 below), and it keeps one name for one machine.
+
+## Command forms
+
+How a command is written decides how it runs — the same split a Dockerfile's
+`RUN` makes, and the same one `docker exec` leaves you to make by hand:
+
+| What you pass after `--` | What runs | For |
+|---|---|---|
+| **several arguments** | exec'd exactly as given, no shell anywhere | everything normal: `vm exec linux -- cargo test --workspace` |
+| **exactly one argument** | run as a script by the guest's shell (`sh -c`, or `cmd /C` on Windows) | pipes, `&&`, redirects, `cd` and other builtins: `vm exec linux -- 'cd src && cargo test'` |
+
+Arguments in the first form reach the guest **byte-identical** — they travel as
+JSON to a guest agent, with no shell quoting layer anywhere between your
+terminal and the process. So `vm exec linux -- grep 'a|b' src/lib.rs` keeps its
+regex: the `|` is data, not a pipe.
+
+The rule counts arguments; it never reads them. That is deliberate — the `|` in
+`grep 'a|b' f` and the one in `echo hi | wc` are the same byte with opposite
+meanings, so no amount of inspecting the command could tell them apart. Instead
+vm prints a `vm ▸ note:` when the form you used looks unlikely to be the one you
+meant (a lone `&&` sitting in an argv, say). The note is advice on stderr; it
+never changes what runs. And the `$ …` breadcrumb always shows the **literal**
+command the guest gets, wrap and shell included, so what ran is never a guess:
+
+```
+vm ▸ linux (Ubuntu 24.04) ▸ ~/work/vm ▸ $ mise exec -- sh -c 'cd src && cargo test'
+```
+
+One edge worth knowing: a single argument is a *script*, so a lone path whose
+filename contains a space gets word-split by the shell like any other script
+would. Quote it for the shell — `vm exec macos -- '"/Applications/My App/run"'` —
+or just pass it in exec form. vm notes this one for you when it sees it.
 
 ## Native or VM (`--or-native`)
 
@@ -83,6 +116,10 @@ and its commands run under it. `vm` handles this for **mise**:
 | detected by | `mise.toml` / `.mise.toml` / `.config/mise/config.toml` … at the repo root |
 | on first sync | runs `mise trust` in the guest checkout (once per checkout creation) |
 | on every exec | runs the command as `mise exec -- <cmd>`, so the repo's tools resolve |
+
+With a script (one argument), the wrap goes *around* the shell — `mise exec --
+sh -c '<script>'` — so the whole script runs inside the environment, builtins
+and pipelines included, and its exit code comes back as its own.
 
 **The first wrapped exec in a fresh guest can take minutes.** `mise exec`
 installs whatever the repo's `[tools]` block asks for before it runs anything —

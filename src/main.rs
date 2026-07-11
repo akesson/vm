@@ -10,7 +10,6 @@ impl From<cli::ExecOpts> for ExecOptions {
         ExecOptions {
             no_sync: opts.no_sync,
             writeback: opts.writeback,
-            shell: opts.shell,
             with_snapshot: opts.with_snapshot,
             or_native: opts.or_native,
             guest_env: opts.guest_env,
@@ -81,7 +80,19 @@ fn run(cli: cli::Cli) -> Result<i32> {
             Ok(0)
         }
 
-        Exec(args) => exec::host::exec(&args.target, &args.opts.into()),
+        Exec(args) => {
+            // Advisories are about what the *caller typed*, so they belong here
+            // rather than in host::exec — which `vm claude` also drives, with an
+            // argv it built itself and would only be confused about. Printed
+            // before any VM work starts, so the note is on screen even if the
+            // run then dies resuming the guest.
+            for note in exec::advise::advisories(&args.target, &args.opts.cmd, |path| {
+                std::path::Path::new(path).is_file()
+            }) {
+                eprintln!("vm ▸ note: {note}");
+            }
+            exec::host::exec(&args.target, &args.opts.into())
+        }
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),
         Shot { alias, file } => commands::shot(&alias, file),

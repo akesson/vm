@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 pub struct ExecOptions {
     pub no_sync: bool,
     pub writeback: bool,
-    pub shell: bool,
     /// Snapshot the VM, run, then roll it back. Takes the VM exclusively.
     pub with_snapshot: bool,
     /// Run natively when the host OS already matches the target's os, instead
@@ -46,6 +45,7 @@ pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
     // a VM resume, a sync, and — under --with-snapshot — a snapshot and its
     // rollback. Cheap and pure, so the real resolution below just redoes it.
     resolve_env(&opts.env, |name| std::env::var(name).ok())?;
+    reject_removed_flags(&opts.cmd)?;
 
     // Config-free native fast path: an os-literal target we can match against
     // the host without the machine config (CI runners have neither config nor
@@ -103,13 +103,11 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
 
     let cwd = mapping::guest_cwd(&vm.work_root, &repo.name, &repo.rel)?;
     let env = resolve_env(&opts.env, |name| std::env::var(name).ok())?;
-    let (argv, shell) = build_argv(&opts.cmd, &genv, vm.os, opts.shell);
     let req = ExecRequest {
         version: PROTO_VERSION,
-        argv,
+        argv: build_argv(&opts.cmd, &genv, vm.os),
         env,
         cwd: cwd.clone(),
-        shell,
     };
 
     eprintln!(
@@ -179,47 +177,76 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     Ok(code)
 }
 
-/// The argv (and shell mode) sent to the guest: the user's command with the
-/// guest env's wrap prefix (mise: `mise exec --`) in front, so the checkout's
-/// tools resolve. Prepending in argv space — not a shell string — is
-/// quoting-safe: the elements ride to the guest as JSON.
-///
-/// `--shell` needs the wrap to go *around the shell*, not in front of its first
-/// word. The guest runs a `--shell` request by joining argv into one script, so
-/// a wrap merely prepended there would produce `sh -c "mise exec -- cd src &&
-/// pwd"`, where mise cannot exec a shell builtin, everything past the first pipe
-/// segment escapes the environment, and `exit 42` comes back as mise's own exit
-/// code of one. So when a wrap is active the host composes the guest's shell
-/// invocation itself — it knows the guest's OS from the config — and sends a
-/// plain argv, `mise exec -- sh -c "<script>"`, putting the script inside the env.
-fn build_argv(
-    cmd: &[String],
-    genv: &ActiveEnv,
-    guest_os: GuestOs,
-    shell: bool,
-) -> (Vec<String>, bool) {
-    let wrap = genv.wrap();
-    if wrap.is_empty() {
-        // No env to wrap: leave `--shell` to the guest, exactly as before.
-        return (cmd.to_vec(), shell);
+/// `--shell` was replaced by the arity rule (see [`build_argv`]). It is not a
+/// flag any more, and `cmd` is `trailing_var_arg`, so a leftover one in an old
+/// script is *swallowed into the command* — the guest would hunt for a binary
+/// called `--shell` and come back with a 127, having already resumed a VM and
+/// run a sync to get there. Nothing can legitimately start with it, so refuse up
+/// front and say what replaced it: a dropped flag that quietly changes what runs
+/// is precisely the failure this codebase does not accept (cf. `vm claude`'s
+/// misplaced-flag check).
+fn reject_removed_flags(cmd: &[String]) -> Result<()> {
+    if cmd.first().is_some_and(|first| first == "--shell") {
+        // clap stopped parsing at `--shell`, so the `--` that followed it is
+        // sitting in the command too — drop it, or the suggested fix would read
+        // back `-- '-- echo hi'`.
+        let rest = cmd[1..].iter().skip_while(|a| *a == "--");
+        let script = rest.cloned().collect::<Vec<_>>().join(" ");
+        return Err(usage(format!(
+            "`--shell` no longer exists — a command's *form* now says whether it is a script.\n  \
+             Pass the script as ONE argument and the guest's shell runs it: \
+             vm exec <alias> -- '{script}'\n  \
+             Several arguments still run exactly as given, with no shell involved."
+        )));
     }
-    let mut argv: Vec<String> = wrap.iter().map(|s| s.to_string()).collect();
-    if shell {
-        let (bin, flag) = match guest_os {
-            GuestOs::Windows => ("cmd", "/C"),
-            GuestOs::Linux | GuestOs::Macos => ("sh", "-c"),
-        };
-        argv.extend([bin.to_string(), flag.to_string(), cmd.join(" ")]);
-        return (argv, false);
-    }
-    argv.extend(cmd.iter().cloned());
-    (argv, false)
+    Ok(())
 }
 
-/// Render an argv for the `$ …` breadcrumb. Elements are separate strings all
-/// the way to the guest, so an element holding shell syntax (`--shell`'s script:
-/// `cd src && pwd`) must be shown quoted — joined bare it would read as though
-/// the `&&` split the command, which is exactly what it does *not* do.
+/// The exact argv the guest will exec, composed here on the host — the guest
+/// never interprets a request, it only spawns it. Two things go into it:
+///
+/// **The arity rule** decides what the command *is*, the way a Dockerfile's
+/// `RUN` does. Several arguments are an argv, exec'd as given: they reach the
+/// guest byte-identical (JSON, no quoting layer anywhere), so `grep 'a|b' f`
+/// keeps its regex. **Exactly one** argument is a script, handed to the guest's
+/// own shell — `sh -c`, or `cmd /C` on Windows, taken from the target's config
+/// and never from the host's `cfg!` — so `'cd src && cargo test'` gets pipes,
+/// builtins and `&&`.
+///
+/// The rule counts arguments; it never reads them. Content cannot decide this:
+/// the `|` in `grep 'a|b' f` and the one in `echo hi | wc` are the same byte
+/// with opposite meanings, so sniffing would fix one case by breaking the other.
+/// [`super::advise`] carries that guesswork instead, where being wrong costs a
+/// line of stderr rather than a wrong command.
+///
+/// **The guest env's wrap** (mise: `mise exec --`) then goes in front, so the
+/// checkout's tools resolve — in front of the *shell*, not of the script's first
+/// word. `mise exec -- sh -c '<script>'` runs the whole script inside the
+/// environment; prepended into the script instead, mise would try to exec `cd`
+/// as a binary, everything past the first pipe would escape the environment, and
+/// `exit 42` would come back as mise's own exit code of one.
+fn build_argv(cmd: &[String], genv: &ActiveEnv, guest_os: GuestOs) -> Vec<String> {
+    let mut argv: Vec<String> = genv.wrap().iter().map(|s| s.to_string()).collect();
+    match cmd {
+        [script] => {
+            let (bin, flag) = match guest_os {
+                GuestOs::Windows => ("cmd", "/C"),
+                GuestOs::Linux | GuestOs::Macos => ("sh", "-c"),
+            };
+            argv.extend([bin.to_string(), flag.to_string(), script.clone()]);
+        }
+        exec_form => argv.extend(exec_form.iter().cloned()),
+    }
+    argv
+}
+
+/// Render an argv for the `$ …` breadcrumb, which is a contract: it always shows
+/// the literal command the guest runs, never a paraphrase of what was typed —
+/// that is how a caller (or an agent driving vm) sees which form the arity rule
+/// picked and what the wrap did to it. Elements stay separate strings all the way
+/// to the guest, so one holding shell syntax (a script: `cd src && pwd`) must be
+/// shown quoted — joined bare it would read as though the `&&` split the command,
+/// which is exactly what it does *not* do.
 fn render_argv(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
@@ -240,33 +267,28 @@ fn render_argv(argv: &[String]) -> String {
 /// with no VM, sync, or guest-env wrap (natively the environment is already
 /// whatever launched the command). A loud banner records that this run stayed
 /// on the host, so `--or-native` never hides where a command executed.
+///
+/// The arity rule applies unchanged, so one task line means the same thing on
+/// both paths. Its shell comes out the same too: native runs only when the host
+/// already *is* the target os, so the host's shell is the very one the guest
+/// path would have picked.
 fn run_native(opts: &ExecOptions) -> Result<i32> {
     let env = resolve_env(&opts.env, |name| std::env::var(name).ok())?;
+    let no_wrap = crate::guest_env::resolve(Some(GuestEnv::None), std::path::Path::new("."));
+    let argv = build_argv(&opts.cmd, &no_wrap, GuestOs::current());
+    // Composed first, printed second: the breadcrumb owes the reader the command
+    // that actually runs, here as much as in a guest.
     eprintln!(
         "vm ▸ native ({}) ▸ $ {}",
         GuestOs::current().as_str(),
-        render_argv(&opts.cmd)
+        render_argv(&argv)
     );
-    let mut cmd = if opts.shell {
-        let joined = opts.cmd.join(" ");
-        if cfg!(windows) {
-            let mut c = std::process::Command::new("cmd");
-            c.args(["/C", &joined]);
-            c
-        } else {
-            let mut c = std::process::Command::new("sh");
-            c.args(["-c", &joined]);
-            c
-        }
-    } else {
-        let mut c = std::process::Command::new(&opts.cmd[0]);
-        c.args(&opts.cmd[1..]);
-        c
-    };
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
     cmd.envs(&env);
     let status = cmd
         .status()
-        .with_context(|| format!("failed to run {:?} natively", opts.cmd[0]))?;
+        .with_context(|| format!("failed to run {:?} natively", argv[0]))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -441,7 +463,6 @@ mod tests {
         ExecOptions {
             no_sync: false,
             writeback: false,
-            shell: false,
             with_snapshot: false,
             or_native: false,
             guest_env: None,
@@ -462,73 +483,116 @@ mod tests {
         tmp
     }
 
+    /// A repo root with no marker at all — no wrap.
+    fn plain_root() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    // ── The arity rule: several arguments are an argv ─────────────────────────
+
     #[test]
-    fn build_argv_prepends_the_guest_envs_wrap() {
-        let tmp = mise_root();
-        let (argv, shell) = build_argv(
+    fn several_arguments_are_execd_as_given() {
+        let tmp = plain_root();
+        let argv = build_argv(
             &s(&["cargo", "test"]),
             &detected(tmp.path()),
             GuestOs::Linux,
-            false,
+        );
+        assert_eq!(argv, s(&["cargo", "test"]));
+    }
+
+    #[test]
+    fn exec_form_keeps_shell_syntax_literal() {
+        // The reason the rule counts arguments instead of reading them: this `|`
+        // is a regex alternation and must reach grep untouched. No shell, ever.
+        let tmp = plain_root();
+        let argv = build_argv(
+            &s(&["grep", "a|b", "src/lib.rs"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
+        );
+        assert_eq!(argv, s(&["grep", "a|b", "src/lib.rs"]));
+    }
+
+    #[test]
+    fn exec_form_gets_the_guest_envs_wrap_in_front() {
+        let tmp = mise_root();
+        let argv = build_argv(
+            &s(&["cargo", "test"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
         );
         assert_eq!(argv, s(&["mise", "exec", "--", "cargo", "test"]));
-        assert!(!shell);
     }
 
-    #[test]
-    fn build_argv_without_a_guest_env_is_the_bare_command() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (argv, _) = build_argv(
-            &s(&["cargo", "test"]),
-            &detected(tmp.path()),
-            GuestOs::Linux,
-            false,
-        );
-        assert_eq!(argv, s(&["cargo", "test"]));
-    }
+    // ── The arity rule: a single argument is a script ─────────────────────────
 
     #[test]
-    fn build_argv_honors_guest_env_none_over_detection() {
-        let tmp = mise_root();
-        let genv = crate::guest_env::resolve(Some(GuestEnv::None), tmp.path());
-        let (argv, _) = build_argv(&s(&["cargo", "test"]), &genv, GuestOs::Linux, false);
-        assert_eq!(argv, s(&["cargo", "test"]));
-    }
-
-    #[test]
-    fn shell_mode_puts_the_wrap_around_the_shell_not_its_first_word() {
-        // The bug this guards: prepending the wrap in argv space and letting the
-        // guest join it into a script yields `sh -c "mise exec -- cd src && pwd"`
-        // — mise cannot exec the `cd` builtin, and `exit 42` would come back as
-        // mise's exit 1. The whole script must run *inside* the env instead.
-        let tmp = mise_root();
-        let (argv, shell) = build_argv(
+    fn a_single_argument_is_run_by_the_guests_shell() {
+        // No guest env in play: the host still composes the shell, so the guest
+        // has nothing to interpret — it only ever execs an argv.
+        let tmp = plain_root();
+        let argv = build_argv(
             &s(&["cd src && pwd"]),
             &detected(tmp.path()),
             GuestOs::Linux,
-            true,
+        );
+        assert_eq!(argv, s(&["sh", "-c", "cd src && pwd"]));
+    }
+
+    #[test]
+    fn the_wrap_goes_around_the_shell_not_its_first_word() {
+        // The bug this guards: with the wrap prepended *inside* the script, mise
+        // would try to exec the `cd` builtin as a binary, anything past a pipe
+        // would escape the environment, and `exit 42` would come back as mise's
+        // own exit 1. The whole script must run inside the env.
+        let tmp = mise_root();
+        let argv = build_argv(
+            &s(&["cd src && pwd"]),
+            &detected(tmp.path()),
+            GuestOs::Linux,
         );
         assert_eq!(
             argv,
             s(&["mise", "exec", "--", "sh", "-c", "cd src && pwd"])
         );
-        // Composed here, so the guest execs this argv directly rather than
-        // re-joining it into a second shell.
-        assert!(!shell);
     }
 
     #[test]
-    fn shell_mode_uses_the_guests_shell_not_the_hosts() {
-        // The host may be macOS while the guest is Windows — the shell is picked
-        // from the target's os, never from cfg!(windows) here.
+    fn the_script_shell_is_the_guests_not_the_hosts() {
+        // The host may be macOS while the guest is Windows: the shell comes from
+        // the target's configured os, never from a cfg!() on the host.
         let tmp = mise_root();
-        let (argv, _) = build_argv(
-            &s(&["echo hi"]),
-            &detected(tmp.path()),
-            GuestOs::Windows,
-            true,
-        );
+        let argv = build_argv(&s(&["echo hi"]), &detected(tmp.path()), GuestOs::Windows);
         assert_eq!(argv, s(&["mise", "exec", "--", "cmd", "/C", "echo hi"]));
+
+        let plain = plain_root();
+        let argv = build_argv(&s(&["echo hi"]), &detected(plain.path()), GuestOs::Windows);
+        assert_eq!(argv, s(&["cmd", "/C", "echo hi"]));
+    }
+
+    #[test]
+    fn a_single_argument_with_no_shell_syntax_is_still_a_script() {
+        // One rule, no carve-outs: `sh -c ls` and exec'ing `ls` are the same run,
+        // so there is nothing to gain from a metacharacter exception — and a rule
+        // with no conditions is one nobody has to remember the conditions of.
+        let tmp = plain_root();
+        let argv = build_argv(&s(&["ls"]), &detected(tmp.path()), GuestOs::Linux);
+        assert_eq!(argv, s(&["sh", "-c", "ls"]));
+    }
+
+    #[test]
+    fn guest_env_none_beats_detection_in_both_forms() {
+        let tmp = mise_root();
+        let genv = crate::guest_env::resolve(Some(GuestEnv::None), tmp.path());
+        assert_eq!(
+            build_argv(&s(&["cargo", "test"]), &genv, GuestOs::Linux),
+            s(&["cargo", "test"])
+        );
+        assert_eq!(
+            build_argv(&s(&["exit 42"]), &genv, GuestOs::Linux),
+            s(&["sh", "-c", "exit 42"])
+        );
     }
 
     #[test]
@@ -542,32 +606,58 @@ mod tests {
         assert_eq!(render_argv(&s(&["cargo", "test"])), "cargo test");
     }
 
+    // ── The removed --shell flag ──────────────────────────────────────────────
+
     #[test]
-    fn shell_mode_without_a_guest_env_is_left_to_the_guest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (argv, shell) = build_argv(
-            &s(&["exit 42"]),
-            &detected(tmp.path()),
-            GuestOs::Linux,
-            true,
+    fn a_leftover_shell_flag_is_a_usage_error_that_teaches_the_new_form() {
+        let err = reject_removed_flags(&s(&["--shell", "cd src && cargo test"])).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::exit::UsageError>().is_some(),
+            "an obsolete flag is the caller's invocation, not a transient fault"
         );
-        assert_eq!(argv, s(&["exit 42"]));
-        assert!(shell, "the guest still runs it through its own shell");
+        let msg = err.to_string();
+        // The error hands back the exact command that replaces the old one.
+        assert!(
+            msg.contains("vm exec <alias> -- 'cd src && cargo test'"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn the_suggested_fix_drops_the_separator_clap_left_behind() {
+        // `vm exec lin --shell -- 'echo hi'` reaches us as ["--shell", "--",
+        // "echo hi"]: clap stops parsing at the unknown flag, so its own `--`
+        // rides along. Suggesting `-- '-- echo hi'` back would be worse than
+        // useless — it is the very command that just failed.
+        let err = reject_removed_flags(&s(&["--shell", "--", "echo hi"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("vm exec <alias> -- 'echo hi'"), "{msg}");
+        assert!(!msg.contains("'-- echo hi'"), "{msg}");
+    }
+
+    #[test]
+    fn shell_as_an_ordinary_argument_is_untouched() {
+        // Only the *first* element can be the stale flag; `--shell` further along
+        // is an argument to the command, and none of vm's business.
+        assert!(reject_removed_flags(&s(&["echo", "--shell"])).is_ok());
+        assert!(reject_removed_flags(&s(&["cargo", "test", "--", "--shell"])).is_ok());
+    }
+
+    // ── The native path obeys the same rule ───────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn run_native_execs_an_exec_form_command() {
+        assert_eq!(run_native(&opts(&["sh", "-c", "exit 3"])).unwrap(), 3);
     }
 
     #[cfg(unix)]
     #[test]
-    fn run_native_propagates_the_exit_code() {
-        let mut o = opts(&["sh", "-c", "exit 3"]);
-        o.shell = false;
-        assert_eq!(run_native(&o).unwrap(), 3);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_native_shell_mode_joins_argv() {
-        let mut o = opts(&["exit", "7"]);
-        o.shell = true;
-        assert_eq!(run_native(&o).unwrap(), 7);
+    fn run_native_runs_a_single_argument_as_a_script() {
+        // Same arity rule as the guest path, so one task line means one thing on
+        // both — including the exit code coming back from the script, not the
+        // shell that hosted it.
+        assert_eq!(run_native(&opts(&["exit 7"])).unwrap(), 7);
+        assert_eq!(run_native(&opts(&["true && exit 5"])).unwrap(), 5);
     }
 }
