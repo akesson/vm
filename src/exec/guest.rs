@@ -16,7 +16,11 @@ pub fn exec() -> Result<i32> {
         );
     }
 
-    let mut cmd = build_command(&req);
+    // Always a plain argv: the host composed any shell invocation before sending
+    // it (it knows this guest's OS from the config), so there is nothing here to
+    // interpret — just spawn what was asked for, byte for byte.
+    let mut cmd = Command::new(&req.argv[0]);
+    cmd.args(&req.argv[1..]);
     cmd.current_dir(&cwd)
         .env("PATH", augmented_path())
         .envs(&req.env)
@@ -30,8 +34,8 @@ pub fn exec() -> Result<i32> {
             // A command that isn't found or isn't executable is the *command's*
             // own result, not a vm failure — report it with the shell's own
             // codes (127 / 126) on the Ok path, so it never collides with the
-            // infra exit code the host would otherwise read back. (The `--shell`
-            // path already yields these from sh/cmd itself.)
+            // infra exit code the host would otherwise read back. (A script
+            // already yields these from the sh/cmd the host wrapped it in.)
             if let Some(io) = err.downcast_ref::<std::io::Error>() {
                 match io.kind() {
                     std::io::ErrorKind::NotFound => {
@@ -117,18 +121,10 @@ fn start_liveness_watcher() {
     });
 }
 
-fn build_command(req: &ExecRequest) -> Command {
-    if req.shell {
-        shell_command(&req.argv.join(" "))
-    } else {
-        let mut cmd = Command::new(&req.argv[0]);
-        cmd.args(&req.argv[1..]);
-        cmd
-    }
-}
-
-/// A guest shell running `script`: `sh -c` on unix, `cmd /C` on Windows. Both
-/// the `--shell` exec path and the first-sync hook run their string this way.
+/// A guest shell running `script`: `sh -c` on unix, `cmd /C` on Windows. The
+/// exec path composes its own shell on the *host* (which knows this guest's OS
+/// without having to be running on it); this is for the first-sync hook, whose
+/// command is a string the guest env hands us.
 fn shell_command(script: &str) -> Command {
     if cfg!(windows) {
         let mut cmd = Command::new("cmd");

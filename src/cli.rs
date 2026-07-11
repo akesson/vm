@@ -198,9 +198,6 @@ pub struct ExecOpts {
     /// against the commit the sync pushes, so with no sync there is no base
     #[arg(long, conflicts_with = "no_sync")]
     pub writeback: bool,
-    /// Run through the guest shell (enables pipes/redirection; argv is joined)
-    #[arg(long)]
-    pub shell: bool,
     /// If the host OS already matches the target's os, run the command
     /// natively (no VM, no sync, no guest) instead of in the guest — the same
     /// task then works on a dev host driving a guest and on a CI runner that
@@ -217,7 +214,10 @@ pub struct ExecOpts {
     /// breadcrumb when active)
     #[arg(long, value_enum, value_name = "ENV")]
     pub guest_env: Option<GuestEnv>,
-    /// Command and arguments to run in the guest checkout
+    /// Command to run in the guest checkout. SEVERAL arguments run exactly as
+    /// given, byte for byte, with no shell involved. A SINGLE argument is run as
+    /// a script by the guest's own shell (`sh -c`, or `cmd /C` on Windows), so
+    /// `vm exec <alias> -- 'cd src && cargo test'` gets pipes, `&&` and builtins
     #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
     pub cmd: Vec<String>,
 }
@@ -238,7 +238,30 @@ mod tests {
         };
         assert_eq!(exec.target, "win");
         assert_eq!(exec.opts.cmd, ["cargo", "build", "--release"]);
-        assert!(!exec.opts.shell);
+    }
+
+    #[test]
+    fn a_single_trailing_argument_survives_as_one() {
+        // The arity rule reads this as a script, so clap must not have split it
+        // — everything downstream keys off `cmd.len() == 1`.
+        let cli = parse(&["vm", "exec", "lin", "--", "cd src && cargo test"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.cmd, ["cd src && cargo test"]);
+    }
+
+    #[test]
+    fn a_leftover_shell_flag_lands_in_the_command() {
+        // `cmd` is trailing_var_arg, so clap does not reject the removed flag —
+        // it swallows it. Pinned here because that is *why* exec::host rejects a
+        // command starting with `--shell` by hand: left alone, an old script
+        // would go hunting the guest for a binary named `--shell`.
+        let cli = parse(&["vm", "exec", "lin", "--shell", "--", "echo hi"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.cmd[0], "--shell");
     }
 
     #[test]

@@ -36,7 +36,6 @@ pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
     let exec = ExecOptions {
         no_sync: false,
         writeback: !opts.no_writeback,
-        shell: false,
         with_snapshot: opts.with_snapshot,
         // claude is the permission boundary — it always runs in the VM.
         or_native: false,
