@@ -433,7 +433,10 @@ mod tests {
         assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
     }
 
-    /// Minimal ExecOptions for the native tests.
+    /// Minimal ExecOptions for the native tests. Those run `sh`, so they are
+    /// unix-only; the helper carries the same gate or it is dead code — and
+    /// under `-D warnings`, a build failure — on the Windows runner.
+    #[cfg(unix)]
     fn opts(cmd: &[&str]) -> ExecOptions {
         ExecOptions {
             no_sync: false,
