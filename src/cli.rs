@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use vm::guest_env::GuestEnv;
 
 /// Run commands in Parallels VMs against a synced copy of the current repo.
 ///
@@ -45,6 +46,10 @@ pub enum Command {
     Sync {
         /// VM alias from ~/.config/vm/config.toml
         alias: String,
+        /// Guest environment handling: `mise` forces the mise setup, `none`
+        /// disables it. Default: auto-detect from the repo root
+        #[arg(long, value_enum, value_name = "ENV")]
+        guest_env: Option<GuestEnv>,
     },
     /// Build and install the vm agent inside a guest
     Deploy {
@@ -58,8 +63,6 @@ pub enum Command {
         /// Output file (default: <alias>-<timestamp>.png in the current dir)
         file: Option<PathBuf>,
     },
-    /// Snapshot a VM, run a command, then roll back
-    WithSnapshot(ExecArgs),
     /// Run Claude Code headless in the guest checkout of the current repo
     ///
     /// Syncs the repo, runs `claude -p` with permission prompts bypassed —
@@ -75,7 +78,8 @@ pub enum Command {
         /// Idle threshold in minutes, measured from the end of the last use
         #[arg(long, default_value_t = 30)]
         idle_minutes: u64,
-        /// Install a launchd job running `vm reap` every 5 minutes
+        /// Install a launchd job running `vm reap` every 5 minutes; the job
+        /// bakes in this invocation's --idle-minutes
         #[arg(long, conflicts_with_all = ["uninstall", "alias"])]
         install: bool,
         /// Remove the launchd job
@@ -126,7 +130,8 @@ pub enum Command {
         /// Path of the guest checkout ('~/' prefix allowed)
         #[arg(long)]
         repo: String,
-        /// The `on_first_sync` command from the repo's .vm.toml
+        /// The first-sync setup command (e.g. `mise trust` from the mise
+        /// guest env)
         #[arg(long)]
         cmd: String,
     },
@@ -140,8 +145,9 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct ExecArgs {
-    /// VM alias from ~/.config/vm/config.toml, or an OS name
-    /// (windows | linux | macos) to pick the VM configured for that OS
+    /// VM alias from ~/.config/vm/config.toml. With --or-native, a target
+    /// literally named windows | linux | macos that matches the host OS runs
+    /// natively without needing the config (CI runners)
     pub target: String,
     #[command(flatten)]
     pub opts: ExecOpts,
@@ -149,8 +155,7 @@ pub struct ExecArgs {
 
 #[derive(Args)]
 pub struct ClaudeArgs {
-    /// VM alias from ~/.config/vm/config.toml, or an OS name
-    /// (windows | linux | macos) to pick the VM configured for that OS
+    /// VM alias from ~/.config/vm/config.toml
     pub target: String,
     /// Prompt for the headless run
     pub prompt: String,
@@ -162,18 +167,36 @@ pub struct ClaudeArgs {
     /// back to the host tree
     #[arg(long)]
     pub no_writeback: bool,
-    /// Extra arguments passed to claude verbatim (e.g. --model sonnet)
+    /// Set an env var for the guest claude process: `-e NAME=value`, or
+    /// `-e NAME` to forward the host's current value. Repeatable; must come
+    /// before the prompt
+    #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
+    pub env: Vec<String>,
+    /// Guest environment handling: `mise` forces the mise setup/wrap, `none`
+    /// disables it. Default: auto-detect from the repo root
+    #[arg(long, value_enum, value_name = "ENV")]
+    pub guest_env: Option<GuestEnv>,
+    /// Extra arguments passed to claude verbatim (e.g. --model sonnet).
+    /// Everything from the first argument vm does not know onwards goes to
+    /// claude — so vm's own flags must come before the prompt
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub claude_args: Vec<String>,
 }
 
 #[derive(Args)]
 pub struct ExecOpts {
+    /// Snapshot the VM first, run the command, then roll the VM back — the
+    /// guest keeps nothing from the run (needs the VM to itself and ~2× the
+    /// VM's RAM free on disk)
+    #[arg(long, conflicts_with = "or_native")]
+    pub with_snapshot: bool,
     /// Skip the pre-exec sync (run against the guest checkout as-is)
     #[arg(long)]
     pub no_sync: bool,
-    /// After the command, apply source changes made in the guest back to the host tree
-    #[arg(long)]
+    /// After the command, apply source changes made in the guest back to the
+    /// host tree. Cannot be combined with --no-sync: the guest diff is measured
+    /// against the commit the sync pushes, so with no sync there is no base
+    #[arg(long, conflicts_with = "no_sync")]
     pub writeback: bool,
     /// Run through the guest shell (enables pipes/redirection; argv is joined)
     #[arg(long)]
@@ -189,6 +212,11 @@ pub struct ExecOpts {
     /// to forward the host's current value. Repeatable.
     #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
     pub env: Vec<String>,
+    /// Guest environment handling: `mise` forces the mise setup/wrap, `none`
+    /// disables it. Default: auto-detect from the repo root (announced by a
+    /// breadcrumb when active)
+    #[arg(long, value_enum, value_name = "ENV")]
+    pub guest_env: Option<GuestEnv>,
     /// Command and arguments to run in the guest checkout
     #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
     pub cmd: Vec<String>,
@@ -236,13 +264,82 @@ mod tests {
     }
 
     #[test]
-    fn exec_target_can_be_an_os_name() {
-        let cli = parse(&["vm", "exec", "windows", "--", "cargo", "nextest", "run"]);
+    fn exec_parses_with_snapshot() {
+        let cli = parse(&[
+            "vm",
+            "exec",
+            "win",
+            "--with-snapshot",
+            "--",
+            "cargo",
+            "test",
+        ]);
         let Command::Exec(exec) = cli.command else {
             panic!("expected exec");
         };
-        assert_eq!(exec.target, "windows");
-        assert_eq!(exec.opts.cmd, ["cargo", "nextest", "run"]);
+        assert!(exec.opts.with_snapshot);
+        assert_eq!(exec.opts.cmd, ["cargo", "test"]);
+    }
+
+    #[test]
+    fn with_snapshot_conflicts_with_or_native_at_parse_time() {
+        // The host cannot be snapshotted, so the combination is rejected by
+        // clap itself instead of surfacing later at runtime.
+        assert!(
+            Cli::try_parse_from([
+                "vm",
+                "exec",
+                "win",
+                "--with-snapshot",
+                "--or-native",
+                "--",
+                "true",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn writeback_conflicts_with_no_sync_at_parse_time() {
+        // Writeback diffs the guest tree against the commit the sync pushed, so
+        // with --no-sync there is no base to diff against and the writeback
+        // could only be silently skipped. Reject it up front instead.
+        assert!(
+            Cli::try_parse_from([
+                "vm",
+                "exec",
+                "lin",
+                "--no-sync",
+                "--writeback",
+                "--",
+                "true"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exec_parses_guest_env_choices() {
+        let cli = parse(&["vm", "exec", "win", "--guest-env", "none", "--", "true"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.guest_env, Some(GuestEnv::None));
+
+        let cli = parse(&["vm", "exec", "win", "--guest-env", "mise", "--", "true"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.guest_env, Some(GuestEnv::Mise));
+    }
+
+    #[test]
+    fn exec_guest_env_defaults_to_auto_detect() {
+        let cli = parse(&["vm", "exec", "win", "--", "true"]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.guest_env, None);
     }
 
     #[test]
@@ -312,6 +409,49 @@ mod tests {
         assert!(args.no_writeback);
         assert_eq!(args.prompt, "do it");
         assert!(args.claude_args.is_empty());
+    }
+
+    #[test]
+    fn claude_env_flags_parse_before_the_prompt() {
+        let cli = parse(&[
+            "vm", "claude", "lin", "-e", "FOO=bar", "--env", "BAZ", "do it",
+        ]);
+        let Command::Claude(args) = cli.command else {
+            panic!("expected claude");
+        };
+        assert_eq!(args.env, ["FOO=bar", "BAZ"]);
+        assert_eq!(args.prompt, "do it");
+        assert!(args.claude_args.is_empty());
+    }
+
+    /// The passthrough tail starts at the first argument vm does not know, and
+    /// swallows everything after it — including names vm *does* know. So a vm
+    /// flag reaches vm before `--model`, and claude after it. `vm::claude`
+    /// rejects the second shape rather than letting the flag quietly vanish;
+    /// this pins the parse behavior that makes that check necessary.
+    #[test]
+    fn a_vm_flag_after_an_unknown_flag_lands_in_the_passthrough_tail() {
+        let cli = parse(&["vm", "claude", "lin", "do it", "--no-writeback"]);
+        let Command::Claude(args) = cli.command else {
+            panic!("expected claude");
+        };
+        assert!(args.no_writeback, "before the tail, it is vm's own flag");
+        assert!(args.claude_args.is_empty());
+
+        let cli = parse(&[
+            "vm",
+            "claude",
+            "lin",
+            "do it",
+            "--model",
+            "sonnet",
+            "--no-writeback",
+        ]);
+        let Command::Claude(args) = cli.command else {
+            panic!("expected claude");
+        };
+        assert!(!args.no_writeback, "inside the tail, vm never sees it");
+        assert_eq!(args.claude_args, ["--model", "sonnet", "--no-writeback"]);
     }
 
     #[test]

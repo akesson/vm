@@ -16,7 +16,6 @@ impl std::fmt::Display for GuestOs {
 }
 
 /// Resolve the address to ssh to: config override, or the IP Parallels reports.
-#[allow(dead_code)] // used from phase 4 (exec)
 pub fn ssh_target(vm: &VmConfig) -> Result<SshTarget> {
     let host = match &vm.host {
         Some(host) => host.clone(),
@@ -44,24 +43,59 @@ pub fn ls() -> Result<i32> {
     let vms = prl::list_all()?;
     let repo = mapping::RepoLocation::discover().ok();
 
-    println!(
-        "{:<7} {:<8} {:<14} {:<10} {:<15} CHECKOUT (this repo)",
-        "ALIAS", "OS", "VM", "STATUS", "IP"
-    );
+    // Rows first, so every column is as wide as its widest cell: a long alias
+    // or Parallels name shifts the table instead of ragging it.
+    let mut rows = vec![[
+        "ALIAS".to_string(),
+        "OS".to_string(),
+        "VM".to_string(),
+        "STATUS".to_string(),
+        "IP".to_string(),
+        "CHECKOUT (this repo)".to_string(),
+    ]];
     for (alias, vm) in &cfg.vm {
         let prl_vm = vms.iter().find(|p| p.name == vm.parallels_name);
-        let status = prl_vm.map_or("missing!", |p| p.status.as_str());
-        let ip = prl_vm.and_then(|p| p.ip()).unwrap_or("-");
-        let checkout = match &repo {
-            Some(repo) => mapping::guest_repo_path(&vm.work_root, &repo.name),
-            None => "- (not in a git repo)".to_string(),
-        };
-        println!(
-            "{:<7} {:<8} {:<14} {:<10} {:<15} {}",
-            alias, vm.os, vm.parallels_name, status, ip, checkout
-        );
+        rows.push([
+            alias.clone(),
+            vm.os.to_string(),
+            vm.parallels_name.clone(),
+            prl_vm.map_or("missing!", |p| p.status.as_str()).to_string(),
+            prl_vm.and_then(|p| p.ip()).unwrap_or("-").to_string(),
+            match &repo {
+                Some(repo) => mapping::guest_repo_path(&vm.work_root, &repo.name),
+                None => "- (not in a git repo)".to_string(),
+            },
+        ]);
+    }
+    let widths = column_widths(&rows);
+    for row in &rows {
+        println!("{}", format_row(row, &widths));
     }
     Ok(0)
+}
+
+/// Widest cell per column. The last column is never padded (nothing follows
+/// it), so it does not need a width.
+fn column_widths<const N: usize>(rows: &[[String; N]]) -> Vec<usize> {
+    (0..N - 1)
+        .map(|col| {
+            rows.iter()
+                .map(|r| r[col].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn format_row<const N: usize>(row: &[String; N], widths: &[usize]) -> String {
+    let mut line = String::new();
+    for (col, cell) in row.iter().enumerate() {
+        match widths.get(col) {
+            Some(width) => line.push_str(&format!("{cell:<width$}  ")),
+            None => line.push_str(cell), // last column: no padding
+        }
+    }
+    line
 }
 
 pub fn start(alias: &str) -> Result<i32> {
@@ -188,20 +222,21 @@ pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync:
     Ok(snap)
 }
 
-/// Run the repo's `on_first_sync` hook (from `.vm.toml`) in the guest checkout,
-/// once per checkout creation; a no-op when the repo configures no hook or the
-/// checkout already ran it (the guest verb keeps the marker). Serialized per
+/// Run the guest env's one-time setup (mise: `mise trust`) in the guest
+/// checkout, once per checkout creation; a no-op when no guest env is active or
+/// the checkout already ran it (the guest verb keeps the marker). Serialized per
 /// (repo, guest) via the same lock the sync path uses, so a parallel exec
-/// fan-out on a fresh checkout runs the hook exactly once. A nonzero hook exit
-/// is an infra failure (exit 125): vm couldn't ready the checkout, so the
-/// caller's command must not run.
+/// fan-out on a fresh checkout runs it exactly once. A nonzero exit is an infra
+/// failure (exit 125): vm couldn't ready the checkout, so the caller's command
+/// must not run.
 pub fn first_sync_hook(
     alias: &str,
     vm: &VmConfig,
     target: &SshTarget,
     repo: &mapping::RepoLocation,
+    genv: &crate::guest_env::ActiveEnv,
 ) -> Result<()> {
-    let Some(hook) = crate::repo_config::RepoConfig::load(&repo.root)?.on_first_sync else {
+    let Some(hook) = genv.first_sync_cmd() else {
         return Ok(());
     };
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
@@ -209,7 +244,7 @@ pub fn first_sync_hook(
     let agent = agent_path(vm);
     // Bare agent path so `~` expands in the remote shell; POSIX-quote the values
     // (a Windows checkout path, or a hook with spaces) exactly like agent_call.
-    let (repo_q, cmd_q) = (ssh::shell_quote(&guest_repo), ssh::shell_quote(&hook));
+    let (repo_q, cmd_q) = (ssh::shell_quote(&guest_repo), ssh::shell_quote(hook));
     let remote = [
         agent.as_str(),
         "_first-sync",
@@ -221,26 +256,29 @@ pub fn first_sync_hook(
     let status = ssh::run_streamed(target, &remote)?;
     if !status.success() {
         bail!(
-            "first-sync hook failed (exit {}): {hook}\n  \
-             it ran in the guest checkout {guest_repo}; fix the hook in .vm.toml, \
-             or re-run with --no-sync to skip",
+            "guest-env setup failed (exit {}): {hook}\n  \
+             it ran in the guest checkout {guest_repo}; fix it there, or re-run with \
+             `--guest-env none` to skip the guest env entirely",
             status.code().unwrap_or(-1)
         );
     }
     Ok(())
 }
 
-/// `vm sync <alias>`: start the VM if needed, then sync.
-pub fn sync_cmd(alias: &str) -> Result<i32> {
+/// `vm sync <alias> [--guest-env …]`: start the VM if needed, then sync (and
+/// run the guest env's first-sync setup, exactly as an exec would).
+pub fn sync_cmd(alias: &str, guest_env: Option<crate::guest_env::GuestEnv>) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
     let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
     prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
     let target = ssh_target(vm)?;
-    sync_repo(alias, vm, &target)?;
     let repo = mapping::RepoLocation::discover()?;
-    first_sync_hook(alias, vm, &target, &repo)?;
+    let genv = crate::guest_env::resolve(guest_env, &repo.root);
+    genv.announce(alias);
+    sync_repo(alias, vm, &target)?;
+    first_sync_hook(alias, vm, &target, &repo, &genv)?;
     Ok(0)
 }
 
@@ -305,25 +343,21 @@ pub fn clean(alias: &str) -> Result<i32> {
     Ok(0)
 }
 
-/// `vm with-snapshot <target> -- cmd…`: snapshot, run, roll back, delete the
-/// snapshot. The guest ends up exactly as it started — for destructive or
+/// `vm exec <alias> --with-snapshot -- cmd…`: snapshot, run, roll back, delete
+/// the snapshot. The guest ends up exactly as it started — for destructive or
 /// state-polluting experiments (installers, registry edits, config trials).
-pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Result<i32> {
-    if opts.or_native {
-        // with-snapshot rolls the *guest* back around the run; there is nothing
-        // to snapshot on the host, so the two are mutually exclusive.
-        return Err(crate::exit::usage(
-            "--or-native cannot be combined with with-snapshot: the host cannot be \
-             snapshotted, so a native run has nothing to roll back",
-        ));
-    }
-    let cfg = Config::load()?;
-    let (alias, vm) = cfg.resolve(target)?;
+/// Called from `exec::host::exec` once the target has resolved; it takes the VM
+/// exclusively and calls back into `exec_in` (which does not lock).
+pub fn with_snapshot(
+    alias: &str,
+    vm: &VmConfig,
+    opts: &crate::exec::host::ExecOptions,
+) -> Result<i32> {
     // Exclusive: rollback rewinds the whole VM (disk and memory), which would
     // obliterate any concurrent run and silently undo its guest-side effects.
     let Some(_claim) = lock::try_exclusive(alias)? else {
         bail!(
-            "'{alias}' is in use by another vm process — with-snapshot needs the \
+            "'{alias}' is in use by another vm process — --with-snapshot needs the \
              VM to itself (rollback would destroy the other run)"
         );
     };
@@ -334,7 +368,7 @@ pub fn with_snapshot(target: &str, opts: &crate::exec::host::ExecOptions) -> Res
 
     let id = prl::snapshot_create(&vm.parallels_name, &format!("vm-with-snapshot-{alias}"))?;
     eprintln!("vm ▸ {alias} ▸ snapshot {id} taken");
-    let run = crate::exec::host::exec_unlocked(alias, opts);
+    let run = crate::exec::host::exec_in(alias, vm, opts);
     // Roll back even when the command failed — that's the whole point.
     let restore = prl::snapshot_switch(&vm.parallels_name, &id)
         .and_then(|()| prl::snapshot_delete(&vm.parallels_name, &id));

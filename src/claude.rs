@@ -9,6 +9,8 @@
 //! so a run leaves nothing behind but the diff.
 
 use crate::exec::host::ExecOptions;
+use crate::exit::usage;
+use crate::guest_env::GuestEnv;
 use anyhow::Result;
 
 pub struct ClaudeOptions {
@@ -17,25 +19,56 @@ pub struct ClaudeOptions {
     pub claude_args: Vec<String>,
     pub with_snapshot: bool,
     pub no_writeback: bool,
+    /// `-e` specs forwarded to the guest claude process.
+    pub env: Vec<String>,
+    pub guest_env: Option<GuestEnv>,
 }
 
+/// vm's own flags on `vm claude`. Once clap starts filling the verbatim
+/// passthrough tail (at the first arg it does not know, e.g. `--model`), every
+/// later arg lands there raw — so `--no-writeback` *before* `--model` reaches
+/// vm, and *after* it silently reaches claude instead. See
+/// [`reject_misplaced_vm_flags`].
+const VM_FLAGS: &[&str] = &["--with-snapshot", "--no-writeback", "--guest-env"];
+
 pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
+    reject_misplaced_vm_flags(&opts.claude_args)?;
     let exec = ExecOptions {
         no_sync: false,
         writeback: !opts.no_writeback,
         shell: false,
-        // claude is the permission boundary — it always runs in the VM, and its
-        // own `claude` argv is never subject to the repo's `wrap` prefix.
+        with_snapshot: opts.with_snapshot,
+        // claude is the permission boundary — it always runs in the VM.
         or_native: false,
-        apply_wrap: false,
-        env: Vec::new(),
+        // In a mise repo claude runs under `mise exec --`, so the commands *it*
+        // spawns in the guest resolve the repo's tools.
+        guest_env: opts.guest_env,
+        env: opts.env.clone(),
         cmd: argv(opts),
     };
-    if opts.with_snapshot {
-        crate::commands::with_snapshot(target, &exec)
-    } else {
-        crate::exec::host::exec(target, &exec)
+    crate::exec::host::exec(target, &exec)
+}
+
+/// A vm flag that landed in the passthrough tail would be handed to claude,
+/// which does not have it — so the flag the caller *did* pass would take no
+/// effect here. Refuse rather than warn: the flags in question are the ones
+/// that hold vm back from touching things (`--no-writeback` keeps the host tree
+/// untouched), and a silently dropped safety flag is exactly the failure worth
+/// paying an exit-2 for. Claude's own flags are unaffected — only these three
+/// names are reserved.
+fn reject_misplaced_vm_flags(claude_args: &[String]) -> Result<()> {
+    for arg in claude_args {
+        let name = arg.split('=').next().unwrap_or(arg);
+        if VM_FLAGS.contains(&name) {
+            return Err(usage(format!(
+                "`{name}` is a vm flag, but here it sits after an argument vm does not know, \
+                 so it would be passed to claude verbatim and have no effect.\n  \
+                 Put vm's own flags before the prompt: \
+                 `vm claude <alias> {name} … \"<prompt>\" [claude flags…]`"
+            )));
+        }
     }
+    Ok(())
 }
 
 fn argv(opts: &ClaudeOptions) -> Vec<String> {
@@ -53,16 +86,21 @@ fn argv(opts: &ClaudeOptions) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn argv_puts_extra_args_before_the_prompt() {
-        let opts = ClaudeOptions {
+    fn opts(claude_args: &[&str]) -> ClaudeOptions {
+        ClaudeOptions {
             prompt: "fix the failing test".into(),
-            claude_args: vec!["--model".into(), "sonnet".into()],
+            claude_args: claude_args.iter().map(|s| s.to_string()).collect(),
             with_snapshot: false,
             no_writeback: false,
-        };
+            env: Vec::new(),
+            guest_env: None,
+        }
+    }
+
+    #[test]
+    fn argv_puts_extra_args_before_the_prompt() {
         assert_eq!(
-            argv(&opts),
+            argv(&opts(&["--model", "sonnet"])),
             [
                 "claude",
                 "-p",
@@ -72,5 +110,38 @@ mod tests {
                 "fix the failing test",
             ]
         );
+    }
+
+    fn reject(claude_args: &[&str]) -> Result<()> {
+        let args: Vec<String> = claude_args.iter().map(|s| s.to_string()).collect();
+        reject_misplaced_vm_flags(&args)
+    }
+
+    #[test]
+    fn a_vm_flag_in_the_passthrough_tail_is_rejected() {
+        // `vm claude lin "p" --model sonnet --no-writeback`: clap fills the tail
+        // from `--model` on, so --no-writeback would reach claude and vm would
+        // write back anyway — refuse instead of quietly doing the wrong thing.
+        let err = reject(&["--model", "sonnet", "--no-writeback"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--no-writeback"), "{err}");
+        assert!(err.contains("before the prompt"), "{err}");
+    }
+
+    #[test]
+    fn the_value_form_is_rejected_too() {
+        assert!(reject(&["--verbose", "--guest-env=none"]).is_err());
+    }
+
+    #[test]
+    fn claudes_own_flags_pass_through_untouched() {
+        assert!(reject(&["--model", "sonnet", "--verbose"]).is_ok());
+    }
+
+    #[test]
+    fn a_misplaced_vm_flag_is_a_usage_error_not_an_infra_one() {
+        let err = reject(&["--verbose", "--with-snapshot"]).unwrap_err();
+        assert!(err.downcast_ref::<crate::exit::UsageError>().is_some());
     }
 }

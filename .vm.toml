@@ -1,4 +1,0 @@
-# Per-repo vm setup, run once in each guest checkout the first time it is
-# created (and again after `vm clean`). This repo is mise-managed, so a fresh
-# guest checkout needs `mise trust` before any task runs.
-on_first_sync = "mise trust"

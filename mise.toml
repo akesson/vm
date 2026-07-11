@@ -25,7 +25,11 @@ fi
 description = "Format and lint (--check for CI mode)"
 
 [tasks.a11y-probe]
-usage = 'arg "[target]" help="VM alias or OS (windows|linux|macos), or all" default="all"'
+# Targets are vm aliases. vm addresses VMs by alias only, so this line assumes
+# the machine config names them after their OS (see the README's "Targets") —
+# `vm exec windows` against a config whose Windows VM is called `win` is an
+# error, and says exactly which rename to make.
+usage = 'arg "[target]" help="VM alias (conventionally windows|linux|macos), or all" default="all"'
 run = '''
 targets="${usage_target}"
 if [ "$targets" = "all" ]; then targets="windows linux macos"; fi

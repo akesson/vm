@@ -27,7 +27,6 @@ pub struct VmConfig {
     /// Hostname/IP override; by default the IP is discovered via prlctl
     pub host: Option<String>,
     /// Path of the vm agent binary in the guest (default: <home>/.vm/bin/vm[.exe])
-    #[allow(dead_code)] // used from phase 4 (deploy/exec)
     pub agent_path: Option<String>,
 }
 
@@ -40,7 +39,10 @@ pub enum GuestOs {
 }
 
 impl GuestOs {
-    /// The OS names accepted as exec targets.
+    /// The literal OS names `exec --or-native` recognizes in a target. This is
+    /// not a lookup — a target named exactly `windows`/`linux`/`macos` that
+    /// matches the host OS runs natively before the config is even loaded, so
+    /// the same task line works on a CI runner with no config or Parallels.
     pub fn parse(s: &str) -> Option<GuestOs> {
         match s {
             "windows" => Some(GuestOs::Windows),
@@ -99,48 +101,45 @@ impl Config {
     }
 
     /// Look up a VM by alias, with an error that lists what is configured.
+    /// The alias is the only way to address a VM — there is no OS-name
+    /// fallback; the one os-literal special case lives in `exec --or-native`
+    /// (see [`GuestOs::parse`]).
+    ///
+    /// An alias that *is* an os name but is not configured gets an extra line:
+    /// that shape is a CI-portable `--or-native` task line landing on a host of
+    /// a different OS, and the fix — name the VM for its OS — is not obvious
+    /// from "unknown alias" alone.
     pub fn get(&self, alias: &str) -> Result<&VmConfig> {
-        self.vm.get(alias).ok_or_else(|| {
-            let known: Vec<&str> = self.vm.keys().map(String::as_str).collect();
-            usage(format!(
-                "unknown VM alias '{alias}' (configured: {})",
-                known.join(", ")
-            ))
-        })
-    }
-
-    /// Resolve an exec target: an alias, or an OS name (`windows` | `linux` |
-    /// `macos`) selecting the single VM configured for that OS. Aliases win
-    /// on collision. Never resolves to the host — `vm` always targets a VM.
-    pub fn resolve(&self, target: &str) -> Result<(&str, &VmConfig)> {
-        if let Some((alias, vm)) = self.vm.get_key_value(target) {
-            return Ok((alias.as_str(), vm));
-        }
-        if let Some(os) = GuestOs::parse(target) {
-            return self.find_by_os(os);
+        if let Some(vm) = self.vm.get(alias) {
+            return Ok(vm);
         }
         let known: Vec<&str> = self.vm.keys().map(String::as_str).collect();
-        Err(usage(format!(
-            "unknown target '{target}' — expected a configured alias ({}) or an OS name (windows, linux, macos)",
+        let mut msg = format!(
+            "unknown VM alias '{alias}' (configured: {})",
             known.join(", ")
-        )))
-    }
-
-    /// Find the (single) VM configured for an OS.
-    pub fn find_by_os(&self, os: GuestOs) -> Result<(&str, &VmConfig)> {
-        let mut matches = self.vm.iter().filter(|(_, vm)| vm.os == os);
-        let Some((alias, vm)) = matches.next() else {
-            return Err(usage(format!(
-                "no VM configured for os '{os:?}' in {}",
-                Self::path().display()
-            )));
-        };
-        if let Some((other, _)) = matches.next() {
-            return Err(usage(format!(
-                "multiple VMs configured for os '{os:?}' ({alias}, {other}); use `vm exec <alias>`"
-            )));
+        );
+        if let Some(os) = GuestOs::parse(alias) {
+            let same_os: Vec<&str> = self
+                .vm
+                .iter()
+                .filter(|(_, vm)| vm.os == os)
+                .map(|(a, _)| a.as_str())
+                .collect();
+            msg.push_str(&format!(
+                "\n  '{alias}' is an OS name, but VMs are addressed by alias only. For a task \
+                 line that runs natively on a {alias} host and in the VM elsewhere, the VM's \
+                 alias must itself be '{alias}' — "
+            ));
+            match same_os.as_slice() {
+                [] => msg.push_str(&format!("no VM is configured with os = \"{alias}\".")),
+                aliases => msg.push_str(&format!(
+                    "rename [vm.{}] to [vm.{alias}] in {}.",
+                    aliases.join("] / [vm."),
+                    Self::path().display()
+                )),
+            }
         }
-        Ok((alias.as_str(), vm))
+        Err(usage(msg))
     }
 }
 
@@ -192,36 +191,35 @@ mod tests {
     }
 
     #[test]
-    fn find_by_os_picks_the_single_match() {
+    fn os_names_are_not_aliases() {
+        // Aliases are the only addressing mode: an OS name that is not a
+        // configured alias is an error like any other unknown alias.
         let cfg = Config::parse(SAMPLE).unwrap();
-        let (alias, _) = cfg.find_by_os(GuestOs::Linux).unwrap();
-        assert_eq!(alias, "lin");
-    }
-
-    #[test]
-    fn resolve_prefers_alias_then_falls_back_to_os_name() {
-        let cfg = Config::parse(SAMPLE).unwrap();
-        assert_eq!(cfg.resolve("win").unwrap().0, "win");
-        assert_eq!(cfg.resolve("windows").unwrap().0, "win");
-        assert_eq!(cfg.resolve("macos").unwrap().0, "mac");
-    }
-
-    #[test]
-    fn resolve_rejects_unknown_target_mentioning_both_forms() {
-        let cfg = Config::parse(SAMPLE).unwrap();
-        let err = cfg.resolve("ios").unwrap_err().to_string();
+        let err = cfg.get("windows").unwrap_err().to_string();
         assert!(err.contains("lin, mac, win"), "{err}");
-        assert!(err.contains("windows, linux, macos"), "{err}");
     }
 
     #[test]
-    fn find_by_os_rejects_ambiguity() {
-        let two = format!(
-            "{SAMPLE}\n[vm.win2]\nparallels_name = \"W2\"\nos = \"windows\"\nuser = \"u\"\nwork_root = 'C:\\w'\n"
+    fn an_os_named_target_points_at_the_vm_to_rename() {
+        // The CI-portable `--or-native <os>` shape only works when the alias is
+        // the os name, so say which VM to rename rather than just "unknown".
+        let cfg = Config::parse(SAMPLE).unwrap();
+        let err = cfg.get("windows").unwrap_err().to_string();
+        assert!(err.contains("addressed by alias only"), "{err}");
+        assert!(err.contains("rename [vm.win] to [vm.windows]"), "{err}");
+    }
+
+    #[test]
+    fn an_os_with_no_vm_says_so_instead_of_naming_one() {
+        let cfg = Config::parse(
+            "[vm.lin]\nparallels_name = \"U\"\nos = \"linux\"\nuser = \"u\"\nwork_root = \"~/w\"\n",
+        )
+        .unwrap();
+        let err = cfg.get("windows").unwrap_err().to_string();
+        assert!(
+            err.contains("no VM is configured with os = \"windows\""),
+            "{err}"
         );
-        let cfg = Config::parse(&two).unwrap();
-        let err = cfg.find_by_os(GuestOs::Windows).unwrap_err().to_string();
-        assert!(err.contains("multiple"), "{err}");
     }
 
     #[test]
