@@ -182,12 +182,20 @@ on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and co
 ## Gotchas
 
 - Don't stop VMs when done — the reap timer suspends idle VMs automatically,
-  and any `vm exec` resumes a suspended VM in ~1s. Parallel `vm` invocations
+  and any `vm exec` resumes a suspended VM for you: a few seconds to be ready
+  (a macOS guest takes ~15s, a cold boot longer). Parallel `vm` invocations
   are safe: uses hold a shared per-VM lock; stop/`--with-snapshot`/reap won't
   fire while another vm process is using the VM. Parallel `vm exec` of the
   *same* repo to the *same* guest (e.g. a `mise` fan-out) is safe too — the
   syncs serialize behind a per-(repo, guest) lock, so a second one waits a
   moment for the first rather than racing on the shared git snapshot.
+- A wait for a VM is never silent: past 10s vm prints where it is
+  (`vm ▸ 'macOS' running, no IP yet — 10s of 90s`) and says when the guest is
+  ready. If a VM is not coming up at all — a resume that Parallels reported as
+  successful but did not perform, or something suspending it again underneath —
+  vm says so within ~15s (exit 125) instead of waiting the guest out. `vm ls`
+  shows every VM's status and IP, so a wait can be watched from another
+  terminal.
 - A lone path with a **space in its filename** is the one place the one-argument
   form bites: it is a script, so the shell splits it. Quote it for the shell
   (`vm exec macos -- '"/Applications/My App/run"'`) or pass it in exec form. vm

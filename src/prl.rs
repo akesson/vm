@@ -72,21 +72,106 @@ pub fn ensure_running(name: &str) -> Result<()> {
     }
 }
 
-/// Wait until the guest reports an IP (Parallels Tools up / DHCP done).
-pub fn wait_for_ip(name: &str, timeout: Duration) -> Result<String> {
-    let deadline = Instant::now() + timeout;
+/// How long a guest gets to report an IP once Parallels has it running.
+const IP_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How often the VM's state is re-read while waiting.
+const POLL: Duration = Duration::from_secs(2);
+
+/// A wait that passes this says so, and keeps saying so this often. Below it
+/// the wait is not worth a line: the overwhelmingly common case is a VM that
+/// is already up, which returns on the first look and prints nothing.
+const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// How long Parallels gets to move a VM out of a settled off-state after
+/// reporting a successful start or resume. Measured on Parallels 26.4: a
+/// stopped VM reads `starting` the instant `prlctl start` returns, and a cold
+/// resume of a 20 GB macOS VM reads `running` ~2.5s after `prlctl resume`
+/// returns. 15s is a wide margin over that — so a VM still `suspended` here is
+/// not a slow one, it is one that is not coming up.
+const TRANSITION_GRACE: Duration = Duration::from_secs(15);
+
+/// Statuses a VM never leaves on its own — it has to be started or resumed, so
+/// one of these means no IP is ever coming. Everything else is left to the
+/// timeout: `running`, and the transients Parallels reports while it works
+/// (`starting`, `resuming`, `stopping`).
+fn is_off(status: &str) -> bool {
+    matches!(status, "stopped" | "suspended" | "paused")
+}
+
+/// What one observation of the VM means to a caller waiting on its IP.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Up(String),
+    Wait,
+    Fail(String),
+}
+
+fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout: Duration) -> Step {
+    if let Some(ip) = ip {
+        return Step::Up(ip.to_string());
+    }
+    // Checked before the timeout: it is the more specific diagnosis, and the
+    // one whose advice is actionable.
+    if is_off(status) && waited >= TRANSITION_GRACE {
+        return Step::Fail(format!(
+            "VM '{name}' is {status} {}s after vm asked Parallels to bring it up, so it \
+             will never report an IP.\n  \
+             Either the start/resume did not take effect, or something put the VM back \
+             down while vm was waiting for it (`vm reap`, or a suspend from the Parallels \
+             GUI).\n  \
+             `prlctl list -a` shows the current state; `prlctl resume \"{name}\"` brings \
+             it up by hand.",
+            waited.as_secs()
+        ));
+    }
+    if waited >= timeout {
+        return Step::Fail(format!(
+            "VM '{name}' is {status} but did not report an IP within {}s — the guest may \
+             still be booting, or Parallels Tools isn't running in it",
+            timeout.as_secs()
+        ));
+    }
+    Step::Wait
+}
+
+/// Wait until the guest reports an IP (Parallels Tools up / DHCP done),
+/// narrating any wait long enough to wonder about.
+///
+/// The VM's *status* is watched, not just its IP, because a VM that is not
+/// running can never report one — so sitting out the full timeout on a
+/// suspended VM buys nothing but a 90-second delay in front of a wrong answer
+/// ("the guest may still be booting"). And a VM can be down here even though
+/// `ensure_running` just brought it up: `vm reap` or a suspend from the
+/// Parallels GUI can put it back down while this loop is waiting on it.
+pub fn wait_for_ip(name: &str) -> Result<String> {
+    let start = Instant::now();
+    let mut next_beat = HEARTBEAT;
     loop {
-        if let Some(ip) = find(name)?.ip() {
-            return Ok(ip.to_string());
+        let vm = find(name)?;
+        let waited = start.elapsed();
+        match assess(name, &vm.status, vm.ip(), waited, IP_TIMEOUT) {
+            Step::Up(ip) => {
+                // Only worth a line if the caller was kept waiting for it.
+                if waited >= HEARTBEAT {
+                    eprintln!("vm ▸ '{name}' ready at {ip} after {}s", waited.as_secs());
+                }
+                return Ok(ip);
+            }
+            Step::Fail(msg) => bail!("{msg}"),
+            Step::Wait => {
+                if waited >= next_beat {
+                    eprintln!(
+                        "vm ▸ '{name}' {}, no IP yet — {}s of {}s",
+                        vm.status,
+                        waited.as_secs(),
+                        IP_TIMEOUT.as_secs()
+                    );
+                    next_beat = waited + HEARTBEAT;
+                }
+                std::thread::sleep(POLL);
+            }
         }
-        if Instant::now() >= deadline {
-            bail!(
-                "VM '{name}' did not report an IP within {}s — the guest may still be \
-                 booting, or Parallels Tools isn't running in it",
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -287,6 +372,107 @@ mod tests {
         let d = parse_details(json).unwrap();
         assert_eq!(d.home, "/Users/hakesson/Parallels/macOS.macvm/");
         assert_eq!(d.memory_mb, 20480);
+    }
+
+    /// The statuses in `is_off` are the ones a VM stays in until something
+    /// starts or resumes it; the transients Parallels reports while it works
+    /// are on their way somewhere and must not be mistaken for them.
+    #[test]
+    fn only_settled_off_states_count_as_off() {
+        for status in ["stopped", "suspended", "paused"] {
+            assert!(is_off(status), "{status}");
+        }
+        // Observed live on Parallels 26.4 during start/resume/stop.
+        for status in ["running", "starting", "resuming", "stopping"] {
+            assert!(!is_off(status), "{status}");
+        }
+    }
+
+    /// An IP settles it, whatever the status says or how long it took.
+    #[test]
+    fn an_ip_ends_the_wait() {
+        let up = Step::Up("10.211.55.4".into());
+        assert_eq!(
+            assess("v", "running", Some("10.211.55.4"), secs(0), secs(90)),
+            up
+        );
+        // Defensive: a stale status alongside a real IP must not lose to the
+        // off-state check below — the address is the thing the caller needs.
+        assert_eq!(
+            assess("v", "suspended", Some("10.211.55.4"), secs(60), secs(90)),
+            up
+        );
+    }
+
+    #[test]
+    fn a_booting_guest_is_given_its_full_timeout() {
+        for waited in [0, 5, 30, 89] {
+            assert_eq!(
+                assess("v", "running", None, secs(waited), secs(90)),
+                Step::Wait,
+                "{waited}s"
+            );
+        }
+    }
+
+    /// The grace window exists because `prlctl` reports the old status for a
+    /// beat after it returns — bailing on that would break every resume.
+    #[test]
+    fn an_off_vm_is_given_the_grace_window_before_being_judged() {
+        for waited in [0, 5, 14] {
+            assert_eq!(
+                assess("v", "suspended", None, secs(waited), secs(90)),
+                Step::Wait,
+                "{waited}s"
+            );
+        }
+        // Transients get no early exit at all: they are Parallels working.
+        assert_eq!(
+            assess("v", "starting", None, secs(60), secs(90)),
+            Step::Wait
+        );
+        assert_eq!(
+            assess("v", "resuming", None, secs(60), secs(90)),
+            Step::Wait
+        );
+    }
+
+    #[test]
+    fn an_off_vm_past_the_grace_window_fails_early_and_says_why() {
+        for status in ["stopped", "suspended", "paused"] {
+            let Step::Fail(msg) = assess("macOS", status, None, secs(15), secs(90)) else {
+                panic!("{status} past grace must fail");
+            };
+            assert!(msg.contains(status), "{msg}");
+            // The two causes seen in the wild, and the way out of both.
+            assert!(msg.contains("did not take effect"), "{msg}");
+            assert!(msg.contains("vm reap"), "{msg}");
+            assert!(msg.contains(r#"prlctl resume "macOS""#), "{msg}");
+        }
+    }
+
+    /// The old error blamed a booting guest / missing Parallels Tools for
+    /// *every* IP-less wait, including a VM that was plainly suspended. It now
+    /// only fires where that story is actually the plausible one.
+    #[test]
+    fn the_timeout_message_names_the_status_it_timed_out_on() {
+        let Step::Fail(msg) = assess("macOS", "running", None, secs(90), secs(90)) else {
+            panic!("a running VM with no IP must time out");
+        };
+        assert!(msg.contains("is running"), "{msg}");
+        assert!(msg.contains("Parallels Tools"), "{msg}");
+
+        // A suspended VM that also ran out the clock gets the *specific*
+        // diagnosis, not the booting-guest guess.
+        let Step::Fail(msg) = assess("macOS", "suspended", None, secs(90), secs(90)) else {
+            panic!("suspended must fail");
+        };
+        assert!(msg.contains("will never report an IP"), "{msg}");
+        assert!(!msg.contains("Parallels Tools"), "{msg}");
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
     }
 
     #[test]

@@ -103,7 +103,7 @@ pub fn start(alias: &str) -> Result<i32> {
     let vm = cfg.get(alias)?;
     let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
-    let ip = prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    let ip = prl::wait_for_ip(&vm.parallels_name)?;
     let target = SshTarget {
         user: vm.user.clone(),
         host: vm.host.clone().unwrap_or(ip),
@@ -272,7 +272,7 @@ pub fn sync_cmd(alias: &str, guest_env: Option<crate::guest_env::GuestEnv>) -> R
     let vm = cfg.get(alias)?;
     let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    prl::wait_for_ip(&vm.parallels_name)?;
     let target = ssh_target(vm)?;
     let repo = mapping::RepoLocation::discover()?;
     let genv = crate::guest_env::resolve(guest_env, &repo.root);
@@ -328,7 +328,7 @@ pub fn clean(alias: &str) -> Result<i32> {
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
     let _use = lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    prl::wait_for_ip(&vm.parallels_name)?;
     let target = ssh_target(vm)?;
     // All guests speak POSIX (Windows sshd shell is Git Bash).
     let quoted = ssh::shell_quote(&guest_repo);
@@ -364,7 +364,7 @@ pub fn with_snapshot(
     prl::ensure_running(&vm.parallels_name)?;
     sweep_stale_snapshots(alias, &vm.parallels_name)?;
     ensure_snapshot_headroom(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    prl::wait_for_ip(&vm.parallels_name)?;
 
     let id = prl::snapshot_create(&vm.parallels_name, &format!("vm-with-snapshot-{alias}"))?;
     eprintln!("vm ▸ {alias} ▸ snapshot {id} taken");

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Lib-side mirror of the CLI exec flags.
 pub struct ExecOptions {
@@ -80,7 +80,7 @@ pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
 /// already holding the exclusive one (where a shared lock would deadlock).
 pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    prl::wait_for_ip(&vm.parallels_name)?;
     let target = commands::ssh_target(vm)?;
     let repo = mapping::RepoLocation::discover()?;
 

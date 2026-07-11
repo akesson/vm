@@ -4,7 +4,6 @@ use crate::ssh::SshTarget;
 use crate::{commands, mapping, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use std::time::Duration;
 
 /// Build and install the vm agent inside a guest ("build-in-guest").
 ///
@@ -27,7 +26,7 @@ pub fn deploy(alias: &str) -> Result<i32> {
 
     let _use = crate::lock::shared(alias)?;
     prl::ensure_running(&vm.parallels_name)?;
-    prl::wait_for_ip(&vm.parallels_name, Duration::from_secs(90))?;
+    prl::wait_for_ip(&vm.parallels_name)?;
     let target = commands::ssh_target(vm)?;
     eprintln!(
         "vm ▸ {alias} ▸ deploying agent (build-in-guest from {})…",
