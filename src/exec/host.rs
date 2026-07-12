@@ -69,6 +69,13 @@ pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
     if opts.or_native && vm.os == GuestOs::current() {
         return run_native(opts);
     }
+    // From here the command runs in a guest, where vm's stdin does not follow
+    // it — input piped into vm would be discarded without a word (and the run
+    // may well *succeed*, so this cannot wait for a failure). Placed after the
+    // --or-native returns: a native run inherits stdin and uses it normally.
+    if let Some(note) = super::advise::stdin_note(stdin_source()) {
+        eprintln!("vm ▸ note: {note}");
+    }
     if opts.with_snapshot {
         // Takes the VM exclusively and rolls it back around the run.
         return commands::with_snapshot(alias, vm, opts);
@@ -250,6 +257,37 @@ fn unsynced_env_files(repo_root: &std::path::Path, with_file: &[String]) -> Vec<
     // read_dir order is filesystem order; the note must read the same every run.
     found.sort();
     found
+}
+
+/// What vm's own stdin is connected to, when it plainly carries input: a pipe
+/// (`echo hi | vm …`) or a redirected regular file (`vm … < data.txt`). A
+/// terminal and the null device are character devices and classify as `None` —
+/// and fd 0 is one of those in every environment that runs vm routinely (a
+/// shell, an agent harness, CI, cron), which is what keeps the resulting note
+/// off healthy runs. See [`super::advise::stdin_note`].
+///
+/// Unix-only by construction — the vm host runs on macOS; in the Windows build
+/// (the guest agent) this is always `None`.
+fn stdin_source() -> Option<super::advise::StdinSource> {
+    #[cfg(not(unix))]
+    return None;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        // fstat fd 0 via a duplicate: `File::from` takes ownership of the fd it
+        // is given and would close the real stdin when dropped.
+        let fd = std::os::fd::AsFd::as_fd(&std::io::stdin())
+            .try_clone_to_owned()
+            .ok()?;
+        let ft = std::fs::File::from(fd).metadata().ok()?.file_type();
+        if ft.is_fifo() {
+            Some(super::advise::StdinSource::Piped)
+        } else if ft.is_file() {
+            Some(super::advise::StdinSource::Redirected)
+        } else {
+            None
+        }
+    }
 }
 
 /// `--shell` was replaced by the arity rule (see [`build_argv`]). It is not a

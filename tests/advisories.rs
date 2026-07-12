@@ -140,6 +140,89 @@ fn the_advisory_probe_looks_at_the_real_filesystem() {
     assert!(notes(&stderr).is_empty(), "stderr: {stderr}");
 }
 
+/// Run `vm …` like [`run_vm`], but with the given `Stdio` as vm's own stdin —
+/// the stdin-note tests are *about* fd 0, which `Command::output()` pins to the
+/// null device (the silent case every other test in this file exercises).
+#[cfg(unix)]
+fn run_vm_with_stdin(
+    config: &Path,
+    cwd: &Path,
+    args: &[&str],
+    stdin: std::process::Stdio,
+) -> (i32, String) {
+    let out = Command::new(VM_BIN)
+        .args(args)
+        .current_dir(cwd)
+        .env("VM_CONFIG", config)
+        .stdin(stdin)
+        .output()
+        .expect("vm runs");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn piped_stdin_draws_a_note_before_any_vm_work() {
+    // `echo hi | vm exec lin -- 'cat > f'` would exit 0 having written an empty
+    // file — the input is discarded, nothing fails, nothing says so. The note
+    // therefore fires up front, not on failure. An open-but-unwritten pipe is
+    // the same fd type, so spawning with a piped stdin and dropping the handle
+    // is exactly the caller-piped shape.
+    let (dir, config) = workspace();
+    let (code, stderr) = run_vm_with_stdin(
+        &config,
+        dir.path(),
+        &["exec", "lin", "--", "cat > f"],
+        std::process::Stdio::piped(),
+    );
+    let found = notes(&stderr);
+    assert_eq!(found.len(), 1, "stderr: {stderr}");
+    assert!(found[0].contains("piped into vm"), "{}", found[0]);
+    assert_eq!(code, 125, "the note must not change the outcome");
+    let note_at = stderr.find("note:").expect("note on stderr");
+    let error_at = stderr.find("vm: error:").expect("infra error on stderr");
+    assert!(note_at < error_at, "note came after the failure: {stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_redirected_from_a_file_draws_the_note_too() {
+    // `vm exec lin -- 'wc -l' < data.txt` — same discard, different wiring.
+    let (dir, config) = workspace();
+    let data = dir.path().join("data.txt");
+    std::fs::write(&data, "hi\n").unwrap();
+    let (_, stderr) = run_vm_with_stdin(
+        &config,
+        dir.path(),
+        &["exec", "lin", "--", "wc -l"],
+        std::fs::File::open(&data).unwrap().into(),
+    );
+    let found = notes(&stderr);
+    assert_eq!(found.len(), 1, "stderr: {stderr}");
+    assert!(found[0].contains("redirected into vm"), "{}", found[0]);
+}
+
+#[cfg(unix)]
+#[test]
+fn vm_claude_with_piped_stdin_is_told_too() {
+    // `git diff | vm claude lin "review this"` looks like it hands claude the
+    // diff; it does not — claude's stdin is the null device like any other
+    // guest command's. Same path (claude drives exec::host::exec), same note.
+    let (dir, config) = workspace();
+    let (_, stderr) = run_vm_with_stdin(
+        &config,
+        dir.path(),
+        &["claude", "lin", "review this"],
+        std::process::Stdio::piped(),
+    );
+    let found = notes(&stderr);
+    assert_eq!(found.len(), 1, "stderr: {stderr}");
+    assert!(found[0].contains("piped into vm"), "{}", found[0]);
+}
+
 #[test]
 fn vm_claude_is_not_run_past_the_exec_advisories() {
     // claude's argv is built by vm, not typed by the caller, and its prompt is
