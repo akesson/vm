@@ -32,14 +32,19 @@ pub fn lock_sync(repo_root: &Path, peer: &str) -> Result<crate::lock::PathLock> 
 /// Returns the snapshot so the caller can ask the guest to apply
 /// `snapshot.commit` and verify the reported tree hash matches
 /// `snapshot.tree`.
+///
+/// `extra` (repo-root-relative) forces gitignored paths into the snapshot —
+/// `--with-file`. They ride the ordinary object push, so the tree-hash check
+/// covers them like any other file: a forced `.env` is *proven* to have landed.
 pub fn sync_to(
     repo_root: &Path,
     peer: &str,
     remote_url: &str,
     ssh_command: Option<&str>,
+    extra: &[String],
 ) -> Result<Snapshot> {
     let git = Git::in_dir(repo_root);
-    let snap = snapshot(&git, &format!("vm-sync-index-{peer}"))?;
+    let snap = snapshot(&git, &format!("vm-sync-index-{peer}"), extra)?;
     let git = match ssh_command {
         Some(ssh) => git.with_ssh_command(ssh.to_string()),
         None => git,

@@ -21,6 +21,9 @@ pub struct ClaudeOptions {
     pub no_writeback: bool,
     /// `-e` specs forwarded to the guest claude process.
     pub env: Vec<String>,
+    /// `--with-file` paths: gitignored files to sync into the checkout the agent
+    /// works in.
+    pub with_file: Vec<String>,
     pub guest_env: Option<GuestEnv>,
 }
 
@@ -29,7 +32,12 @@ pub struct ClaudeOptions {
 /// later arg lands there raw — so `--no-writeback` *before* `--model` reaches
 /// vm, and *after* it silently reaches claude instead. See
 /// [`reject_misplaced_vm_flags`].
-const VM_FLAGS: &[&str] = &["--with-snapshot", "--no-writeback", "--guest-env"];
+const VM_FLAGS: &[&str] = &[
+    "--with-snapshot",
+    "--no-writeback",
+    "--guest-env",
+    "--with-file",
+];
 
 pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
     reject_misplaced_vm_flags(&opts.claude_args)?;
@@ -43,6 +51,7 @@ pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
         // spawns in the guest resolve the repo's tools.
         guest_env: opts.guest_env,
         env: opts.env.clone(),
+        with_file: opts.with_file.clone(),
         cmd: argv(opts),
     };
     crate::exec::host::exec(target, &exec)
@@ -92,6 +101,7 @@ mod tests {
             with_snapshot: false,
             no_writeback: false,
             env: Vec::new(),
+            with_file: Vec::new(),
             guest_env: None,
         }
     }

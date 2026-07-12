@@ -61,7 +61,7 @@ fn sync_once(
     // the overlap via its own fetch_max before this one leaves the section.
     std::thread::sleep(Duration::from_millis(2));
 
-    let snap = host::sync_to(repo, peer, guest_path, None).map_err(|e| format!("{e:#}"))?;
+    let snap = host::sync_to(repo, peer, guest_path, None, &[]).map_err(|e| format!("{e:#}"))?;
     let tree = guest::apply(guest_path, &snap.commit).map_err(|e| format!("{e:#}"))?;
     if tree != snap.tree {
         return Err(format!(

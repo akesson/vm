@@ -62,9 +62,15 @@ fn setup() -> Repos {
 
 /// One full sync: init guest, snapshot host, push, apply, verify tree hash.
 fn sync(repos: &Repos) -> Snapshot {
+    sync_with(repos, &[])
+}
+
+/// A sync that also force-includes `extra` (the `--with-file` paths).
+fn sync_with(repos: &Repos, extra: &[&str]) -> Snapshot {
+    let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
     let guest_path = repos.guest.to_str().unwrap();
     guest::ensure_init(guest_path).unwrap();
-    let snap = host::sync_to(&repos.host, "test", guest_path, None).unwrap();
+    let snap = host::sync_to(&repos.host, "test", guest_path, None, &extra).unwrap();
     let guest_tree = guest::apply(guest_path, &snap.commit).unwrap();
     assert_eq!(guest_tree, snap.tree, "tree hash must round-trip");
     snap
@@ -282,8 +288,159 @@ fn sync_works_in_repo_with_no_commits() {
 
     let guest_path = guest_dir.to_str().unwrap();
     guest::ensure_init(guest_path).unwrap();
-    let snap = host::sync_to(&host_dir, "test", guest_path, None).unwrap();
+    let snap = host::sync_to(&host_dir, "test", guest_path, None, &[]).unwrap();
     let tree = guest::apply(guest_path, &snap.commit).unwrap();
     assert_eq!(tree, snap.tree);
     assert!(guest_dir.join("hello.txt").exists());
+}
+
+// ── --with-file: forcing gitignored files into the snapshot ──────────────────
+
+/// The `setup()` repo ignores `*.log` and `target/`; give it an ignored `.env`
+/// too, which is the case the flag exists for.
+fn with_dotenv(repos: &Repos) {
+    write(&repos.host, ".gitignore", "target/\n*.log\n.env\n");
+    write(&repos.host, ".env", "API_KEY=secret\n");
+}
+
+#[test]
+fn a_gitignored_file_reaches_the_guest_only_when_forced() {
+    let repos = setup();
+    with_dotenv(&repos);
+
+    sync(&repos);
+    assert!(
+        !repos.guest.join(".env").exists(),
+        "a plain sync must leave gitignored files on the host"
+    );
+
+    sync_with(&repos, &[".env"]);
+    assert_eq!(
+        fs::read_to_string(repos.guest.join(".env")).unwrap(),
+        "API_KEY=secret\n",
+        "--with-file must carry the file's contents to the guest"
+    );
+}
+
+#[test]
+fn a_forced_file_leaves_when_the_flag_does() {
+    // The semantics the flag promises: the file is in the guest *iff* the last
+    // sync named it. Nothing lingers, so a secret cannot outlive the run that
+    // asked for it — and `vm exec` without the flag is always the same run.
+    let repos = setup();
+    with_dotenv(&repos);
+    sync_with(&repos, &[".env"]);
+    assert!(repos.guest.join(".env").exists());
+
+    sync(&repos);
+    assert!(
+        !repos.guest.join(".env").exists(),
+        "dropping --with-file must remove the file from the guest checkout"
+    );
+}
+
+#[test]
+fn forcing_a_file_does_not_pollute_later_snapshots() {
+    // The regression this whole design exists to prevent. `add -A` keeps paths
+    // the index already tracks even when ignored — that is what carries
+    // tracked-but-ignored files — so forcing `.env` *into the persistent index*
+    // would silently re-add it to every later snapshot. The proof is a tree
+    // hash: after a forced sync, an unforced one must be byte-for-byte the tree
+    // a repo that never saw the flag produces.
+    let clean = setup();
+    with_dotenv(&clean);
+    let never_forced = sync(&clean);
+
+    let repos = setup();
+    with_dotenv(&repos);
+    sync_with(&repos, &[".env"]);
+    let after_forcing = sync(&repos);
+
+    assert_eq!(
+        after_forcing.tree, never_forced.tree,
+        "the persistent index must be left exactly as a plain sync would leave it"
+    );
+}
+
+#[test]
+fn forcing_is_deterministic() {
+    // Same tree + same forced files → same commit, so a repeated `vm exec
+    // --with-file .env` is the same no-op an ordinary re-sync is.
+    let repos = setup();
+    with_dotenv(&repos);
+    assert_eq!(sync_with(&repos, &[".env"]), sync_with(&repos, &[".env"]));
+}
+
+#[test]
+fn several_files_can_be_forced_at_once() {
+    let repos = setup();
+    with_dotenv(&repos);
+    write(&repos.host, ".env.local", "DEBUG=1\n");
+    write(
+        &repos.host,
+        ".gitignore",
+        "target/\n*.log\n.env\n.env.local\n",
+    );
+
+    sync_with(&repos, &[".env", ".env.local"]);
+
+    assert!(repos.guest.join(".env").exists());
+    assert_eq!(
+        fs::read_to_string(repos.guest.join(".env.local")).unwrap(),
+        "DEBUG=1\n"
+    );
+}
+
+#[test]
+fn a_forced_file_survives_in_a_subdirectory() {
+    // Paths are repo-root-relative, and a nested one must land nested.
+    let repos = setup();
+    write(
+        &repos.host,
+        ".gitignore",
+        "target/\n*.log\nconfig/secrets.toml\n",
+    );
+    write(&repos.host, "config/secrets.toml", "token = \"abc\"\n");
+
+    sync_with(&repos, &["config/secrets.toml"]);
+
+    assert_eq!(
+        fs::read_to_string(repos.guest.join("config/secrets.toml")).unwrap(),
+        "token = \"abc\"\n"
+    );
+}
+
+#[test]
+fn forcing_works_in_a_repo_with_no_commits() {
+    // No HEAD to seed from, and `add -A` may not have written an index file at
+    // all — the copied-index path must cope with having nothing to copy.
+    let tmp = tempfile::tempdir().unwrap();
+    let host_dir = tmp.path().join("fresh");
+    let guest_dir = tmp.path().join("fresh-guest");
+    fs::create_dir_all(&host_dir).unwrap();
+    git(&host_dir, &["init", "--quiet"]);
+    git(&host_dir, &["config", "user.name", "test"]);
+    git(&host_dir, &["config", "user.email", "test@local"]);
+    write(&host_dir, ".gitignore", ".env\n");
+    write(&host_dir, ".env", "API_KEY=fresh\n");
+
+    let guest_path = guest_dir.to_str().unwrap();
+    guest::ensure_init(guest_path).unwrap();
+    let snap = host::sync_to(&host_dir, "test", guest_path, None, &[".env".to_string()]).unwrap();
+    let tree = guest::apply(guest_path, &snap.commit).unwrap();
+    assert_eq!(tree, snap.tree);
+    assert_eq!(
+        fs::read_to_string(guest_dir.join(".env")).unwrap(),
+        "API_KEY=fresh\n"
+    );
+}
+
+#[test]
+fn forcing_an_already_tracked_file_changes_nothing() {
+    // `--with-file src/main.rs` is pointless but harmless: a tracked file is in
+    // the snapshot either way, and the flag must not produce a different tree.
+    let repos = setup();
+    let plain = sync(&repos);
+    let forced = sync_with(&repos, &["src/main.rs"]);
+    assert_eq!(plain.tree, forced.tree);
 }

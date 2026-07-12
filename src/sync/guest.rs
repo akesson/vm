@@ -30,7 +30,12 @@ pub fn apply(repo: &str, sha: &str) -> Result<String> {
 pub fn tree(repo: &str) -> Result<Snapshot> {
     let path = expand_home(repo)?;
     let git = Git::in_dir(&path);
-    let snap = snapshot(&git, "vm-writeback-index")?;
+    // Nothing to force here: a `--with-file` file arrived as an ordinary tracked
+    // file of the sync commit, so the HEAD seed already snapshots it — and since
+    // it sits in the writeback *base* too, it yields no diff unless the guest
+    // actually edited it, which is exactly what writeback is for. Forcing is a
+    // host-side decision about the host's gitignore; the guest never makes it.
+    let snap = snapshot(&git, "vm-writeback-index", &[])?;
     git.run(&["update-ref", "refs/sync/writeback", &snap.commit])?;
     Ok(snap)
 }

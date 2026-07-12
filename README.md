@@ -20,7 +20,19 @@ vm ls
   the dirty working tree (staging area untouched) is snapshotted as a git
   commit object and pushed over ssh to a per-guest native checkout under the
   guest's `work_root`. The guest resets to it and the tree hash is verified —
-  guests always run exactly what is on the host's disk.
+  guests always run exactly what *git* sees on the host's disk: uncommitted and
+  untracked files included, gitignored files excluded. A gitignored `.env` or
+  local fixture the build needs does not travel; a tracked file that also
+  matches `.gitignore` does.
+- **`--with-file` is the way past that**, for the `.env` the build cannot start
+  without: `vm exec lin --with-file .env -- cargo test` forces the file into the
+  same snapshot, so it arrives tree-hash-verified like everything else. It lives
+  in the guest exactly as long as the flag does — the next sync without it takes
+  the file back out. Its contents do land on the guest's disk, so for a value
+  that must not, `-e NAME=value` (or bare `-e NAME` to forward the host's) passes
+  it to the process and nowhere else. When a guest command fails and the repo has
+  a gitignored `.env` that stayed behind, vm says so rather than letting you hunt
+  for it.
 - **Builds happen on guest-local disk.** No shared folders: no cross-platform
   `target/` conflicts, native file watching and locking, native speed.
 - **One-way by default.** Guests cannot corrupt the host tree; `--writeback`
@@ -129,8 +141,9 @@ against a config whose Windows VM is called `win` is an error, and says so.)
 
 - Omit the flag to **force the VM** even on a matching host — e.g. a macOS host
   driving the macOS guest for UI tests (the whole reason that guest exists).
-- `--writeback` / `--no-sync` compose but are no-ops on the native path; the
-  guest env's wrap prefix (below) is **not** applied natively — the launching
+- `--writeback` / `--no-sync` / `--with-file` compose but are no-ops on the
+  native path (nothing syncs, and the file is already where it lives); the guest
+  env's wrap prefix (below) is **not** applied natively — the launching
   environment already is the environment. `--or-native` cannot be combined with
   `--with-snapshot` (the host cannot be snapshotted).
 

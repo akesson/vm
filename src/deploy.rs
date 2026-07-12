@@ -85,6 +85,8 @@ fn build_in_guest(alias: &str, target: &SshTarget, src: &Path, bin: &str) -> Res
         &format!("deploy-{alias}"),
         &url,
         Some(&ssh::git_ssh_command()),
+        // vm's own source: nothing gitignored belongs in the build.
+        &[],
     )?;
     remote(
         target,

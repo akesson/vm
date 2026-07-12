@@ -10,6 +10,11 @@ of the current repo**. Before every exec it snapshots the host working tree
 (including uncommitted + untracked files, excluding gitignored ones) and syncs
 it to the guest via git objects. You never copy files yourself.
 
+A gitignored file the guest build needs — a `.env`, a local fixture — is the one
+thing that does *not* travel by default. `--with-file .env` forces it into the
+sync; `-e NAME=value` passes a value without ever writing it to guest disk. See
+**Gitignored files** below.
+
 ## Mental model
 
 - You always invoke `vm` on the host, from inside the repo you care about.
@@ -35,6 +40,10 @@ vm exec <alias> --writeback -- <cmd>…   # pull guest file changes back to host
 vm exec <alias> -e NAME=value -- <cmd>… # set env var for the guest command;
                                         # -e NAME forwards the host's value.
                                         # Repeatable; put -e before the --
+vm exec <alias> --with-file .env -- <cmd>…  # sync a GITIGNORED file too (a plain
+                                        # sync leaves it on the host). Repeatable;
+                                        # it stays in the guest only as long as the
+                                        # flag does (see Gitignored files)
 vm exec <alias> --with-snapshot -- <cmd>…  # snapshot, run, roll back — the guest
                                         # ends up untouched (reverts EVERYTHING
                                         # since the snapshot, including the pre-run
@@ -49,7 +58,7 @@ vm exec --or-native <os> -- <cmd>…      # run natively (no VM) IF the host is 
                                         # that OS, else route to the VM. The target
                                         # must literally be windows|linux|macos so it
                                         # works config-free on CI. Omit to force the VM
-vm sync <alias>                # sync only
+vm sync <alias>                # sync only (--with-file works here too)
 vm reap [alias] [--idle-minutes N]  # suspend VMs idle ≥N min (default 30) and not in
                                     # use; --install/--uninstall manage a launchd job
                                     # that runs it every 5 min (--install bakes in the
@@ -127,6 +136,33 @@ a macOS host driving the macOS guest for UI tests).
   `--writeback` skips the writeback on that code (and prints that it did).
   Killing `vm` (Ctrl-C, SIGKILL, closed session) kills the whole process tree in
   the guest — no orphaned compilers.
+
+## Gitignored files (`.env` and friends)
+
+The sync carries what git sees. Gitignored files stay on the host — deliberately
+(that is what keeps `target/` and `node_modules` from crossing), but it means a
+build that reads a gitignored `.env` fails in the guest while every breadcrumb
+reads green. Two fixes, in order of preference:
+
+```sh
+vm exec lin -e API_KEY -e DATABASE_URL -- cargo test   # values only; nothing is
+                                                       # written to guest disk.
+                                                       # -e NAME forwards the host's
+                                                       # value, -e NAME=v sets it
+vm exec lin --with-file .env -- cargo test             # the file itself, when the
+                                                       # build insists on reading it
+```
+
+- `--with-file` rides the ordinary snapshot, so the file is tree-hash-verified
+  like any other. It is in the guest **iff** the last sync named it: run without
+  the flag and the next sync takes it back out. Repeat the flag for more files.
+- Its contents *do* land on the guest's disk (and in git objects on both sides).
+  When that matters, `-e` is the one that does not.
+- Refused up front (exit 2): a path that does not exist, a directory, a symlink
+  (git would sync the link, not the file), or a path outside the repo.
+- **When a guest command fails and a gitignored `.env*` stayed behind, vm prints
+  a `vm ▸ note:` saying so.** If you see it, that is very likely your failure —
+  re-run with `-e` or `--with-file` before investigating anything else.
 
 ## Guest environments
 
