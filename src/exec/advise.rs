@@ -7,7 +7,9 @@
 //! rule stays deterministic, and the guesswork is confined to *here*, where a
 //! wrong guess costs one line of stderr instead of running the wrong command.
 //! The third ([`unsynced_env_note`]) is about the sync's *scope*, and fires only
-//! after a command has already failed.
+//! after a command has already failed. The fourth ([`stdin_note`]) is about vm's
+//! own stdin, which never travels to the guest: a caller who piped data into vm
+//! is told up front, instead of finding an empty output file and no error.
 //!
 //! One budget governs all of them: a note that fires on healthy commands trains
 //! its reader (agent or human) to ignore every note, taking the real ones down
@@ -75,6 +77,45 @@ pub fn unsynced_env_note(unsynced: &[String]) -> Option<String> {
          what is in {them}, that is the first thing to rule out.\
          {INDENT}Pass the values with `-e NAME=value` (they never reach the guest's disk), \
          or sync the file itself with `--with-file {first}`."
+    ))
+}
+
+/// What the caller wired into vm's own stdin, as classified by
+/// `super::host::stdin_source` (injected here so the wording is testable
+/// without rewiring the test process's fd 0).
+pub enum StdinSource {
+    /// fd 0 is a pipe: `echo hi | vm exec …`.
+    Piped,
+    /// fd 0 is a regular file: `vm exec … < data.txt`.
+    Redirected,
+}
+
+/// The note for input wired into vm — a pipe or a redirected file on vm's own
+/// stdin. vm never reads it: the host↔agent pipe carries liveness, not data,
+/// and the guest command's stdin is the null device (see `exec/guest.rs`). So
+/// `echo hi | vm exec lin -- 'cat > f'` exits 0 having written an *empty* file
+/// — no error anywhere, which is exactly the silent near-miss the advisory
+/// channel exists for. It fires before the run, not after a failure, because
+/// the run usually *succeeds*; a failure-gated note would never print.
+///
+/// The silence budget holds because a terminal and the null device are both
+/// character devices, which classify as `None`: a shell, an agent harness, CI,
+/// and cron — the places vm actually runs — all leave fd 0 that way. The one
+/// known misfire is `cmd | while read x; do vm exec …; done`, where the loop's
+/// own pipe is still on vm's fd 0; the note's *statement* stays true there (vm
+/// did not read it — unlike ssh, it never eats a loop's input), only its advice
+/// is moot. Accepted: that shape is rare, and suppressing it would need to read
+/// the caller's mind.
+pub fn stdin_note(source: Option<StdinSource>) -> Option<String> {
+    let what = match source? {
+        StdinSource::Piped => "piped into vm",
+        StdinSource::Redirected => "redirected into vm from a file",
+    };
+    Some(format!(
+        "input was {what}, but stdin does not travel to the guest — the command runs \
+         without it.\
+         {INDENT}Put the data in a file inside the repo instead: the sync carries it into \
+         the checkout the command runs in."
     ))
 }
 
@@ -404,6 +445,30 @@ mod tests {
         assert!(note.contains("left them on the host"), "{note}");
         // The suggested flag names one of them; repeating it is the caller's call.
         assert!(note.contains("--with-file .env"), "{note}");
+    }
+
+    // ── Advisory 4: input wired into vm's own stdin ───────────────────────────
+
+    #[test]
+    fn ordinary_stdin_says_nothing() {
+        // A terminal, /dev/null, an agent harness, CI — every run that did not
+        // wire data into vm classifies as None and stays silent.
+        assert!(stdin_note(None).is_none());
+    }
+
+    #[test]
+    fn piped_stdin_draws_the_note_and_the_file_fix() {
+        let note = stdin_note(Some(StdinSource::Piped)).expect("a note");
+        assert!(note.contains("piped into vm"), "{note}");
+        assert!(note.contains("does not travel to the guest"), "{note}");
+        // The fix is the sync itself: put the data in a file, and it travels.
+        assert!(note.contains("file inside the repo"), "{note}");
+    }
+
+    #[test]
+    fn redirected_stdin_names_the_redirect() {
+        let note = stdin_note(Some(StdinSource::Redirected)).expect("a note");
+        assert!(note.contains("redirected into vm from a file"), "{note}");
     }
 
     // ── Cross-cutting ────────────────────────────────────────────────────────

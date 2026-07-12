@@ -27,7 +27,14 @@ sync; `-e NAME=value` passes a value without ever writing it to guest disk. See
   gitignored files (build caches) survive syncs.
 - Every run prints breadcrumbs to stderr telling you where it ran:
   `vm ▸ windows (Windows 11) ▸ ~/work/repo ▸ $ cargo test` … `vm ▸ windows ▸ exit 0 ▸ 12s`.
-  Stdout is the command's own output, untouched.
+  Stdout is the command's own output, untouched — so redirects and pipes on the
+  host side are clean: `vm exec linux -- 'cargo test 2>&1' > log.txt` captures a
+  big log to a file (grep the file instead of paging the log through your
+  context) with no vm chatter mixed in.
+- vm's own stdin is **never** forwarded to the guest: `echo data | vm exec …`
+  runs the command with no input — `cat > f` writes an *empty* file, and exits 0.
+  vm prints a `vm ▸ note:` when it spots piped stdin. To feed a command data,
+  write it to a file in the repo first — the sync carries it.
 
 ## Commands
 

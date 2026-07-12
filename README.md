@@ -207,6 +207,22 @@ breadcrumb and the `vm: error:` / `vm: config error:` line disambiguate. Because
 255 may mean the connection dropped mid-run, `--writeback` **skips** the
 writeback on that code rather than trusting the guest tree — and says so.
 
+## Stdio
+
+A guest command's stdout and stderr stream through untouched, and every line vm
+itself prints — breadcrumbs, notes, errors — goes to **stderr**. Stdout is
+therefore exactly the command's own: `vm exec linux -- 'cargo test 2>&1' >
+log.txt` captures a clean log, and piping vm's stdout into another tool never
+picks up vm chatter.
+
+Stdin is the deliberate exception: it is **never** forwarded. vm holds the
+host↔guest pipe open as a liveness signal (closing it is how a killed `vm`
+tears down the guest process tree), and the guest command reads from the null
+device. So `echo hi | vm exec linux -- 'cat > f'` writes an empty file and
+exits 0 — vm prints a `vm ▸ note:` when it sees input wired into its stdin, so
+that near-miss is never silent. To feed a command data, put it in a file in the
+repo: the sync carries it, verified like everything else.
+
 ## Claude in a VM
 
 `vm claude <alias> "<prompt>"` runs Claude Code headless (`claude -p`) in
