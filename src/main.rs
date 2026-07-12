@@ -14,6 +14,7 @@ impl From<cli::ExecOpts> for ExecOptions {
             or_native: opts.or_native,
             guest_env: opts.guest_env,
             env: opts.env,
+            with_file: opts.with_file,
             cmd: opts.cmd,
         }
     }
@@ -52,7 +53,11 @@ fn run(cli: cli::Cli) -> Result<i32> {
             (_, true) => vm::reap::uninstall(),
             _ => vm::reap::reap(alias.as_deref(), idle_minutes),
         },
-        Sync { alias, guest_env } => commands::sync_cmd(&alias, guest_env),
+        Sync {
+            alias,
+            guest_env,
+            with_file,
+        } => commands::sync_cmd(&alias, guest_env, &with_file),
 
         // Guest-side plumbing verbs (invoked by a host `vm` over ssh)
         GuestVersion => {
@@ -102,6 +107,7 @@ fn run(cli: cli::Cli) -> Result<i32> {
                 with_snapshot: args.with_snapshot,
                 no_writeback: args.no_writeback,
                 env: args.env,
+                with_file: args.with_file,
                 guest_env: args.guest_env,
             },
         ),

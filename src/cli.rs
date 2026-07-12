@@ -6,9 +6,10 @@ use vm::guest_env::GuestEnv;
 ///
 /// The host working tree is the single source of truth. Before every exec,
 /// the repo is snapshotted (dirty state included, staging area untouched)
-/// and pushed to a per-guest native checkout, so guests always see exactly
-/// what is on disk on the host. Builds run on guest-local disk: no shared
-/// folders, no cross-platform artifact conflicts.
+/// and pushed to a per-guest native checkout, so guests see exactly what git
+/// sees on the host: uncommitted and untracked files included, gitignored
+/// files excluded. Builds run on guest-local disk: no shared folders, no
+/// cross-platform artifact conflicts.
 ///
 /// VM lifecycle takes care of itself: any command that needs a guest starts or
 /// resumes it first (a resume takes about a second, and vm says what it is
@@ -27,11 +28,17 @@ pub enum Command {
     Ls,
     /// Sync the current repo to a guest, then run a command in the guest checkout
     ///
+    /// The sync carries uncommitted and untracked files; gitignored files (build
+    /// caches, `.env`…) stay on the host unless named with --with-file.
+    ///
     /// Exit status is the guest command's own, except vm's reserved codes:
     /// 125 = vm infrastructure error (sync/agent/ssh/VM lifecycle), 2 =
     /// usage/config error. See the README's "Exit codes" section.
     Exec(ExecArgs),
     /// Sync the current repo to a guest without running anything
+    ///
+    /// Carries uncommitted and untracked files; gitignored files (build caches,
+    /// `.env`…) stay on the host unless named with --with-file.
     Sync {
         /// VM alias from ~/.config/vm/config.toml
         alias: String,
@@ -39,6 +46,10 @@ pub enum Command {
         /// disables it. Default: auto-detect from the repo root
         #[arg(long, value_enum, value_name = "ENV")]
         guest_env: Option<GuestEnv>,
+        /// Sync a gitignored file too (e.g. `--with-file .env`). Repeatable.
+        /// It stays in the guest checkout until a sync that does not name it
+        #[arg(long, value_name = "PATH")]
+        with_file: Vec<String>,
     },
     /// Build and install the vm agent inside a guest
     Deploy {
@@ -161,6 +172,11 @@ pub struct ClaudeArgs {
     /// before the prompt
     #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
     pub env: Vec<String>,
+    /// Sync a gitignored file into the guest checkout too (e.g.
+    /// `--with-file .env`), so the agent's build sees it. Repeatable; must come
+    /// before the prompt
+    #[arg(long, value_name = "PATH")]
+    pub with_file: Vec<String>,
     /// Guest environment handling: `mise` forces the mise setup/wrap, `none`
     /// disables it. Default: auto-detect from the repo root
     #[arg(long, value_enum, value_name = "ENV")]
@@ -198,6 +214,13 @@ pub struct ExecOpts {
     /// to forward the host's current value. Repeatable.
     #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
     pub env: Vec<String>,
+    /// Sync a gitignored file into the guest checkout too (e.g.
+    /// `--with-file .env`) — the sync otherwise carries only what git sees.
+    /// Repeatable. It stays in the checkout until a sync that does not name it,
+    /// and its contents do land on the guest's disk (`-e NAME=value` passes a
+    /// value without that)
+    #[arg(long, value_name = "PATH", conflicts_with = "no_sync")]
+    pub with_file: Vec<String>,
     /// Guest environment handling: `mise` forces the mise setup/wrap, `none`
     /// disables it. Default: auto-detect from the repo root (announced by a
     /// breadcrumb when active)
@@ -339,6 +362,71 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn exec_collects_repeated_with_file_flags() {
+        let cli = parse(&[
+            "vm",
+            "exec",
+            "lin",
+            "--with-file",
+            ".env",
+            "--with-file",
+            "config/local.toml",
+            "--",
+            "cargo",
+            "test",
+        ]);
+        let Command::Exec(exec) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(exec.opts.with_file, [".env", "config/local.toml"]);
+        assert_eq!(exec.opts.cmd, ["cargo", "test"]);
+    }
+
+    #[test]
+    fn with_file_conflicts_with_no_sync_at_parse_time() {
+        // The file rides the sync's snapshot; with no sync there is nothing for
+        // it to ride, and it could only be silently ignored.
+        assert!(
+            Cli::try_parse_from([
+                "vm",
+                "exec",
+                "lin",
+                "--no-sync",
+                "--with-file",
+                ".env",
+                "--",
+                "true",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sync_and_claude_take_with_file_too() {
+        // The flag has to exist wherever a sync happens, or a caller who hit the
+        // note on `vm exec` cannot act on it from `vm claude`.
+        let cli = parse(&["vm", "sync", "lin", "--with-file", ".env"]);
+        let Command::Sync { with_file, .. } = cli.command else {
+            panic!("expected sync");
+        };
+        assert_eq!(with_file, [".env"]);
+
+        let cli = parse(&[
+            "vm",
+            "claude",
+            "lin",
+            "--with-file",
+            ".env",
+            "fix the build",
+        ]);
+        let Command::Claude(args) = cli.command else {
+            panic!("expected claude");
+        };
+        assert_eq!(args.with_file, [".env"]);
+        assert_eq!(args.prompt, "fix the build");
     }
 
     #[test]

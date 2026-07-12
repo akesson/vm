@@ -1,7 +1,9 @@
 use crate::config::{Config, GuestOs, VmConfig};
+use crate::exit::usage;
 use crate::ssh::SshTarget;
 use crate::{lock, mapping, prl, ssh, sync};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 impl std::fmt::Display for GuestOs {
@@ -232,7 +234,15 @@ pub fn agent_call(vm: &VmConfig, target: &SshTarget, args: &[&str]) -> Result<St
 }
 
 /// Full sync of the current repo to a guest. Returns the verified snapshot.
-pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync::Snapshot> {
+///
+/// `extra` holds already-validated, repo-root-relative `--with-file` paths (see
+/// [`resolve_with_files`]) to carry even though they are gitignored.
+pub fn sync_repo(
+    alias: &str,
+    vm: &VmConfig,
+    target: &SshTarget,
+    extra: &[String],
+) -> Result<sync::Snapshot> {
     let repo = mapping::RepoLocation::discover()?;
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
     let started = Instant::now();
@@ -247,7 +257,13 @@ pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync:
 
     // 2. Snapshot + push objects.
     let url = mapping::ssh_remote_url(&target.user, &target.host, &guest_repo);
-    let snap = sync::host::sync_to(&repo.root, alias, &url, Some(&ssh::git_ssh_command()))?;
+    let snap = sync::host::sync_to(
+        &repo.root,
+        alias,
+        &url,
+        Some(&ssh::git_ssh_command()),
+        extra,
+    )?;
 
     // 3. Apply in the guest and verify the tree hash round-trips.
     let guest_tree = agent_call(
@@ -261,13 +277,81 @@ pub fn sync_repo(alias: &str, vm: &VmConfig, target: &SshTarget) -> Result<sync:
             snap.tree
         );
     }
+    // Forced files are named in the breadcrumb, never smuggled: `--with-file`
+    // ships something the repo's own .gitignore says to leave behind (often a
+    // secret), and a run that does that must say so on its way past.
+    let forced = match extra {
+        [] => String::new(),
+        extra => format!(" ▸ forced {}", extra.join(", ")),
+    };
     eprintln!(
-        "vm ▸ {alias} ▸ synced {} ▸ tree {} ▸ {:.1}s",
+        "vm ▸ {alias} ▸ synced {} ▸ tree {}{forced} ▸ {:.1}s",
         repo.name,
         &snap.tree[..10],
         started.elapsed().as_secs_f32()
     );
     Ok(snap)
+}
+
+/// Resolve `--with-file` specs into repo-root-relative paths for the snapshot.
+/// Each names an existing file inside the repo, taken relative to `cwd` like any
+/// other path the caller types.
+///
+/// A bad spec is the caller's own invocation — a typo, a path from the wrong
+/// directory — so it is a usage error (exit 2, "fix it and retry"), raised
+/// before vm resumes a VM or syncs anything, exactly like a typo'd `-e` (see
+/// `exec::host::resolve_env`).
+///
+/// Two things are refused rather than half-worked:
+///
+/// - **Directories.** `--with-file target` would quietly push a multi-gigabyte
+///   build tree over ssh. The flag exists for the `.env`-shaped case; naming the
+///   files is cheap, and discovering why a sync took ten minutes is not.
+/// - **Symlinks.** git syncs the *link*, not what it points at, so a
+///   `.env -> ~/secrets/app.env` would land in the guest dangling — a file that
+///   exists and cannot be read, which is a worse failure than not syncing it.
+pub fn resolve_with_files(specs: &[String], cwd: &Path, repo_root: &Path) -> Result<Vec<String>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = std::fs::canonicalize(repo_root)
+        .with_context(|| format!("resolving repo root {}", repo_root.display()))?;
+    let mut out = Vec::new();
+    for spec in specs {
+        let path = cwd.join(spec);
+        // Checked before canonicalize, which would follow the link and hide it —
+        // and whose non-following of it is what makes the containment test below
+        // mean what it says.
+        if path.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
+            return Err(usage(format!(
+                "--with-file {spec}: is a symlink, and git syncs the link rather than the \
+                 file it points at — the guest would get a dangling one.\n  \
+                 Point the flag at a real file, or pass the values with -e NAME=value."
+            )));
+        }
+        let abs = std::fs::canonicalize(&path).map_err(|_| {
+            usage(format!(
+                "--with-file {spec}: no such file (paths are relative to the current \
+                 directory; to pass a value rather than a file, use -e NAME=value)"
+            ))
+        })?;
+        if !abs.is_file() {
+            return Err(usage(format!(
+                "--with-file {spec}: not a file — a directory is not synced this way. \
+                 Name the files you need."
+            )));
+        }
+        let rel = abs.strip_prefix(&root).map_err(|_| {
+            usage(format!(
+                "--with-file {spec}: sits outside the repo ({}), and the sync only ever \
+                 carries the repo tree",
+                root.display()
+            ))
+        })?;
+        // git takes `/` on every platform; a Windows host would hand us `\`.
+        out.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(out)
 }
 
 /// Run the guest env's one-time setup (mise: `mise trust`) in the guest
@@ -313,17 +397,24 @@ pub fn first_sync_hook(
     Ok(())
 }
 
-/// `vm sync <alias> [--guest-env …]`: bring the VM up if needed, then sync (and
-/// run the guest env's first-sync setup, exactly as an exec would).
-pub fn sync_cmd(alias: &str, guest_env: Option<crate::guest_env::GuestEnv>) -> Result<i32> {
+/// `vm sync <alias> [--guest-env …] [--with-file …]`: bring the VM up if needed,
+/// then sync (and run the guest env's first-sync setup, exactly as an exec would).
+pub fn sync_cmd(
+    alias: &str,
+    guest_env: Option<crate::guest_env::GuestEnv>,
+    with_file: &[String],
+) -> Result<i32> {
     let cfg = Config::load()?;
     let vm = cfg.get(alias)?;
+    let repo = mapping::RepoLocation::discover()?;
+    // Before the VM is touched: a typo'd path must cost a line of stderr, not a
+    // resume and a sync.
+    let extra = resolve_with_files(with_file, &std::env::current_dir()?, &repo.root)?;
     let _use = lock::shared(alias)?;
     let target = bring_up(alias, vm)?;
-    let repo = mapping::RepoLocation::discover()?;
     let genv = crate::guest_env::resolve(guest_env, &repo.root);
     genv.announce(alias);
-    sync_repo(alias, vm, &target)?;
+    sync_repo(alias, vm, &target, &extra)?;
     first_sync_hook(alias, vm, &target, &repo, &genv)?;
     Ok(0)
 }
@@ -523,5 +614,111 @@ mod tests {
             agent_console_path(&win_vm(Some(r"C:\tools/vm.exe"))),
             r"C:\tools\vm.exe"
         );
+    }
+
+    // ── --with-file path resolution ───────────────────────────────────────────
+
+    /// A repo root holding a `.env` and a `config/` dir.
+    fn repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "API_KEY=x\n").unwrap();
+        std::fs::create_dir(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/local.toml"), "a = 1\n").unwrap();
+        tmp
+    }
+
+    fn resolve(specs: &[&str], cwd: &Path, root: &Path) -> Result<Vec<String>> {
+        let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+        resolve_with_files(&specs, cwd, root)
+    }
+
+    /// The message of the usage error `specs` must produce.
+    fn refused(specs: &[&str], cwd: &Path, root: &Path) -> String {
+        let err = resolve(specs, cwd, root).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::exit::UsageError>().is_some(),
+            "a bad --with-file path is the caller's invocation, not a transient fault: {err:#}"
+        );
+        err.to_string()
+    }
+
+    #[test]
+    fn a_file_in_the_repo_root_resolves_to_its_name() {
+        let tmp = repo();
+        assert_eq!(
+            resolve(&[".env"], tmp.path(), tmp.path()).unwrap(),
+            [".env"]
+        );
+    }
+
+    #[test]
+    fn paths_are_relative_to_the_cwd_but_reported_from_the_repo_root() {
+        // Typed from a subdirectory, as any other path would be — the snapshot
+        // needs it repo-relative.
+        let tmp = repo();
+        let cwd = tmp.path().join("config");
+        assert_eq!(
+            resolve(&["local.toml"], &cwd, tmp.path()).unwrap(),
+            ["config/local.toml"]
+        );
+        // …and an absolute path works from anywhere.
+        let abs = tmp.path().join(".env");
+        assert_eq!(
+            resolve(&[abs.to_str().unwrap()], &cwd, tmp.path()).unwrap(),
+            [".env"]
+        );
+    }
+
+    #[test]
+    fn no_specs_resolves_to_nothing() {
+        // The overwhelmingly common path: it must not even look at the disk.
+        assert_eq!(
+            resolve_with_files(&[], Path::new("/nonexistent"), Path::new("/nonexistent")).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_refused_and_points_at_the_alternative() {
+        let tmp = repo();
+        let msg = refused(&[".env.nope"], tmp.path(), tmp.path());
+        assert!(msg.contains("no such file"), "{msg}");
+        assert!(msg.contains("-e NAME=value"), "{msg}");
+    }
+
+    #[test]
+    fn a_directory_is_refused() {
+        // `--with-file target` would push a build tree over ssh.
+        let tmp = repo();
+        let msg = refused(&["config"], tmp.path(), tmp.path());
+        assert!(msg.contains("not a file"), "{msg}");
+    }
+
+    #[test]
+    fn a_path_outside_the_repo_is_refused() {
+        let tmp = repo();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secrets.env"), "K=v\n").unwrap();
+        let spec = outside.path().join("secrets.env");
+        let msg = refused(&[spec.to_str().unwrap()], tmp.path(), tmp.path());
+        assert!(msg.contains("outside the repo"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_refused_because_git_would_sync_the_link() {
+        // The trap: `.env -> ~/secrets/app.env` is the tidy way people keep a
+        // secret out of a repo, and git would ship the *link*, landing a
+        // dangling file in the guest — a file that exists and cannot be read.
+        let tmp = repo();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("app.env");
+        std::fs::write(&real, "K=v\n").unwrap();
+        let link = tmp.path().join(".env.link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let msg = refused(&[".env.link"], tmp.path(), tmp.path());
+        assert!(msg.contains("symlink"), "{msg}");
+        assert!(msg.contains("dangling"), "{msg}");
     }
 }

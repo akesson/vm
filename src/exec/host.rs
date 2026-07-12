@@ -23,6 +23,9 @@ pub struct ExecOptions {
     /// `NAME=value` / bare `NAME` specs from `-e`; resolved against the host
     /// environment when the request is built.
     pub env: Vec<String>,
+    /// `--with-file` paths: gitignored files to force into the sync anyway.
+    /// Resolved against the repo root (see [`commands::resolve_with_files`]).
+    pub with_file: Vec<String>,
     pub cmd: Vec<String>,
 }
 
@@ -41,10 +44,12 @@ pub struct ExecOptions {
 /// even loaded; any other alias needs the config to learn its os (so it only
 /// takes the native path on a configured host).
 pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
-    // Validate `-e` before touching anything: a typo'd spec must not first cost
-    // a VM resume, a sync, and — under --with-snapshot — a snapshot and its
-    // rollback. Cheap and pure, so the real resolution below just redoes it.
+    // Validate `-e` and `--with-file` before touching anything: a typo'd spec
+    // must not first cost a VM resume, a sync, and — under --with-snapshot — a
+    // snapshot and its rollback. Cheap and pure, so the real resolution below
+    // just redoes it.
     resolve_env(&opts.env, |name| std::env::var(name).ok())?;
+    with_files(opts)?;
     reject_removed_flags(&opts.cmd)?;
 
     // Config-free native fast path: an os-literal target we can match against
@@ -93,7 +98,9 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     let base = if opts.no_sync {
         None
     } else {
-        Some(commands::sync_repo(alias, vm, &target)?)
+        let extra =
+            commands::resolve_with_files(&opts.with_file, &std::env::current_dir()?, &repo.root)?;
+        Some(commands::sync_repo(alias, vm, &target, &extra)?)
     };
 
     // The guest env's one-time setup (mise: `mise trust`) the first time this
@@ -153,6 +160,18 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         );
     }
 
+    // A failed command in a repo whose `.env` never left the host: the likeliest
+    // cause of the failure the caller is now staring at, and the one thing the
+    // green sync breadcrumb above actively argues against. Said once, after the
+    // fact, only when a sync ran — never on a healthy run.
+    if code != 0
+        && base.is_some()
+        && let Some(note) =
+            super::advise::unsynced_env_note(&unsynced_env_files(&repo.root, &opts.with_file))
+    {
+        eprintln!("vm ▸ note: {note}");
+    }
+
     if opts.writeback
         && let Some(base) = &base
     {
@@ -175,6 +194,62 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         started.elapsed().as_secs_f32()
     );
     Ok(code)
+}
+
+/// Validate the `--with-file` paths up front, discarding the result — the real
+/// resolution happens in [`exec_in`], against the same repo root, once the run
+/// is actually going to sync.
+///
+/// The repo is only discovered when the flag was passed at all: `--or-native` on
+/// a CI runner may not be inside a git repo (and does not need to be), so an
+/// unused flag must not go looking for one.
+fn with_files(opts: &ExecOptions) -> Result<()> {
+    if opts.with_file.is_empty() {
+        return Ok(());
+    }
+    let repo = mapping::RepoLocation::discover()?;
+    commands::resolve_with_files(&opts.with_file, &std::env::current_dir()?, &repo.root)?;
+    Ok(())
+}
+
+/// After a *failed* guest command, the gitignored env files sitting in the repo
+/// root that the sync left behind — the ones that would explain a "VAR not set"
+/// the caller is about to go hunting for in the wrong place.
+///
+/// Deliberately narrow. It runs only on a nonzero exit (a healthy run says
+/// nothing and pays nothing — see [`super::advise`] on the silence budget), and
+/// only `.env*` names qualify: they are the ones whose absence fails a build
+/// while every breadcrumb reads green. Tracked files are excluded because they
+/// *did* sync (the HEAD seed carries tracked-but-ignored files), as are files
+/// the caller already passed to `--with-file` — a note about a file that
+/// travelled would be a lie.
+fn unsynced_env_files(repo_root: &std::path::Path, with_file: &[String]) -> Vec<String> {
+    let git = sync::Git::in_dir(repo_root);
+    let mut found: Vec<String> = std::fs::read_dir(repo_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".env"))
+        .filter(|name| !with_file.iter().any(|w| w == name))
+        .filter(|name| {
+            // Ignored (so `add -A` skipped it) *and* untracked (so the HEAD seed
+            // did not carry it either): only then is it truly not in the guest.
+            // `check-ignore` exits 1 for "not ignored", which `out` reports as a
+            // failure — the empty/error case is the one we want to drop anyway.
+            let ignored = git
+                .out(&["check-ignore", "--quiet", "--", name])
+                .map(|_| true)
+                .unwrap_or(false);
+            let untracked = git
+                .out(&["ls-files", "--error-unmatch", "--", name])
+                .is_err();
+            ignored && untracked
+        })
+        .collect();
+    // read_dir order is filesystem order; the note must read the same every run.
+    found.sort();
+    found
 }
 
 /// `--shell` was replaced by the arity rule (see [`build_argv`]). It is not a
@@ -467,6 +542,7 @@ mod tests {
             or_native: false,
             guest_env: None,
             env: Vec::new(),
+            with_file: Vec::new(),
             cmd: s(cmd),
         }
     }
@@ -649,6 +725,92 @@ mod tests {
     #[test]
     fn run_native_execs_an_exec_form_command() {
         assert_eq!(run_native(&opts(&["sh", "-c", "exit 3"])).unwrap(), 3);
+    }
+
+    // ── The probe behind the unsynced-env note ────────────────────────────────
+
+    /// A repo whose .gitignore hides `.env*`, with a real commit so HEAD exists.
+    fn env_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@local"]);
+        std::fs::write(tmp.path().join(".gitignore"), ".env*\n").unwrap();
+        std::fs::write(tmp.path().join("src.rs"), "fn main() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "init"]);
+        tmp
+    }
+
+    #[test]
+    fn the_probe_finds_ignored_untracked_env_files() {
+        let tmp = env_repo();
+        std::fs::write(tmp.path().join(".env"), "K=v\n").unwrap();
+        std::fs::write(tmp.path().join(".env.local"), "D=1\n").unwrap();
+        assert_eq!(
+            unsynced_env_files(tmp.path(), &[]),
+            [".env".to_string(), ".env.local".to_string()],
+            "sorted, so the note reads the same on every run"
+        );
+    }
+
+    #[test]
+    fn the_probe_is_silent_when_nothing_was_left_behind() {
+        // No env file at all — the ordinary repo, and the ordinary failing
+        // command in one. Nothing to say.
+        let tmp = env_repo();
+        assert!(unsynced_env_files(tmp.path(), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_did_sync_is_never_reported() {
+        let tmp = env_repo();
+        std::fs::write(tmp.path().join(".env"), "K=v\n").unwrap();
+
+        // Already forced by this very run: it is in the guest, so a note about it
+        // would be a lie.
+        assert!(unsynced_env_files(tmp.path(), &[".env".to_string()]).is_empty());
+
+        // Tracked despite matching .gitignore: the HEAD seed carried it, so it is
+        // in the guest too (see sync::snapshot).
+        let out = std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(["add", "-f", ".env"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            unsynced_env_files(tmp.path(), &[]).is_empty(),
+            "a tracked-but-ignored file reaches the guest and must not draw a note"
+        );
+    }
+
+    #[test]
+    fn an_unignored_env_file_is_never_reported() {
+        // `.env` committed as ordinary tracked content (no ignore rule): it syncs
+        // like anything else.
+        let tmp = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.name", "test"][..],
+            &["config", "user.email", "test@local"][..],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(tmp.path().join(".env"), "K=v\n").unwrap();
+        assert!(unsynced_env_files(tmp.path(), &[]).is_empty());
     }
 
     #[cfg(unix)]

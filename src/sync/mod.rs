@@ -25,13 +25,18 @@ pub struct Snapshot {
 /// persistent alternate index inside `.git/` (one per sync peer, so stat
 /// caches stay warm per-target).
 ///
+/// `extra` holds repo-root-relative paths to force into the snapshot even when
+/// gitignored — the `--with-file` escape hatch, for the `.env` a build needs
+/// and git refuses to see. Empty for a plain sync.
+///
 /// The commit is deterministic: same tree + same parent → same sha, which
-/// makes repeated syncs of an unchanged tree no-ops end to end.
+/// makes repeated syncs of an unchanged tree no-ops end to end. That holds with
+/// `extra` too: same files forced, same tree.
 ///
 /// Not internally synchronized: the alternate index's `.lock` tolerates no
 /// concurrent writer. Host-side callers serialize per (repo, peer) via
 /// [`host::lock_sync`]; the guest side has a single writer by construction.
-pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
+pub fn snapshot(git: &Git, index_name: &str, extra: &[String]) -> anyhow::Result<Snapshot> {
     let index = git.git_dir()?.join(index_name);
     let g = git.with_index(index.clone());
 
@@ -44,13 +49,63 @@ pub fn snapshot(git: &Git, index_name: &str) -> anyhow::Result<Snapshot> {
         g.run(&["read-tree", head])?;
     }
     g.run(&["add", "-A"])?;
-    let tree = g.out(&["write-tree"])?;
+    let tree = match extra {
+        [] => g.out(&["write-tree"])?,
+        extra => tree_with_forced(git, &index, index_name, extra)?,
+    };
 
     let commit = match &head {
         Some(head) => g.commit_tree(&tree, Some(head))?,
         None => g.commit_tree(&tree, None)?,
     };
     Ok(Snapshot { commit, tree })
+}
+
+/// The tree of the working tree *plus* `extra`, written through a throwaway
+/// **copy** of the persistent index — never the index itself.
+///
+/// That indirection is the whole point. `add -A` keeps every path the index
+/// already tracks, ignored or not: it is exactly what the HEAD seed in
+/// [`snapshot`] leans on to hold tracked-but-ignored files. So a `.env` forced
+/// into the *persistent* index would still be there on the next sync, and the
+/// one after that — silently riding along long after the caller dropped
+/// `--with-file`, with no way to get it back out. Forced files must live for
+/// exactly one snapshot, so they are written somewhere that only lives that
+/// long.
+///
+/// The copy inherits the stat cache the persistent index just warmed, and is
+/// overwritten from it on every use, so a previous run's forced files are gone
+/// before this one starts.
+fn tree_with_forced(
+    git: &Git,
+    index: &std::path::Path,
+    index_name: &str,
+    extra: &[String],
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let scratch = git.git_dir()?.join(format!("{index_name}-forced"));
+    match std::fs::copy(index, &scratch) {
+        Ok(_) => {}
+        // No index file to copy: `add -A` writes none in a repo that has nothing
+        // to add yet (a fresh `git init`). Start from empty — and from *nothing*,
+        // not from whatever a previous run left in the scratch file.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if scratch.exists() {
+                std::fs::remove_file(&scratch)
+                    .with_context(|| format!("removing stale {}", scratch.display()))?;
+            }
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("copying sync index to {}", scratch.display()));
+        }
+    }
+    let g = git.with_index(scratch);
+    // `--` so a path can never be read as a revision or an option.
+    let mut args = vec!["add", "-f", "--"];
+    args.extend(extra.iter().map(String::as_str));
+    g.run(&args)?;
+    g.out(&["write-tree"])
 }
 
 /// Expand a leading `~/` against the platform home directory. Guest-side:

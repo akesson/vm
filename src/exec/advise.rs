@@ -1,16 +1,19 @@
-//! Advisory notes on a command's *form* (see [`super::host::build_argv`]).
+//! Advisory notes: the guesswork vm keeps out of its rules.
 //!
+//! Two of these are about a command's *form* (see [`super::host::build_argv`]).
 //! The arity rule decides behavior by counting arguments, never by inspecting
 //! them: content is undecidable — the `|` in `grep 'a|b' f` is a regex, the one
 //! in `echo hi | wc` is a pipe, and the same bytes cannot be told apart. So the
 //! rule stays deterministic, and the guesswork is confined to *here*, where a
 //! wrong guess costs one line of stderr instead of running the wrong command.
+//! The third ([`unsynced_env_note`]) is about the sync's *scope*, and fires only
+//! after a command has already failed.
 //!
-//! That budget is the whole design constraint: a note that fires on healthy
-//! commands trains its reader (agent or human) to ignore every note, taking the
-//! real ones down with it. Both checks below are therefore biased hard toward
-//! silence — a missed note leaves the reader exactly where they were, while a
-//! false one costs the channel. Nothing else fires.
+//! One budget governs all of them: a note that fires on healthy commands trains
+//! its reader (agent or human) to ignore every note, taking the real ones down
+//! with it. Every check here is therefore biased hard toward silence — a missed
+//! note leaves the reader exactly where they were, while a false one costs the
+//! channel. Nothing else fires.
 
 /// Shell operators that are never a command's own argument. No flag takes `&&`
 /// or `2>&1` as its value, so seeing one in exec form is a mistake regardless
@@ -41,6 +44,38 @@ pub fn advisories(target: &str, cmd: &[String], is_file: impl Fn(&str) -> bool) 
             .collect(),
         _ => exec_form_note(target, cmd).into_iter().collect(),
     }
+}
+
+/// The note for a command that *failed* in a guest whose checkout never received
+/// the repo's gitignored env files (`unsynced`, as found by
+/// `super::host::unsynced_env_files`). `None` when there are none — the ordinary
+/// case, and the silent one.
+///
+/// This is the one note that fires *after* the fact, because that is where it
+/// pays: the sync worked, the breadcrumbs are green, and the guest is failing on
+/// a variable the host has and it does not. Without this line the reader — very
+/// often an agent — goes hunting through the build, the guest env and the
+/// toolchain, and finds nothing wrong there, because nothing is.
+///
+/// It names flags rather than a whole command line (the way the form notes do):
+/// `vm claude` fails through this same path, and a note that told it to run
+/// `vm exec` would be advice for a command the caller did not run. Both flags
+/// exist on both verbs. `-e` comes first — it is the one fix that keeps a secret
+/// off the guest's disk.
+pub fn unsynced_env_note(unsynced: &[String]) -> Option<String> {
+    let [first, ..] = unsynced else {
+        return None;
+    };
+    let (subject, them) = match unsynced {
+        [one] => (format!("`{one}` is"), "it"),
+        many => (format!("{} are", backticked(many)), "them"),
+    };
+    Some(format!(
+        "{subject} gitignored, so the sync left {them} on the host — if the guest needed \
+         what is in {them}, that is the first thing to rule out.\
+         {INDENT}Pass the values with `-e NAME=value` (they never reach the guest's disk), \
+         or sync the file itself with `--with-file {first}`."
+    ))
 }
 
 /// Exec form carrying what looks like shell syntax: `vm exec lin -- echo a && echo b`
@@ -333,6 +368,42 @@ mod tests {
         // name; one appearing as an argument is the caller's own quoting problem
         // and not something the arity rule caused.
         silent(&["cat my file.txt"], files(&["my file.txt"]));
+    }
+
+    // ── Advisory 3: gitignored env files the sync left behind ─────────────────
+
+    fn env_note(unsynced: &[&str]) -> String {
+        let unsynced: Vec<String> = unsynced.iter().map(|s| s.to_string()).collect();
+        unsynced_env_note(&unsynced).expect("a note")
+    }
+
+    #[test]
+    fn nothing_unsynced_says_nothing() {
+        // Every healthy repo without a gitignored .env — i.e. most of them — and
+        // every failing command in one. The channel stays cheap.
+        assert!(unsynced_env_note(&[]).is_none());
+    }
+
+    #[test]
+    fn the_note_names_the_file_and_both_fixes() {
+        let note = env_note(&[".env"]);
+        assert!(note.contains("`.env` is gitignored"), "{note}");
+        // The value fix first (nothing touches the guest's disk), the file fix
+        // second — and the file fix is a flag the reader can paste as-is.
+        assert!(note.contains("-e NAME=value"), "{note}");
+        assert!(note.contains("--with-file .env"), "{note}");
+    }
+
+    #[test]
+    fn several_files_read_as_a_list() {
+        let note = env_note(&[".env", ".env.local"]);
+        assert!(
+            note.contains("`.env`, `.env.local` are gitignored"),
+            "{note}"
+        );
+        assert!(note.contains("left them on the host"), "{note}");
+        // The suggested flag names one of them; repeating it is the caller's call.
+        assert!(note.contains("--with-file .env"), "{note}");
     }
 
     // ── Cross-cutting ────────────────────────────────────────────────────────
