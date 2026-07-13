@@ -11,6 +11,7 @@ vm exec linux --writeback -- cargo clippy --fix
 vm exec linux --with-snapshot -- ./install-something-destructive.sh
 vm exec --or-native windows -- cargo nextest run  # native when the host is already Windows
 vm claude windows "fix the test that only fails on Windows"
+vm run linux --elevated -- apt-get upgrade -y          # the guest itself: no repo, no sync
 vm ls
 ```
 
@@ -115,6 +116,77 @@ filename contains a space gets word-split by the shell like any other script
 would. Quote it for the shell — `vm exec macos -- '"/Applications/My App/run"'` —
 or just pass it in exec form. vm notes this one for you when it sees it.
 
+### Running a script
+
+**Write the script to a file in the repo and run it.** The sync carries
+uncommitted *and untracked* files, so a script you just created is already in the
+guest — no copying, no staging, no commit:
+
+```sh
+cat > check.py <<'EOF'
+import platform; print("hello from", platform.system())
+EOF
+vm exec linux -- python3 check.py     # untracked; the sync takes it anyway
+```
+
+This is the path to reach for. The file is versioned with everything else, it is
+there for the next run, and it has no size limit.
+
+Two things to know about the alternatives:
+
+- **A heredoc works**, because one argument is a script for the guest's shell:
+  `vm exec linux -- 'python3 - <<EOF … EOF'`. Convenient for a throwaway. But on
+  Windows, `cmd.exe` refuses a command line over **8191 characters**, so a long
+  inline script must be a file.
+- **Piping the script into vm does not work.** `vm exec` never forwards its own
+  stdin (see [Stdio](#stdio)) — `cat script.py | vm exec linux -- python3` runs
+  python with *no input* and exits 0, having done nothing. If you want to feed a
+  command on stdin, that is what [`vm run`](#ad-hoc-commands-vm-run) does.
+- **A gitignored script does not travel.** Name it with `--with-file`, or keep
+  scripts out of ignored paths.
+
+## Ad-hoc commands (`vm run`)
+
+`vm exec` is for *this repo's code*: it finds the repo, syncs it, and runs in the
+checkout. When the **guest itself** is the subject — patch it, install a tool,
+ask what version of something it has — that is `vm run`, which has no repo and no
+sync behind it and therefore needs neither:
+
+```sh
+vm run linux -- uname -a                         # runs in the guest user's home
+vm run windows --elevated -- winget upgrade --all
+vm run linux --elevated -- apt-get update
+vm run macos --elevated -- sh < maintenance.sh   # a script, on stdin
+```
+
+It works from anywhere — no git repo required — and takes the same command forms
+as exec (several arguments are an argv; one argument is a script for the guest's
+shell). It holds the same use-lock as exec, so `vm reap` will not suspend a guest
+out from under a long `apt-get upgrade`.
+
+**`--elevated`** runs as **root** (linux/macos) or **SYSTEM** (windows) through
+Parallels Tools. It is the only elevation there is: `sudo` over ssh wants a
+password, and the Windows guest user is not an administrator (UAC cannot be
+satisfied headless). It needs no console login. Note that the superuser's `PATH`
+is the *system* one — per-user tools (`mise`, `cargo`, a user-scope `brew`) are
+not on it, which is correct for `apt`/`winget`/`softwareupdate` and wrong for
+anything installed under the config user's home. Run those without `--elevated`.
+
+**Stdin travels — this is the one command where it does.** Input piped or
+redirected into `vm run` becomes the guest command's stdin (up to 8 MiB of text),
+which is how a script gets in:
+
+```sh
+vm run linux --elevated -- sh < step.sh          # exit code is the script's own
+```
+
+That is also the *only* way to send a large script through the elevated
+transport: `prlctl exec` hangs forever — silently, and immune to SIGTERM — once
+its **total** command line passes roughly 4 KB (many small arguments hang it just
+as reliably as one big one). vm refuses to build such a command line rather than
+let it hang; on stdin there is no such limit, because the payload rides inside
+the request the agent reads.
+
 ## Native or VM (`--or-native`)
 
 By default `vm exec` **always** runs in a VM, even when the target's os is the
@@ -215,13 +287,19 @@ therefore exactly the command's own: `vm exec linux -- 'cargo test 2>&1' >
 log.txt` captures a clean log, and piping vm's stdout into another tool never
 picks up vm chatter.
 
-Stdin is the deliberate exception: it is **never** forwarded. vm holds the
+Stdin is the deliberate exception: **`vm exec` never forwards it.** vm holds the
 host↔guest pipe open as a liveness signal (closing it is how a killed `vm`
 tears down the guest process tree), and the guest command reads from the null
 device. So `echo hi | vm exec linux -- 'cat > f'` writes an empty file and
 exits 0 — vm prints a `vm ▸ note:` when it sees input wired into its stdin, so
-that near-miss is never silent. To feed a command data, put it in a file in the
-repo: the sync carries it, verified like everything else.
+that near-miss is never silent. To feed an exec'd command data, put it in a file
+in the repo: the sync carries it, verified like everything else.
+
+**`vm run` is the exception to the exception**: there, input piped or redirected
+into vm *is* the guest command's stdin (≤ 8 MiB of text), and vm says so — `vm ▸
+linux ▸ stdin ▸ 91 bytes → the guest command`. It rides inside the request rather
+than down the pipe, so the liveness channel is untouched. Binary input is refused
+rather than mangled. See [Ad-hoc commands](#ad-hoc-commands-vm-run).
 
 ## Claude in a VM
 

@@ -39,6 +39,16 @@ fn main() {
     }
 }
 
+/// Print the form advisories for a command line the caller typed, naming the
+/// verb they typed it under so the suggested fix is one they can paste back.
+fn advise(verb: &str, target: &str, cmd: &[String]) {
+    for note in exec::advise::advisories(verb, target, cmd, |path| {
+        std::path::Path::new(path).is_file()
+    }) {
+        eprintln!("vm ▸ note: {note}");
+    }
+}
+
 fn run(cli: cli::Cli) -> Result<i32> {
     use cli::Command::*;
     match cli.command {
@@ -89,12 +99,21 @@ fn run(cli: cli::Cli) -> Result<i32> {
             // argv it built itself and would only be confused about. Printed
             // before any VM work starts, so the note is on screen even if the
             // run then dies resuming the guest.
-            for note in exec::advise::advisories(&args.target, &args.opts.cmd, |path| {
-                std::path::Path::new(path).is_file()
-            }) {
-                eprintln!("vm ▸ note: {note}");
-            }
+            advise("exec", &args.target, &args.opts.cmd);
             exec::host::exec(&args.target, &args.opts.into())
+        }
+        Run(args) => {
+            // The arity rule is exec's, so its near-misses are too — and the
+            // suggested fix has to come back as `vm run`, not `vm exec`.
+            advise("run", &args.target, &args.cmd);
+            exec::run::run(
+                &args.target,
+                &exec::run::RunOptions {
+                    elevated: args.elevated,
+                    env: args.env,
+                    cmd: args.cmd,
+                },
+            )
         }
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),

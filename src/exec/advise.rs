@@ -37,14 +37,23 @@ const INDENT: &str = "\n           ";
 /// `is_file` answers whether a path names an existing file — injected so the
 /// rules are testable without a filesystem; production passes a host-CWD probe,
 /// which is the directory the guest checkout mirrors.
-pub fn advisories(target: &str, cmd: &[String], is_file: impl Fn(&str) -> bool) -> Vec<String> {
+///
+/// `verb` is the command the caller actually typed (`exec` or `run`), because
+/// every note here ends in a corrected command line to paste — and advice that
+/// silently swapped the verb would be advice for a command they did not run.
+pub fn advisories(
+    verb: &str,
+    target: &str,
+    cmd: &[String],
+    is_file: impl Fn(&str) -> bool,
+) -> Vec<String> {
     // Arity-exclusive by construction: a command is one form or the other, so
     // at most one of these can ever produce a note.
     match cmd {
-        [script] => shell_form_note(target, script, is_file)
+        [script] => shell_form_note(verb, target, script, is_file)
             .into_iter()
             .collect(),
-        _ => exec_form_note(target, cmd).into_iter().collect(),
+        _ => exec_form_note(verb, target, cmd).into_iter().collect(),
     }
 }
 
@@ -124,7 +133,7 @@ pub fn stdin_note(source: Option<StdinSource>) -> Option<String> {
 /// survived only because it was quoted or escaped), so `&&` is handed to `echo`
 /// as a literal word. Nothing fails — `echo` cheerfully prints it — which is
 /// exactly why it is worth a note: the command "works", just not as meant.
-fn exec_form_note(target: &str, cmd: &[String]) -> Option<String> {
+fn exec_form_note(verb: &str, target: &str, cmd: &[String]) -> Option<String> {
     let ops = operators_in_exec_form(cmd);
     if ops.is_empty() {
         return None;
@@ -135,7 +144,7 @@ fn exec_form_note(target: &str, cmd: &[String]) -> Option<String> {
         "{list} reached vm as {} own argument, so it is passed to `{prog}` as a literal \
          word — several arguments run exactly as given, never as shell syntax.\
          {INDENT}To run this as a shell script, pass it as ONE argument: \
-         vm exec {target} -- '{script}'",
+         vm {verb} {target} -- '{script}'",
         if ops.len() == 1 { "its" } else { "their" },
     ))
 }
@@ -167,13 +176,18 @@ fn operators_in_exec_form(cmd: &[String]) -> Vec<String> {
 /// `/Applications/My` — the one case where the arity rule's convenience bites,
 /// and the reason it is checked against the filesystem rather than guessed at:
 /// only an actual file on disk earns the note.
-fn shell_form_note(target: &str, script: &str, is_file: impl Fn(&str) -> bool) -> Option<String> {
+fn shell_form_note(
+    verb: &str,
+    target: &str,
+    script: &str,
+    is_file: impl Fn(&str) -> bool,
+) -> Option<String> {
     let end = spaced_file_prefix(script, &is_file)?;
     let (path, rest) = (&script[..end], &script[end..]);
     Some(format!(
         "`{path}` is an existing file whose name holds a space, but a single argument runs \
          as a shell script — the guest shell splits it there and never sees that file.\
-         {INDENT}To run it, quote the path for the shell: vm exec {target} -- '\"{path}\"{rest}'"
+         {INDENT}To run it, quote the path for the shell: vm {verb} {target} -- '\"{path}\"{rest}'"
     ))
 }
 
@@ -222,7 +236,7 @@ mod tests {
 
     fn notes(cmd: &[&str], is_file: impl Fn(&str) -> bool) -> Vec<String> {
         let cmd: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-        advisories("lin", &cmd, is_file)
+        advisories("exec", "lin", &cmd, is_file)
     }
 
     /// The single note `cmd` produces, or a panic — most cases assert on its text.
@@ -268,6 +282,26 @@ mod tests {
         assert!(note.contains("`echo`"), "{note}");
         // The suggestion is the command the caller should have typed.
         assert!(note.contains("vm exec lin -- 'echo a && echo b'"), "{note}");
+    }
+
+    /// Both form notes end in a command line to paste, so they must name the
+    /// verb the caller typed. `vm run` has no repo and no sync; being told to
+    /// retry with `vm exec` would send them somewhere they cannot go.
+    #[test]
+    fn the_suggested_fix_names_the_verb_that_was_used() {
+        let cmd: Vec<String> = ["echo", "a", "&&", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let note = advisories("run", "lin", &cmd, no_files).remove(0);
+        assert!(note.contains("vm run lin -- 'echo a && b'"), "{note}");
+
+        let script = vec!["my script.sh --flag".to_string()];
+        let note = advisories("run", "lin", &script, files(&["my script.sh"])).remove(0);
+        assert!(
+            note.contains(r#"vm run lin -- '"my script.sh" --flag'"#),
+            "{note}"
+        );
     }
 
     #[test]

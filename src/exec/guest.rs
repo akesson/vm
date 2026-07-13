@@ -2,19 +2,23 @@ use super::job;
 use crate::proto::ExecRequest;
 use crate::sync::expand_home;
 use anyhow::{Context, Result};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 /// `vm _exec`: read an ExecRequest from stdin, run it, propagate the exit
 /// code. Stdout/stderr stream straight through the ssh channel.
 pub fn exec() -> Result<i32> {
-    let req = ExecRequest::read_from(std::io::stdin().lock())?;
+    let mut req = ExecRequest::read_from(std::io::stdin().lock())?;
     let cwd = expand_home(&req.cwd)?;
     if !cwd.is_dir() {
         anyhow::bail!(
-            "working directory {} does not exist (sync first?)",
+            "working directory {} does not exist (sync first? or is `user` in the \
+             machine config wrong for this guest?)",
             cwd.display()
         );
     }
+    // `vm run` may have sent input for the child (a script on `sh`'s stdin); an
+    // exec never does, and its child keeps the null device.
+    let payload = req.stdin.take();
 
     // Always a plain argv: the host composed any shell invocation before sending
     // it (it knows this guest's OS from the config), so there is nothing here to
@@ -24,11 +28,20 @@ pub fn exec() -> Result<i32> {
     cmd.current_dir(&cwd)
         .env("PATH", augmented_path())
         .envs(&req.env)
-        .stdin(Stdio::null())
+        .stdin(if payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = match job::spawn_and_wait(cmd, start_liveness_watcher) {
+    let status = match job::spawn_and_wait(cmd, |child| {
+        if let Some(payload) = payload {
+            feed_stdin(child, payload);
+        }
+        start_liveness_watcher();
+    }) {
         Ok(status) => status,
         Err(err) => {
             // A command that isn't found or isn't executable is the *command's*
@@ -100,12 +113,44 @@ pub fn first_sync(repo: &str, cmd: &str) -> Result<i32> {
     Ok(code)
 }
 
+/// Write the request's stdin payload to the child and close the pipe, so a
+/// command reading stdin (`sh` running a script, `findstr`) sees the input and
+/// then a clean EOF.
+///
+/// On a thread, and never inline, for two independent reasons. The payload can
+/// be megabytes while a pipe buffer is tens of kilobytes, so a synchronous
+/// `write_all` would block until the child drained it — and a child that reads
+/// something else first (or nothing at all) would never get that far: deadlock.
+/// And `Child::wait()` closes `child.stdin` before it blocks, which would
+/// truncate a payload still being written. Taking the handle out of the `Child`
+/// gives this thread sole ownership of both problems.
+///
+/// A child that never reads its stdin is the ordinary case, not an error: the
+/// write blocks until the child exits, the read end closes, and the write fails
+/// `BrokenPipe` — which is why the result is dropped. That is only safe because
+/// Rust ignores SIGPIPE at startup; an agent that ever opted out would die here
+/// instead.
+fn feed_stdin(child: &mut Child, payload: String) {
+    let Some(mut stdin) = child.stdin.take() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(payload.as_bytes());
+        // Dropping `stdin` closes the pipe: that EOF is what ends `sh`'s read of
+        // the script and lets the command run at all.
+    });
+}
+
 /// The host holds our stdin open for the whole run. EOF (or error) means the
 /// host or the ssh connection died — sshd sends no signal for no-PTY
 /// sessions, so this is the only disconnect notification we get. Tear the
 /// child tree down instead of leaving orphaned compilers. Started only after
 /// the kill-tree (process group / job object) is registered, so the stop can
 /// never miss the child.
+///
+/// Reads the *agent's* own stdin — a different pipe from the child's, which
+/// [`feed_stdin`] owns — so a payload and the liveness channel never contend.
 fn start_liveness_watcher() {
     std::thread::spawn(|| {
         use std::io::Read;

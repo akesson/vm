@@ -19,16 +19,33 @@ fn agent_exec(argv: &[&str], cwd: &str) -> (i32, String) {
 
 /// `agent_exec` with `env` forwarded — what a `-e NAME=value` run puts on the wire.
 fn agent_exec_env(argv: &[&str], cwd: &str, env: &[(&str, &str)]) -> (i32, String) {
+    agent_request(argv, cwd, env, None)
+}
+
+/// `agent_exec` with a stdin payload — what `vm run … < script` puts on the wire.
+fn agent_exec_stdin(argv: &[&str], cwd: &str, stdin: &str) -> (i32, String) {
+    agent_request(argv, cwd, &[], Some(stdin))
+}
+
+fn agent_request(
+    argv: &[&str],
+    cwd: &str,
+    env: &[(&str, &str)],
+    stdin: Option<&str>,
+) -> (i32, String) {
     let env: serde_json::Map<String, serde_json::Value> = env
         .iter()
         .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
         .collect();
-    let req = serde_json::json!({
+    let mut req = serde_json::json!({
         "version": PROTO_VERSION,
         "argv": argv,
         "env": env,
         "cwd": cwd,
     });
+    if let Some(stdin) = stdin {
+        req["stdin"] = serde_json::Value::String(stdin.to_string());
+    }
     let mut child = Command::new(VM_BIN)
         .arg("_exec")
         .stdin(Stdio::piped())
@@ -134,6 +151,84 @@ fn command_not_found_is_127_not_infra() {
         tmp.path().to_str().unwrap(),
     );
     assert_eq!(code, 127);
+}
+
+// ── the stdin payload (`vm run … < script`) ──────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn a_stdin_payload_reaches_the_command_and_then_ends() {
+    // The `vm run lin -- sh < step.sh` shape: `sh` reads the script from stdin,
+    // runs it, and *terminates* — which it only does on EOF, so this pins the
+    // close as much as the write.
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout) = agent_exec_stdin(
+        &["sh"],
+        tmp.path().to_str().unwrap(),
+        "printf payload-ran\nexit 7\n",
+    );
+    assert_eq!(code, 7, "the script's own exit code comes back");
+    assert_eq!(stdout, "payload-ran", "stdout: {stdout:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_stdin_payload_reaches_the_command_and_then_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout) = agent_exec_stdin(
+        &["findstr", "."],
+        tmp.path().to_str().unwrap(),
+        "payload-ran\r\n",
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("payload-ran"), "stdout: {stdout:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_payload_survives_the_bytes_that_would_end_a_json_line() {
+    // The payload rides *inside* the request's single JSON line, so newlines —
+    // which every script is made of — must survive the trip escaped and come
+    // back out intact.
+    let tmp = tempfile::tempdir().unwrap();
+    let script = "printf 'a\\n'\nprintf \"b'c\\n\"\nprintf 'uni-→\\n'\n";
+    let (code, stdout) = agent_exec_stdin(&["sh"], tmp.path().to_str().unwrap(), script);
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "a\nb'c\nuni-→\n", "stdout: {stdout:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_big_payload_into_a_command_that_never_reads_it_does_not_deadlock() {
+    // The reason the payload is written on a thread. 1 MiB against a ~64 KiB
+    // pipe buffer blocks the writer until the child drains it — and this child
+    // never reads a byte. Written inline, the agent would hang here forever;
+    // written on a thread, the child exits, the pipe breaks, and the write is
+    // abandoned. (The `vm run lin -- 'apt-get update' < script` slip, which must
+    // fail with apt's own exit code and not by wedging.)
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = "x".repeat(1024 * 1024);
+    let (code, _) = agent_exec_stdin(
+        &["sh", "-c", "exit 7"],
+        tmp.path().to_str().unwrap(),
+        &payload,
+    );
+    assert_eq!(code, 7, "the command's own exit code, not a hang");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_command_with_no_payload_reads_the_null_device() {
+    // Every `vm exec` sends no payload, and its command's stdin must be at EOF
+    // immediately — not an open pipe nobody will ever write to, which would hang
+    // anything that reads stdin.
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout) = agent_exec(
+        &["sh", "-c", "printf got:[%s] \"$(cat)\""],
+        tmp.path().to_str().unwrap(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "got:[]", "stdout: {stdout:?}");
 }
 
 #[test]
