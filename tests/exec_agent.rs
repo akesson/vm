@@ -1,13 +1,14 @@
-//! The `vm _exec` agent driven exactly as the host drives it: one JSON line
-//! on stdin, stdin held open for the lifetime of the command (the liveness
-//! channel), exit code propagated. Runs in CI on all three OSes.
+//! The `vm _exec` agent driven exactly as the host drives it: one JSON line on
+//! stdin, then stdin held open and beaten on for the lifetime of the command
+//! (the liveness channel), exit code propagated. Runs in CI on all three OSes.
 //!
 //! The request is always a plain argv — the host composes any shell invocation
 //! before it goes on the wire, so a *script* reaches the agent already wrapped
 //! in `sh -c` / `cmd /C`, and these tests send it the same way.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::time::{Duration, Instant};
 use vm::proto::PROTO_VERSION;
 
 const VM_BIN: &str = env!("CARGO_BIN_EXE_vm");
@@ -231,13 +232,39 @@ fn a_command_with_no_payload_reads_the_null_device() {
     assert_eq!(stdout, "got:[]", "stdout: {stdout:?}");
 }
 
-#[test]
-fn liveness_stdin_eof_kills_the_child_tree() {
-    let req = serde_json::json!({
+// ── the liveness channel ─────────────────────────────────────────────────────
+
+/// The silence budget these tests give the agent, in place of the real minute.
+/// Generous enough that a loaded CI box stalling a beat by most of a second
+/// still doesn't read as a dead host.
+const TEST_BUDGET_MS: u64 = 1000;
+
+/// A guest command that never ends of its own accord — the tree the watcher has
+/// to kill. It must genuinely block: a child that exits by itself would hand
+/// every test below a nonzero exit for free, and they would all pass against a
+/// watcher that does nothing at all.
+fn blocking_argv() -> Vec<String> {
+    // Windows has no `sleep`, and `timeout` refuses a redirected stdin (the
+    // child's is the null device) — pinging loopback is the portable wait.
+    let argv: &[&str] = if cfg!(windows) {
+        &["cmd", "/C", "ping -n 300 127.0.0.1"]
+    } else {
+        &["sh", "-c", "sleep 300"]
+    };
+    argv.iter().map(|s| s.to_string()).collect()
+}
+
+/// The agent, running a command that will never end, with the request already
+/// sent and its stdin — the liveness channel — still open in hand.
+fn agent_on_a_blocking_command(budget_ms: Option<u64>) -> (Child, ChildStdin) {
+    let mut req = serde_json::json!({
         "version": PROTO_VERSION,
-        "argv": [VM_BIN, "_exec"], // grandchild that blocks forever reading stdin… (never gets a request)
+        "argv": blocking_argv(),
         "cwd": ".",
     });
+    if let Some(ms) = budget_ms {
+        req["heartbeat_timeout_ms"] = ms.into();
+    }
     let mut child = Command::new(VM_BIN)
         .arg("_exec")
         .stdin(Stdio::piped())
@@ -247,20 +274,70 @@ fn liveness_stdin_eof_kills_the_child_tree() {
         .expect("agent spawns");
     let mut stdin = child.stdin.take().expect("piped stdin");
     writeln!(stdin, "{req}").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    // Simulate host death / connection drop: close the liveness channel.
-    drop(stdin);
-    // The watcher must tear the agent (and its child) down promptly.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    (child, stdin)
+}
+
+/// The agent stops, and stops the way a torn-down agent does: an emergency stop
+/// exit, not its command's own.
+fn assert_torn_down(child: &mut Child, after: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = child.try_wait().expect("try_wait") {
             assert_ne!(status.code(), Some(0), "should exit via emergency stop");
             return;
         }
         assert!(
-            std::time::Instant::now() < deadline,
-            "agent did not stop within 10s of stdin EOF"
+            Instant::now() < deadline,
+            "agent did not stop within 10s of {after}"
         );
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn liveness_stdin_eof_kills_the_child_tree() {
+    let (mut child, stdin) = agent_on_a_blocking_command(None);
+    std::thread::sleep(Duration::from_millis(500));
+    // Simulate host death / connection drop: close the liveness channel.
+    drop(stdin);
+    assert_torn_down(&mut child, "stdin EOF");
+}
+
+/// The prlctl half of the contract (#21). The host is dead but the pipe never
+/// closes — Parallels Tools holds the guest's end open — so the EOF above is
+/// never coming. Silence is the only news there is, and it has to be enough.
+#[test]
+fn liveness_silence_past_the_budget_kills_the_child_tree() {
+    let started = Instant::now();
+    // `_stdin` stays open, and silent, for the whole test: precisely what a
+    // killed `vm` looks like from inside a guest reached over prlctl.
+    let (mut child, _stdin) = agent_on_a_blocking_command(Some(TEST_BUDGET_MS));
+    assert_torn_down(&mut child, "the silence budget");
+    assert!(
+        started.elapsed() >= Duration::from_millis(TEST_BUDGET_MS / 2),
+        "the agent must spend the budget before calling the host dead, not kill on sight"
+    );
+}
+
+/// The other half — and the one that makes the timeout safe rather than a
+/// disaster: a host that keeps beating holds its command open for as long as it
+/// likes, budget or no budget.
+#[test]
+fn heartbeats_hold_a_command_open_and_eof_still_ends_it() {
+    let (mut child, mut stdin) = agent_on_a_blocking_command(Some(TEST_BUDGET_MS));
+    // Three budgets' worth of beats, at the same 1:5 beat-to-budget ratio the
+    // real 15s/60s pair runs on.
+    for _ in 0..15 {
+        std::thread::sleep(Duration::from_millis(TEST_BUDGET_MS / 5));
+        stdin
+            .write_all(b"\n")
+            .expect("the agent should still be reading its liveness channel");
+    }
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "a heartbeating host must keep the guest command alive"
+    );
+    // And the beats stopping is still a death: the EOF path survives the change.
+    drop(stdin);
+    assert_torn_down(&mut child, "stdin EOF");
 }

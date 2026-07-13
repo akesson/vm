@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::exit::usage;
 use crate::guest_env::{ActiveEnv, GuestEnv};
-use crate::proto::{ExecRequest, PROTO_VERSION};
+use crate::proto::{ExecRequest, HEARTBEAT_INTERVAL, PROTO_VERSION};
 use crate::{commands, mapping, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -123,9 +123,11 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         env,
         cwd: cwd.clone(),
         // An exec's guest command gets the null device: vm's own stdin is the
-        // liveness channel and never travels. `vm run` is the one that sends a
-        // payload (see `super::run`).
+        // liveness channel — request, then heartbeats — and never travels.
+        // `vm run` is the one that sends a payload (see `super::run`).
         stdin: None,
+        // The guest keeps the real budget. Only a test ever overrides it.
+        heartbeat_timeout_ms: None,
     };
 
     eprintln!(
@@ -179,14 +181,22 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
 /// — [`exec_in`] and [`super::run::run`] differ in everything *around* this and
 /// in nothing about it.
 ///
-/// The open stdin pipe is the contract. It carries the request, and then it
-/// carries nothing at all: the agent keeps reading it, so if this process dies
-/// (Ctrl-C, kill) the pipe closes, the agent sees EOF and tears the guest's
-/// process tree down. It must therefore be held open across the wait — which is
-/// why the handle is taken *out* of the `Child`, whose own `wait()` would close
-/// it. (Measured on Parallels 26.4: over the prlctl channels a unix guest's
-/// nonzero exit code only comes back while that pipe is still open, so this is
-/// load-bearing for the exit-code contract too, not only for teardown.)
+/// The open stdin pipe is the contract. It carries the request, and then a
+/// keepalive byte every [`HEARTBEAT_INTERVAL`] for as long as the command runs.
+/// The agent tears the guest's process tree down when that pipe closes — this
+/// process died, Ctrl-C or kill — *or* when it falls silent for
+/// [`crate::proto::HEARTBEAT_TIMEOUT`]. The silence half is the one that holds
+/// over prlctl, where a dead host may close nothing the guest can ever see:
+/// Parallels Tools can keep the guest's end of stdin open, which is how a killed
+/// `vm run --elevated macos` used to leave its command running for as long as
+/// anyone cared to watch (#21).
+///
+/// The pipe must therefore stay open across the wait — which is why the handle
+/// is taken *out* of the `Child`, whose own `wait()` would close it, and given
+/// to the heartbeat thread to hold. (Measured on Parallels 26.4: over the
+/// prlctl channels a unix guest's nonzero exit code only comes back while that
+/// pipe is still open, so this is load-bearing for the exit-code contract too,
+/// not only for teardown.)
 pub(super) fn drive_agent(
     alias: &str,
     mut transport: std::process::Command,
@@ -202,8 +212,25 @@ pub(super) fn drive_agent(
     request_line.push('\n');
     let mut agent_stdin = child.stdin.take().expect("piped stdin");
     agent_stdin.write_all(request_line.as_bytes())?;
+
+    // The pulse. Detached, and the owner of the pipe from here on: it has to
+    // outlive the `wait()` below — a pipe closed early would read as a dead
+    // host — and nothing after the wait has any use for the handle. It ends by
+    // failing, not by being told: when the transport exits, the read end goes
+    // with it and the next write returns `BrokenPipe`. Leaning on a failed
+    // write is only safe because Rust ignores SIGPIPE at startup (the same
+    // reasoning [`super::guest::feed_stdin`] runs on). So the thread outlives
+    // the command by at most one interval, asleep, holding a dead pipe.
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(HEARTBEAT_INTERVAL);
+            if agent_stdin.write_all(b"\n").is_err() {
+                break;
+            }
+        }
+    });
+
     let status = child.wait().context("waiting on the exec transport")?;
-    drop(agent_stdin);
     let code = match status.code() {
         Some(code) => code,
         // No exit code means the transport itself was killed by a signal while

@@ -287,10 +287,19 @@ therefore exactly the command's own: `vm exec linux -- 'cargo test 2>&1' >
 log.txt` captures a clean log, and piping vm's stdout into another tool never
 picks up vm chatter.
 
-Stdin is the deliberate exception: **`vm exec` never forwards it.** vm holds the
-host↔guest pipe open as a liveness signal (closing it is how a killed `vm`
-tears down the guest process tree), and the guest command reads from the null
-device. So `echo hi | vm exec linux -- 'cat > f'` writes an empty file and
+Stdin is the deliberate exception: **`vm exec` never forwards it.** vm keeps the
+host↔guest pipe for itself as the liveness channel — it sends the request, then
+a keepalive every 15s for as long as the command runs — and the guest command
+reads from the null device. A killed `vm` (Ctrl-C, `kill -9`) stops beating, and
+the agent takes that as its cue to tear the guest process tree down rather than
+leave a compiler running in there. Over ssh the pipe *closes* as well, so
+teardown is immediate. Over `prlctl` (`vm exec windows`, `vm run --elevated`) it
+may not close at all — Parallels Tools can leave the guest's end of stdin open
+long after the host is gone, which is how a killed `vm run --elevated macos`
+used to leave its command running forever — so there the silence is the news,
+and the tree comes down within the minute instead.
+
+So `echo hi | vm exec linux -- 'cat > f'` writes an empty file and
 exits 0 — vm prints a `vm ▸ note:` when it sees input wired into its stdin, so
 that near-miss is never silent. To feed an exec'd command data, put it in a file
 in the repo: the sync carries it, verified like everything else.

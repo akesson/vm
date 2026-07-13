@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use std::process::{Child, Command, ExitStatus};
 
 /// Exit immediately. The job handle (KILL_ON_JOB_CLOSE) is still open, so
-/// process exit closes it and Windows kills the entire child tree. Called
-/// from the stdin-EOF watcher (host/connection died).
+/// process exit closes it and Windows kills the entire child tree. Called from
+/// the stdin liveness watcher — on EOF, or on a pipe that stopped heartbeating:
+/// either way the host or the connection died.
 pub fn emergency_stop() -> ! {
     std::process::exit(130)
 }

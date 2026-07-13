@@ -1,8 +1,10 @@
 use super::job;
-use crate::proto::ExecRequest;
+use crate::proto::{self, ExecRequest};
 use crate::sync::expand_home;
 use anyhow::{Context, Result};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// `vm _exec`: read an ExecRequest from stdin, run it, propagate the exit
 /// code. Stdout/stderr stream straight through the ssh channel.
@@ -19,6 +21,13 @@ pub fn exec() -> Result<i32> {
     // `vm run` may have sent input for the child (a script on `sh`'s stdin); an
     // exec never does, and its child keeps the null device.
     let payload = req.stdin.take();
+    // How long the host may go quiet before it counts as dead. The host itself
+    // never sets this — only a test does, to watch the timeout fire in half a
+    // second instead of a minute.
+    let silence_budget = req
+        .heartbeat_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(proto::HEARTBEAT_TIMEOUT);
 
     // Always a plain argv: the host composed any shell invocation before sending
     // it (it knows this guest's OS from the config), so there is nothing here to
@@ -40,7 +49,7 @@ pub fn exec() -> Result<i32> {
         if let Some(payload) = payload {
             feed_stdin(child, payload);
         }
-        start_liveness_watcher();
+        start_liveness_watcher(silence_budget);
     }) {
         Ok(status) => status,
         Err(err) => {
@@ -142,27 +151,55 @@ fn feed_stdin(child: &mut Child, payload: String) {
     });
 }
 
-/// The host holds our stdin open for the whole run. EOF (or error) means the
-/// host or the ssh connection died — sshd sends no signal for no-PTY
-/// sessions, so this is the only disconnect notification we get. Tear the
-/// child tree down instead of leaving orphaned compilers. Started only after
-/// the kill-tree (process group / job object) is registered, so the stop can
-/// never miss the child.
+/// The host holds our stdin open for the whole run and beats on it every
+/// [`proto::HEARTBEAT_INTERVAL`]. Either way it goes quiet — the pipe closes,
+/// or the beats stop for `timeout` — the host or the connection died, and the
+/// child tree comes down instead of turning into orphaned compilers.
 ///
-/// Reads the *agent's* own stdin — a different pipe from the child's, which
-/// [`feed_stdin`] owns — so a payload and the liveness channel never contend.
-fn start_liveness_watcher() {
-    std::thread::spawn(|| {
+/// Two ways, because no single one covers every transport. Over ssh the close
+/// arrives (and is the only notification there is: sshd sends no signal for
+/// no-PTY sessions), so EOF is acted on the instant it lands. Over `prlctl exec`
+/// it may never arrive at all — Parallels Tools can leave the guest's end of
+/// stdin open after the host-side `prlctl` is gone, and the reader below then
+/// blocks forever on a pipe nobody will ever write to again (measured on the
+/// macOS guest: a killed `vm run --elevated` orphaned agent and command alike,
+/// #21) — so silence is the same verdict, reached the slow way.
+///
+/// Started only after the kill-tree (process group / job object) is registered,
+/// so the stop can never miss the child. Reads the *agent's* own stdin — a
+/// different pipe from the child's, which [`feed_stdin`] owns — so a payload
+/// and the liveness channel never contend.
+fn start_liveness_watcher(timeout: Duration) {
+    // When the host was last heard from. Seeded now rather than at the first
+    // beat: one is a whole interval away, and until then the host is presumed
+    // alive — it just spoke, in the request this run is made of.
+    let last_heard = Arc::new(Mutex::new(Instant::now()));
+
+    let heard = Arc::clone(&last_heard);
+    std::thread::spawn(move || {
         use std::io::Read;
         let mut sink = [0u8; 64];
         let mut stdin = std::io::stdin();
         loop {
             match stdin.read(&mut sink) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+                Ok(0) | Err(_) => break, // EOF: the host is gone, and we know it now.
+                Ok(_) => *heard.lock().unwrap() = Instant::now(), // a beat; nothing else is ever sent here
             }
         }
         super::job::emergency_stop();
+    });
+
+    // Checked on its own thread because the read above blocks with no timeout —
+    // std has no portable way to ask for one, and the whole point is to notice
+    // the read that will never return.
+    let tick = (timeout / 4).max(Duration::from_millis(50));
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(tick);
+            if last_heard.lock().unwrap().elapsed() > timeout {
+                super::job::emergency_stop();
+            }
+        }
     });
 }
 

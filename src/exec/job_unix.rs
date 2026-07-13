@@ -9,8 +9,9 @@ extern "C" fn forward_kill(_sig: libc::c_int) {
     emergency_stop()
 }
 
-/// Kill the whole child process group and exit. Called from the signal
-/// handler and from the stdin-EOF watcher (host/connection died).
+/// Kill the whole child process group and exit. Called from the signal handler
+/// and from the stdin liveness watcher — on EOF, or on a pipe that stopped
+/// heartbeating: either way the host or the connection died.
 pub fn emergency_stop() -> ! {
     let pgid = CHILD_PGID.load(Ordering::SeqCst);
     if pgid > 0 {
