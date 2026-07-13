@@ -329,8 +329,14 @@ runners:
 ```toml
 # mise.toml
 [tools]
-"ubi:akesson/vm" = "latest"   # or pin a version, e.g. "0.1.0"
+"ubi:akesson/vm" = "0.1.0"   # pin it: CI stays reproducible, and a release is one git tag
 ```
+
+A `[tools]` entry shadows any `vm` already on PATH — including a
+`cargo install` dev build — wherever mise is active for that repo. If the dev
+machine should keep its own build (say, because you hack on vm itself), put
+the entry in `mise.ci.toml` and set `MISE_ENV=ci` on the runner instead: CI
+installs the pinned release, dev machines never see it.
 
 Or from source: `cargo install --path .` (or `mise run install`).
 
