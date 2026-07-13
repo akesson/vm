@@ -223,6 +223,115 @@ fn vm_claude_with_piped_stdin_is_told_too() {
     assert!(found[0].contains("piped into vm"), "{}", found[0]);
 }
 
+// ── The PATH behind a command-not-found (#25) ────────────────────────────────
+
+/// The host's own OS, spelled as an `--or-native` target literal — the one path
+/// that runs a command without a VM, a config or a sync, so these cases drive the
+/// real spawn and the real report from `cargo test` on any machine.
+fn host_os() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// A name nothing will ever resolve, in exec form (several arguments), which is
+/// the form that hands argv[0] to the OS instead of to a shell.
+const MISSING: &str = "vm-definitely-not-a-real-binary";
+
+#[test]
+fn a_missing_native_command_reports_the_path_it_searched() {
+    let (dir, config) = workspace();
+    // `-e PATH=…` so the expected report is knowable: it also proves vm reports
+    // the PATH the *child* was given, not the one vm itself inherited — the two
+    // differ on every run that sets one, and only the child's decides a not-found.
+    let path = if cfg!(windows) {
+        r"C:\vm-test\bin;C:\vm-test\other"
+    } else {
+        "/vm-test/bin:/vm-test/other"
+    };
+    let env = format!("PATH={path}");
+    let (code, stderr) = run_vm(
+        &config,
+        dir.path(),
+        &[
+            "exec",
+            host_os(),
+            "--or-native",
+            "-e",
+            &env,
+            "--",
+            MISSING,
+            "--flag",
+        ],
+    );
+    assert_eq!(
+        code, 127,
+        "a missing command is 127, not vm's 125: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("vm: command not found: {MISSING}")),
+        "{stderr}"
+    );
+    // The search path, entry by entry: the state the reader cannot see and vm can.
+    assert!(
+        stderr.contains("the PATH it searched (2 entries)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("vm-test"), "{stderr}");
+    // A healthy PATH earns no warning and no advice — the report is the answer.
+    assert!(!stderr.contains('⚠'), "{stderr}");
+    assert!(notes(&stderr).is_empty(), "{stderr}");
+}
+
+#[test]
+fn a_half_posix_path_is_flagged_on_windows_and_nowhere_else() {
+    // The #25 failure itself: a `mise` task whose shell is bash hands a native
+    // grandchild a PATH whose head was converted to Windows form and whose tail
+    // was left POSIX and colon-joined. `cargo` lives in the tail; Win32 searches
+    // only the head; "program not found" was all vm used to say about it.
+    let (dir, config) = workspace();
+    let half = r"C:\Program Files\Git\usr\bin;/c/Users/runneradmin/.cargo/bin:/c/Program Files/Git/mingw64/bin";
+    let env = format!("PATH={half}");
+    let (code, stderr) = run_vm(
+        &config,
+        dir.path(),
+        &[
+            "exec",
+            host_os(),
+            "--or-native",
+            "-e",
+            &env,
+            "--",
+            MISSING,
+            "--flag",
+        ],
+    );
+    assert_eq!(code, 127, "{stderr}");
+
+    // Deliberately branched, not `#[cfg(windows)]`-gated: the rule is Windows-only
+    // and the Windows guest is where this test earns its keep (`vm exec windows --
+    // cargo test`), but the *silence* on unix is just as much a property worth
+    // holding — those same bytes are a perfectly ordinary PATH there.
+    if cfg!(windows) {
+        assert!(stderr.contains('⚠'), "the POSIX tail is unmarked: {stderr}");
+        assert!(stderr.contains("colon-joined: 2 paths"), "{stderr}");
+        let found = notes(&stderr);
+        assert_eq!(found.len(), 1, "stderr: {stderr}");
+        assert!(
+            found[0].contains("POSIX PATH reached a native Windows process"),
+            "{}",
+            found[0]
+        );
+    } else {
+        assert!(!stderr.contains('⚠'), "{stderr}");
+        assert!(notes(&stderr).is_empty(), "{stderr}");
+    }
+}
+
 #[test]
 fn vm_claude_is_not_run_past_the_exec_advisories() {
     // claude's argv is built by vm, not typed by the caller, and its prompt is

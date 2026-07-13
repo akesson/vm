@@ -461,25 +461,35 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
     let status = match cmd.status() {
         Ok(status) => status,
         // A command that isn't found or isn't executable is the *command's* own
-        // result, not a vm failure — report it with the shell's own codes on the
+        // result, not a vm failure — reported with the shell's own codes on the
         // Ok path, so it never lands on 125 ("vm itself failed, often transient,
         // retry"), which would send the reader hunting through vm's plumbing for
         // what is really a broken PATH. Any other spawn failure is infra.
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => {
-                eprintln!("vm: command not found: {}", argv[0]);
-                return Ok(127);
-            }
-            std::io::ErrorKind::PermissionDenied => {
-                eprintln!("vm: command not executable: {}", argv[0]);
-                return Ok(126);
-            }
-            _ => {
+        Err(err) => match super::spawn_failure(&err, &argv[0], native_path(&env).as_deref()) {
+            Some(code) => return Ok(code),
+            None => {
                 return Err(err).with_context(|| format!("failed to run {:?} natively", argv[0]));
             }
         },
     };
     Ok(status.code().unwrap_or(1))
+}
+
+/// The PATH a native command was about to be searched on: an explicit `-e PATH=…`
+/// if the caller passed one, else the one vm inherited and is about to hand down.
+///
+/// Both platforms search the *child's* PATH first — on unix std even gives up its
+/// `posix_spawn` fast path when a modified PATH would otherwise be ignored — so an
+/// override is what a not-found is a statement about, and what there is to report.
+/// Windows then *also* falls back to vm's own PATH and the system directories
+/// (measured: an `-e PATH=…` holding no `cargo` still spawns the one on vm's PATH),
+/// which is why this is the PATH the command was handed rather than the last word
+/// on where Win32 looked. It cannot mislead: the report only ever prints when the
+/// command was found in none of them.
+fn native_path(env: &BTreeMap<String, String>) -> Option<String> {
+    super::path_override(env)
+        .map(str::to_string)
+        .or_else(|| std::env::var("PATH").ok())
 }
 
 /// Resolve `-e` specs into an explicit NAME→value map for the guest process.
