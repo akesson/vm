@@ -435,6 +435,15 @@ pub(super) fn render_argv(argv: &[String]) -> String {
 /// both paths. Its shell comes out the same too: native runs only when the host
 /// already *is* the target os, so the host's shell is the very one the guest
 /// path would have picked.
+///
+/// An unspawnable argv[0] is classified exactly as [`super::guest`] classifies
+/// it — 127 not-found, 126 not-executable — because `--or-native` is meant to be
+/// a transparent swap, and a swap that changes what "command not found" means is
+/// not one (#24). Only the exec form reaches that check: a script is resolved by
+/// the shell [`build_argv`] wrapped it in, which reports its own codes and never
+/// fails the spawn. That shell is the same one the guest path would have picked,
+/// so both paths still answer alike — `sh`'s 127/126 on unix, and on Windows
+/// cmd.exe's 1 for an unrecognized command.
 fn run_native(opts: &ExecOptions) -> Result<i32> {
     let env = resolve_env(&opts.env, |name| std::env::var(name).ok())?;
     let no_wrap = crate::guest_env::resolve(Some(GuestEnv::None), std::path::Path::new("."));
@@ -449,9 +458,27 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     cmd.envs(&env);
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run {:?} natively", argv[0]))?;
+    let status = match cmd.status() {
+        Ok(status) => status,
+        // A command that isn't found or isn't executable is the *command's* own
+        // result, not a vm failure — report it with the shell's own codes on the
+        // Ok path, so it never lands on 125 ("vm itself failed, often transient,
+        // retry"), which would send the reader hunting through vm's plumbing for
+        // what is really a broken PATH. Any other spawn failure is infra.
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                eprintln!("vm: command not found: {}", argv[0]);
+                return Ok(127);
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                eprintln!("vm: command not executable: {}", argv[0]);
+                return Ok(126);
+            }
+            _ => {
+                return Err(err).with_context(|| format!("failed to run {:?} natively", argv[0]));
+            }
+        },
+    };
     Ok(status.code().unwrap_or(1))
 }
 
@@ -622,10 +649,9 @@ mod tests {
         assert_eq!(env.get("FOO").map(String::as_str), Some("2"));
     }
 
-    /// Minimal ExecOptions for the native tests. Those run `sh`, so they are
-    /// unix-only; the helper carries the same gate or it is dead code — and
-    /// under `-D warnings`, a build failure — on the Windows runner.
-    #[cfg(unix)]
+    /// Minimal ExecOptions for the native tests. Most of them run `sh` and are
+    /// unix-only, but the not-found case (#24) needs no shell and runs on both
+    /// platforms — which is the point, since Windows is where that bug bit.
     fn opts(cmd: &[&str]) -> ExecOptions {
         ExecOptions {
             no_sync: false,
@@ -913,5 +939,65 @@ mod tests {
         // shell that hosted it.
         assert_eq!(run_native(&opts(&["exit 7"])).unwrap(), 7);
         assert_eq!(run_native(&opts(&["true && exit 5"])).unwrap(), 5);
+    }
+
+    // ── A native command that cannot be spawned (#24) ─────────────────────────
+
+    /// Deliberately *not* `#[cfg(unix)]`: the report came off a `windows-latest`
+    /// runner, and a spawn error is one of the few things whose `ErrorKind` the
+    /// two platforms have to agree on for this fix to hold. A unix-only test
+    /// here would re-create the exact blind spot that let 125 ship — so this one
+    /// runs in the Windows guest too (`vm exec windows -- cargo test`).
+    #[test]
+    fn run_native_reports_a_missing_command_as_127_not_infra() {
+        // The exec form hands argv[0] straight to the OS, so this is the path
+        // that used to raise the spawn error as an anyhow chain and exit 125 —
+        // "vm infra error, often transient, retry" — for a command that was
+        // simply not on PATH, and never would be on a retry. The guest agent
+        // answers 127 here (exec/guest.rs); --or-native is a transparent swap
+        // only if the host does too.
+        let code = run_native(&opts(&["definitely-not-a-real-binary", "--flag"])).unwrap();
+        assert_eq!(
+            code, 127,
+            "a missing command is the shell's 127, not vm's 125"
+        );
+    }
+
+    /// Unix-only, and not an oversight: Windows has no "exists but not
+    /// executable" spawn error for an ordinary file. CreateProcess rejects a
+    /// non-image file with ERROR_BAD_EXE_FORMAT, which is not `PermissionDenied`
+    /// and correctly stays an infra error — there is no 126 to assert.
+    #[cfg(unix)]
+    #[test]
+    fn run_native_reports_a_non_executable_command_as_126_not_infra() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("not-executable.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        // Readable, but no +x: the spawn fails with PermissionDenied.
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+
+        let code = run_native(&opts(&[script.to_str().unwrap(), "--flag"])).unwrap();
+        assert_eq!(code, 126, "a non-executable command is 126, not vm's 125");
+    }
+
+    /// Unix-only, because the code being asserted is `sh`'s and not vm's. The
+    /// same run on Windows goes through `cmd /C`, which answers 1 for an
+    /// unrecognized command rather than 127 — so the two *forms* genuinely
+    /// disagree there. That is cmd.exe's convention, not a vm bug, and it is not
+    /// what #24 is about: a script reaches a Windows *guest* through the very
+    /// same `cmd /C` (see [`build_argv`]) and yields the same 1, so native and
+    /// guest still answer alike, which is the property `--or-native` sells.
+    #[cfg(unix)]
+    #[test]
+    fn the_script_form_gets_its_codes_from_the_shell_itself() {
+        // The other half of the arity rule, and the reason the bug hid for so
+        // long: a single argument goes to `sh -c`, which resolves argv[0] on its
+        // own and has always reported the shell's codes. Only the exec form ever
+        // reached the spawn error that used to become a 125.
+        assert_eq!(
+            run_native(&opts(&["definitely-not-a-real-binary"])).unwrap(),
+            127
+        );
     }
 }
