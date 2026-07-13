@@ -15,7 +15,8 @@
 //! Windows Update reachable from the host at all.
 //!
 //! **A stdin payload.** `vm exec` never forwards stdin — the host↔agent pipe is
-//! its liveness channel, and the guest command reads the null device. `vm run`
+//! its liveness channel (the request, then a heartbeat until the command ends),
+//! and the guest command reads the null device. `vm run`
 //! reads what was piped or redirected into it and sends it *inside* the request,
 //! so `vm run linux --elevated -- sh < step.sh` feeds the script to the guest's
 //! shell. That is what a script over this transport must do: `prlctl exec` hangs
@@ -98,6 +99,8 @@ pub fn run(alias: &str, opts: &RunOptions) -> Result<i32> {
         env,
         cwd: cwd.clone(),
         stdin: payload,
+        // The guest keeps the real budget. Only a test ever overrides it.
+        heartbeat_timeout_ms: None,
     };
 
     // Who and where, before what: an elevated run is the one case where the
