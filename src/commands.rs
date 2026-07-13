@@ -122,6 +122,73 @@ fn wait_for_ssh(alias: &str, target: &SshTarget) {
     }
 }
 
+/// Bring the VM up for a transport that does not use ssh at all: `vm run
+/// --elevated` rides Parallels Tools, so the guest needs Tools up, not sshd.
+///
+/// Tools' exec session lags the IP after a wake — a resumed macOS guest refuses
+/// one for about ten seconds ("Unable to open new session") while already
+/// reporting an address. Waiting that out here is the difference between a
+/// `vm run` that works on the first try after a resume and one that fails with
+/// a Parallels error the caller can do nothing about.
+///
+/// Advisory like [`wait_for_ssh`], and for the same reason: if the session never
+/// opens, the real run fails on its own terms with the actual error, which is a
+/// better answer than one invented here. Only after a wake — a warm guest has
+/// long since opened one, and probing it would put a prlctl round-trip in front
+/// of every elevated run.
+pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
+    let started = Instant::now();
+    if !prl::ensure_up(alias, &vm.parallels_name)?.woke {
+        return Ok(());
+    }
+    let agent = agent_abs_path(vm);
+    let mut next_beat = HEARTBEAT;
+    loop {
+        match prl::exec_elevated(&vm.parallels_name, &[&agent, "_version"])?
+            .stdin(std::process::Stdio::null())
+            .output()
+        {
+            // Anything but a closed session is the guest answering — including
+            // an error, which the run itself will report far better than we can.
+            Ok(out)
+                if out.status.success()
+                    || !prl::is_session_not_ready(&String::from_utf8_lossy(&out.stderr)) =>
+            {
+                break;
+            }
+            Ok(_) => {}
+            Err(err) => return Err(err).context("probing the guest's elevated session"),
+        }
+        if started.elapsed() >= SESSION_TIMEOUT {
+            eprintln!(
+                "vm ▸ {alias} ▸ WARNING: Parallels Tools accepted no elevated session {}s \
+                 after the guest came up — continuing anyway (see `vm doctor {alias}`)",
+                started.elapsed().as_secs()
+            );
+            break;
+        }
+        if started.elapsed() >= next_beat {
+            eprintln!(
+                "vm ▸ {alias} ▸ waiting for the guest's elevated session — {}s of {}s",
+                started.elapsed().as_secs(),
+                SESSION_TIMEOUT.as_secs()
+            );
+            next_beat = started.elapsed() + HEARTBEAT;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    eprintln!(
+        "vm ▸ {alias} ▸ ready ▸ {:.1}s",
+        started.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
+/// How long Parallels Tools gets to accept an exec session after a wake.
+/// Measured on Parallels 26.4: a resumed macOS guest takes ~10s; the rest are
+/// ready at once.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub fn ls() -> Result<i32> {
     let cfg = Config::load()?;
     let vms = prl::list_all()?;
@@ -195,14 +262,56 @@ pub fn agent_path(vm: &VmConfig) -> String {
 }
 
 /// The agent path as invoked through the console-session transport
-/// (`prlctl exec`), which runs through cmd.exe rather than a POSIX shell:
-/// `~` never expands there, but `%USERPROFILE%` does, and path separators
-/// must be backslashes.
+/// (`prlctl exec --current-user`), which runs through cmd.exe rather than a
+/// POSIX shell: `~` never expands there, but `%USERPROFILE%` does, and path
+/// separators must be backslashes.
+///
+/// Console-session *only*. `%USERPROFILE%` is whatever the running account's
+/// profile is, so under `--elevated` (SYSTEM) this resolves to
+/// `C:\WINDOWS\system32\config\systemprofile` and finds no agent at all — that
+/// path uses [`agent_abs_path`] instead.
 pub fn agent_console_path(vm: &VmConfig) -> String {
     let path = agent_path(vm);
     match path.strip_prefix("~/") {
         Some(rest) => format!(r"%USERPROFILE%\{}", rest.replace('/', r"\")),
         None => path.replace('/', r"\"),
+    }
+}
+
+/// The configured user's home directory in the guest, spelled out. Every other
+/// path helper leans on a shell (or the running process's `$HOME`) to expand
+/// `~`; the elevated transport has neither — no shell to expand it, and a
+/// `$HOME` belonging to root/SYSTEM rather than to `vm.user`.
+pub fn guest_home(vm: &VmConfig) -> String {
+    let user = &vm.user;
+    match vm.os {
+        GuestOs::Windows => format!(r"C:\Users\{user}"),
+        GuestOs::Linux => format!("/home/{user}"),
+        GuestOs::Macos => format!("/Users/{user}"),
+    }
+}
+
+/// The vm agent binary in the guest as an *absolute* path, for a transport with
+/// no shell and no useful `$HOME` behind it (`prlctl exec` without
+/// `--current-user` — see [`crate::prl::exec_elevated`]).
+///
+/// An `agent_path` config override is honored, so a guest whose home is not
+/// where [`guest_home`] guesses (a renamed Windows profile directory, an
+/// unusual layout) has a way to say so: give it an absolute path.
+pub fn agent_abs_path(vm: &VmConfig) -> String {
+    let path = agent_path(vm);
+    let win = vm.os == GuestOs::Windows;
+    let joined = match path.strip_prefix("~/") {
+        Some(rest) => {
+            let sep = if win { '\\' } else { '/' };
+            format!("{}{sep}{rest}", guest_home(vm))
+        }
+        None => path,
+    };
+    if win {
+        joined.replace('/', r"\")
+    } else {
+        joined
     }
 }
 
@@ -613,6 +722,73 @@ mod tests {
         assert_eq!(
             agent_console_path(&win_vm(Some(r"C:\tools/vm.exe"))),
             r"C:\tools\vm.exe"
+        );
+    }
+
+    // ── absolute guest paths (the elevated transport) ─────────────────────────
+
+    fn vm_of(os: &str, user: &str, agent_path: Option<&str>) -> VmConfig {
+        let toml = format!(
+            "parallels_name = \"P\"\nos = \"{os}\"\nuser = \"{user}\"\nwork_root = '~/work'\n{}",
+            agent_path.map_or(String::new(), |p| format!("agent_path = '{p}'\n"))
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    /// `vm run --elevated` runs as root/SYSTEM, whose `$HOME` is not the config
+    /// user's — and its transport has no shell to expand `~` anyway. Both the
+    /// agent and the cwd therefore have to be spelled out, per OS.
+    #[test]
+    fn the_guest_home_is_spelled_out_per_os() {
+        assert_eq!(
+            guest_home(&vm_of("linux", "parallels", None)),
+            "/home/parallels"
+        );
+        assert_eq!(
+            guest_home(&vm_of("macos", "claudedev", None)),
+            "/Users/claudedev"
+        );
+        assert_eq!(
+            guest_home(&vm_of("windows", "hakesson", None)),
+            r"C:\Users\hakesson"
+        );
+    }
+
+    #[test]
+    fn the_absolute_agent_path_expands_against_that_home() {
+        assert_eq!(
+            agent_abs_path(&vm_of("linux", "parallels", None)),
+            "/home/parallels/.vm/bin/vm"
+        );
+        assert_eq!(
+            agent_abs_path(&vm_of("macos", "claudedev", None)),
+            "/Users/claudedev/.vm/bin/vm"
+        );
+        // Windows: home-joined *and* separator-normalized — prlctl hands this
+        // straight to the guest with no shell to fix it up.
+        assert_eq!(
+            agent_abs_path(&vm_of("windows", "hakesson", None)),
+            r"C:\Users\hakesson\.vm\bin\vm.exe"
+        );
+    }
+
+    /// The escape hatch for a guest whose home is not where `guest_home` guesses
+    /// (a renamed Windows profile dir, an unusual layout): an absolute
+    /// `agent_path` in the config passes through untouched.
+    #[test]
+    fn an_absolute_agent_path_override_wins_over_the_derived_home() {
+        assert_eq!(
+            agent_abs_path(&vm_of("linux", "parallels", Some("/opt/vm/bin/vm"))),
+            "/opt/vm/bin/vm"
+        );
+        assert_eq!(
+            agent_abs_path(&vm_of("windows", "hakesson", Some(r"D:\tools/vm.exe"))),
+            r"D:\tools\vm.exe"
+        );
+        // A `~/`-relative override still expands against the *config user's* home.
+        assert_eq!(
+            agent_abs_path(&vm_of("linux", "parallels", Some("~/tools/vm"))),
+            "/home/parallels/tools/vm"
         );
     }
 

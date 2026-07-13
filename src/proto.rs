@@ -10,7 +10,10 @@ use std::io::Read;
 /// v2 dropped the `shell` flag: the host now composes any shell invocation
 /// itself (it knows the guest's OS from the config), so a request is always a
 /// plain argv and the guest has no interpreting left to do.
-pub const PROTO_VERSION: u32 = 2;
+///
+/// v3 added `stdin`: `vm run` feeds the guest command an input payload
+/// (`vm run lin -- sh < step.sh`), which `vm exec` never does.
+pub const PROTO_VERSION: u32 = 3;
 
 /// A command to run in the guest, sent as JSON on the agent's stdin. argv is
 /// always spawned natively — never through a shell — so arguments survive
@@ -26,6 +29,14 @@ pub struct ExecRequest {
     pub env: BTreeMap<String, String>,
     /// Working directory; a leading `~/` is expanded against the guest home
     pub cwd: String,
+    /// Input for the guest command's stdin, fed to it and then closed (EOF).
+    /// `None` — every `vm exec` — leaves the child on the null device.
+    ///
+    /// It rides *inside* this JSON line rather than after it, so the bytes the
+    /// payload is made of can never be mistaken for the liveness channel the
+    /// same pipe carries once the request is read (see [`ExecRequest::read_from`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
 }
 
 impl ExecRequest {
@@ -81,6 +92,7 @@ mod tests {
             argv: argv.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),
             cwd: "~/work/repo".into(),
+            stdin: None,
         }
     }
 
@@ -125,6 +137,41 @@ mod tests {
         let json = format!(r#"{{"version":{PROTO_VERSION},"argv":["ls"],"cwd":"/tmp"}}"#);
         let req = ExecRequest::read_from(json.as_bytes()).unwrap();
         assert!(req.env.is_empty());
+    }
+
+    /// The payload is a *script* as often as not, so the bytes that would end a
+    /// JSON line — newlines above all — have to survive it intact.
+    #[test]
+    fn a_stdin_payload_roundtrips_through_the_one_json_line() {
+        let mut req = request(&["sh"]);
+        req.stdin = Some("set -e\necho 'quoted \"thing\"'\nexit 7\n".into());
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains('\n'),
+            "the request must stay one line: {json}"
+        );
+        assert_eq!(ExecRequest::read_from(json.as_bytes()).unwrap(), req);
+    }
+
+    /// Every `vm exec` sends no payload, and the guest must read that as "null
+    /// device", not as an empty one — an absent field and `""` are different.
+    #[test]
+    fn stdin_defaults_to_none_when_absent() {
+        let json = format!(r#"{{"version":{PROTO_VERSION},"argv":["ls"],"cwd":"/tmp"}}"#);
+        assert_eq!(ExecRequest::read_from(json.as_bytes()).unwrap().stdin, None);
+    }
+
+    #[test]
+    fn a_v2_host_is_rejected_with_the_redeploy_hint() {
+        // v2 is the version before `stdin`; an un-redeployed guest is exactly
+        // what a v2 host talking to a v3 agent (and the reverse) hits, and both
+        // must land on the actionable hint rather than a serde complaint.
+        let v2 = r#"{"version":2,"argv":["ls"],"cwd":"/tmp"}"#;
+        let err = ExecRequest::read_from(v2.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vm deploy"), "{err}");
+        assert!(err.contains("host sent v2"), "{err}");
     }
 
     #[test]

@@ -31,10 +31,39 @@ sync; `-e NAME=value` passes a value without ever writing it to guest disk. See
   host side are clean: `vm exec linux -- 'cargo test 2>&1' > log.txt` captures a
   big log to a file (grep the file instead of paging the log through your
   context) with no vm chatter mixed in.
-- vm's own stdin is **never** forwarded to the guest: `echo data | vm exec …`
+- `vm exec`'s stdin is **never** forwarded to the guest: `echo data | vm exec …`
   runs the command with no input — `cat > f` writes an *empty* file, and exits 0.
-  vm prints a `vm ▸ note:` when it spots piped stdin. To feed a command data,
-  write it to a file in the repo first — the sync carries it.
+  vm prints a `vm ▸ note:` when it spots piped stdin. To feed an exec'd command
+  data, write it to a file in the repo first — the sync carries it. (`vm run` is
+  the exception: there, stdin *does* travel. See **vm run** below.)
+- Two verbs, two jobs: **`vm exec`** runs *this repo's code* in the guest
+  checkout. **`vm run`** runs a command against *the guest itself* — no repo, no
+  sync, optionally as root/SYSTEM.
+
+## Running a script you wrote
+
+**Write it to a file in the repo and name it.** The sync carries untracked files,
+so a script you just created is already in the guest. This is the path to reach
+for — no size limit, and it is still there next run:
+
+```sh
+cat > check.py <<'EOF'
+import platform; print(platform.system())
+EOF
+vm exec linux -- python3 check.py       # untracked; syncs anyway
+```
+
+- **Do NOT pipe the script into vm.** `cat check.py | vm exec linux -- python3`
+  runs python with *no input* and exits 0, having done nothing. exec never
+  forwards stdin.
+- A **heredoc** works, since one argument is a shell script:
+  `vm exec linux -- 'python3 - <<EOF … EOF'`. Fine for a throwaway — but on
+  **Windows, `cmd.exe` rejects a command line over 8191 chars**, so a long inline
+  script must be a file.
+- A script under a **gitignored** path will not travel. Use `--with-file`, or
+  keep it out of ignored paths.
+- For a script that has nothing to do with the repo (patching the guest,
+  installing something), use `vm run … -- sh < script.sh` — see below.
 
 ## Commands
 
@@ -65,6 +94,16 @@ vm exec --or-native <os> -- <cmd>…      # run natively (no VM) IF the host is 
                                         # that OS, else route to the VM. The target
                                         # must literally be windows|linux|macos so it
                                         # works config-free on CI. Omit to force the VM
+vm run <alias> -- <cmd>…       # NO repo, NO sync: runs in the guest user's home.
+                               # Works outside a git repo. Same arity rule as exec
+vm run <alias> --elevated -- <cmd>…     # as root (linux/macos) / SYSTEM (windows),
+                               # via Parallels Tools. The ONLY elevation there is —
+                               # sudo over ssh needs a password, and the Windows user
+                               # is not an admin. Note: superuser PATH is the SYSTEM
+                               # one, so mise/cargo/user-brew are NOT on it
+vm run <alias> -- sh < step.sh # stdin DOES travel here (≤8 MiB text) — this is how
+                               # a script reaches an elevated guest. Exit code is the
+                               # script's own
 vm sync <alias>                # sync only (--with-file works here too)
 vm reap [alias] [--idle-minutes N]  # suspend VMs idle ≥N min (default 30) and not in
                                     # use; --install/--uninstall manage a launchd job

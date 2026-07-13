@@ -35,6 +35,17 @@ pub enum Command {
     /// 125 = vm infrastructure error (sync/agent/ssh/VM lifecycle), 2 =
     /// usage/config error. See the README's "Exit codes" section.
     Exec(ExecArgs),
+    /// Run a command in a guest with no repo and no sync — the guest itself is
+    /// the subject: patch it, install a tool, ask what version it has
+    ///
+    /// Runs in the guest user's home directory. Needs no git repo, so it works
+    /// from anywhere. Same command form as exec: SEVERAL arguments run exactly
+    /// as given; a SINGLE argument is a script for the guest's own shell.
+    ///
+    /// Unlike exec, input piped or redirected into vm IS sent to the guest
+    /// command's stdin (up to 8 MiB of text) — which is how a script gets in:
+    /// `vm run linux --elevated -- sh < step.sh`.
+    Run(RunArgs),
     /// Sync the current repo to a guest without running anything
     ///
     /// Carries uncommitted and untracked files; gitignored files (build caches,
@@ -154,6 +165,30 @@ pub struct ExecArgs {
 }
 
 #[derive(Args)]
+pub struct RunArgs {
+    /// VM alias from ~/.config/vm/config.toml
+    pub target: String,
+    /// Run as the superuser: root on linux/macos, SYSTEM on windows, via
+    /// Parallels Tools. The only elevation available — sudo over ssh wants a
+    /// password, and the Windows guest user is not an administrator. Needs no
+    /// console login. Note the superuser's PATH is the system one: per-user
+    /// tools (mise, cargo, a user-scope brew) are not on it
+    #[arg(long)]
+    pub elevated: bool,
+    /// Set an env var for the guest command: `-e NAME=value`, or `-e NAME`
+    /// to forward the host's current value. Repeatable.
+    #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
+    pub env: Vec<String>,
+    /// Command to run in the guest user's home. SEVERAL arguments run exactly as
+    /// given, byte for byte, with no shell involved. A SINGLE argument is run as
+    /// a script by the guest's own shell (`sh -c`, or `cmd /C` on Windows).
+    /// Input piped or redirected into vm becomes the command's stdin, so a
+    /// script goes in as `vm run <alias> -- sh < step.sh`
+    #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
+    pub cmd: Vec<String>,
+}
+
+#[derive(Args)]
 pub struct ClaudeArgs {
     /// VM alias from ~/.config/vm/config.toml
     pub target: String,
@@ -229,7 +264,13 @@ pub struct ExecOpts {
     /// Command to run in the guest checkout. SEVERAL arguments run exactly as
     /// given, byte for byte, with no shell involved. A SINGLE argument is run as
     /// a script by the guest's own shell (`sh -c`, or `cmd /C` on Windows), so
-    /// `vm exec <alias> -- 'cd src && cargo test'` gets pipes, `&&` and builtins
+    /// `vm exec <alias> -- 'cd src && cargo test'` gets pipes, `&&` and builtins.
+    ///
+    /// To run a script you wrote, put it in a file and name it — the sync
+    /// carries untracked files, so `vm exec <alias> -- python3 script.py` just
+    /// works. Piping it in does NOT: exec never forwards its own stdin, and the
+    /// command would run with no input at all (`vm run` is the one that feeds
+    /// stdin to the guest)
     #[arg(trailing_var_arg = true, required = true, allow_hyphen_values = true)]
     pub cmd: Vec<String>,
 }
@@ -483,6 +524,75 @@ mod tests {
     #[test]
     fn exec_requires_a_command() {
         assert!(Cli::try_parse_from(["vm", "exec", "win"]).is_err());
+    }
+
+    // ── vm run ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_parses_elevated_and_env_before_the_command() {
+        let cli = parse(&[
+            "vm",
+            "run",
+            "lin",
+            "--elevated",
+            "-e",
+            "FOO=bar",
+            "--",
+            "apt-get",
+            "update",
+        ]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(run.target, "lin");
+        assert!(run.elevated);
+        assert_eq!(run.env, ["FOO=bar"]);
+        assert_eq!(run.cmd, ["apt-get", "update"]);
+    }
+
+    #[test]
+    fn run_elevated_defaults_off() {
+        let cli = parse(&["vm", "run", "lin", "--", "whoami"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert!(!run.elevated, "elevation is never implicit");
+    }
+
+    #[test]
+    fn run_keeps_hyphen_args_and_a_lone_script_intact() {
+        let cli = parse(&["vm", "run", "win", "--", "winget", "upgrade", "--all"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(run.cmd, ["winget", "upgrade", "--all"]);
+
+        // The arity rule reads one argument as a script, so clap must not split it.
+        let cli = parse(&["vm", "run", "lin", "--", "id -u && uname -a"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(run.cmd, ["id -u && uname -a"]);
+    }
+
+    /// run is sync-less by construction, so exec's repo flags do not exist on
+    /// it — but `cmd` is trailing_var_arg, so clap does not *reject* one, it
+    /// swallows it into the command. Pinned here because that is why
+    /// `exec::run::reject_exec_flags` exists: left alone, the guest would go
+    /// hunting for a binary called `--no-sync` and come back with a 127.
+    #[test]
+    fn an_exec_only_flag_lands_in_runs_command_rather_than_failing_to_parse() {
+        let cli = parse(&["vm", "run", "lin", "--no-sync", "--", "true"]);
+        let Command::Run(run) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(run.cmd[0], "--no-sync");
+    }
+
+    #[test]
+    fn run_requires_a_target_and_a_command() {
+        assert!(Cli::try_parse_from(["vm", "run"]).is_err());
+        assert!(Cli::try_parse_from(["vm", "run", "lin"]).is_err());
     }
 
     #[test]

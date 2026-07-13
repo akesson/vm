@@ -197,26 +197,88 @@ fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
     }
 }
 
-/// Base invocation for running a command in the guest's *console session*
-/// (the interactive desktop) via Parallels Tools, as the console-logged-in
-/// user. This is how Windows exec reaches session 1: ssh children land in
-/// session 0 on a non-interactive window station, where UIA and every other
-/// GUI API see an empty desktop. Caveats: argv is re-joined guest-side (no
-/// POSIX shell, so `~` never expands), and it requires a user logged in at
-/// the console.
-pub fn exec_console(name: &str) -> Command {
+/// The most guest-command argv `prlctl exec` is allowed to carry, in total
+/// bytes. Over a threshold measured at ~3.9 KB on Parallels 26.4 (2026-07-12),
+/// `prlctl exec` hangs forever — no output, no error, no guest-side process,
+/// and it ignores SIGTERM. The limit is on the *combined* size of the command
+/// line, not any single argument: ten 500-byte arguments hang as reliably as
+/// one 5000-byte one. The cap sits well under the cliff to leave room for the
+/// parts of the request not counted here (VM name, prlctl's own flags).
+const EXEC_ARGV_LIMIT: usize = 3 * 1024;
+
+/// Fail fast — with the real cause — where `prlctl exec` would hang forever.
+fn check_exec_argv(name: &str, args: &[&str]) -> Result<()> {
+    let total: usize = args.iter().map(|a| a.len() + 1).sum();
+    if total > EXEC_ARGV_LIMIT {
+        bail!(
+            "refusing `prlctl exec {name} …`: the command line totals {total} bytes, \
+             over vm's {EXEC_ARGV_LIMIT}-byte cap.\n  \
+             prlctl exec hangs forever — silently, and immune to SIGTERM — once its \
+             total command line passes ~3.9 KB (measured on Parallels 26.4; the limit \
+             is combined size, not per argument).\n  \
+             Send bulk data to the guest some other way: the agent protocol's stdin, \
+             a synced file, or ssh."
+        );
+    }
+    Ok(())
+}
+
+/// Run `args` in the guest's *console session* (the interactive desktop) via
+/// Parallels Tools, as the console-logged-in user. This is how Windows exec
+/// reaches session 1: ssh children land in session 0 on a non-interactive
+/// window station, where UIA and every other GUI API see an empty desktop.
+/// Caveats: argv is re-joined guest-side (no POSIX shell, so `~` never
+/// expands), it requires a user logged in at the console, and the whole argv
+/// must stay small (see [`check_exec_argv`]) — which is why this takes the
+/// complete argv up front instead of returning a base `Command` to extend.
+pub fn exec_console(name: &str, args: &[&str]) -> Result<Command> {
+    check_exec_argv(name, args)?;
     let mut cmd = Command::new("prlctl");
     cmd.args(["exec", name, "--current-user"]);
-    cmd
+    cmd.args(args);
+    Ok(cmd)
 }
 
 /// Run a command in the console session, capturing output (for doctor).
 pub fn exec_console_capture(name: &str, args: &[&str]) -> Result<Output> {
-    exec_console(name)
-        .args(args)
+    exec_console(name, args)?
         .stdin(Stdio::null())
         .output()
         .context("failed to run prlctl exec")
+}
+
+/// Run `args` in the guest as the *superuser* — root on linux/macos, SYSTEM on
+/// windows — via Parallels Tools. `vm run --elevated`'s transport, and the only
+/// elevation available: sudo over ssh wants a password, and the Windows guest
+/// user is not an administrator (UAC cannot be satisfied headless).
+///
+/// The same channel as [`exec_console`] minus `--current-user`, so it needs no
+/// console login — but it runs as a user whose home is *not* the config user's:
+/// `~` never expands here (argv is re-joined guest-side with no shell) and
+/// `$HOME`/`%USERPROFILE%` belong to root/SYSTEM (on Windows,
+/// `C:\WINDOWS\system32\config\systemprofile`). Everything passed in must
+/// therefore be an absolute path — see [`crate::commands::agent_abs_path`].
+///
+/// Measured on Parallels 26.4, for anyone extending this: on linux/macos this
+/// channel drops output written in the first fraction of a second, and reports a
+/// nonzero exit only while the caller still holds the stdin pipe open. Both are
+/// moot for the agent, whose protocol reads a request from that pipe (a
+/// round-trip) before the child can print anything, and whose driver holds stdin
+/// open across the wait. A simpler caller here would silently lose output.
+pub fn exec_elevated(name: &str, args: &[&str]) -> Result<Command> {
+    check_exec_argv(name, args)?;
+    let mut cmd = Command::new("prlctl");
+    cmd.args(["exec", name]);
+    cmd.args(args);
+    Ok(cmd)
+}
+
+/// Parallels Tools' exec session is not ready the instant a VM reports an IP: a
+/// freshly resumed macOS guest refuses one for ~10s ("Unable to open new
+/// session"), which is a wake to wait out, not a failure to report. Callers
+/// retry a spawn that fails with this.
+pub fn is_session_not_ready(stderr: &str) -> bool {
+    stderr.contains("Unable to open new session")
 }
 
 /// Suspend (RAM image to disk; [`ensure_running`] resumes in ~1s). Reap
@@ -338,6 +400,73 @@ mod tests {
         assert_eq!(vms.len(), 2);
         assert_eq!(vms[0].ip(), None);
         assert_eq!(vms[1].ip(), Some("10.211.55.4"));
+    }
+
+    /// Everything vm itself sends through `prlctl exec` — agent invocations,
+    /// doctor probes — is a few dozen bytes and must pass untouched.
+    #[test]
+    fn exec_argv_guard_passes_real_vm_traffic() {
+        check_exec_argv(
+            "Windows 11",
+            &["cmd", "/c", r"%USERPROFILE%\.vm\bin\vm.exe _exec"],
+        )
+        .unwrap();
+        check_exec_argv("Windows 11", &["cmd", "/c", "whoami"]).unwrap();
+    }
+
+    /// Over the cap the transport would hang forever, silently; the guard's
+    /// whole job is to turn that into an error naming the real cause.
+    #[test]
+    fn exec_argv_guard_rejects_oversized_argv_with_the_cause() {
+        let big = "A".repeat(EXEC_ARGV_LIMIT + 1);
+        let err = check_exec_argv("Ubuntu 24.04", &["/bin/echo", &big])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hangs forever"), "{err}");
+        assert!(err.contains("stdin"), "{err}");
+    }
+
+    /// The limit is on the *total* command line: many small arguments hang
+    /// prlctl exactly as reliably as one large one (measured — five 1000-byte
+    /// args wedge it just like a single 5000-byte arg), so a per-argument
+    /// check would wave through commands that never return.
+    #[test]
+    fn exec_argv_guard_sums_across_arguments() {
+        let arg = "A".repeat(500);
+        let args: Vec<&str> = std::iter::repeat_n(arg.as_str(), 10).collect();
+        assert!(check_exec_argv("Ubuntu 24.04", &args).is_err());
+    }
+
+    /// Both prlctl channels ride the same hanging argv, so both are guarded.
+    /// The elevated one carries only `<abs agent path> _exec` — bytes, not
+    /// kilobytes, because the command itself goes over the agent's stdin.
+    #[test]
+    fn both_prlctl_channels_check_their_argv() {
+        exec_elevated("Ubuntu 24.04", &["/home/parallels/.vm/bin/vm", "_exec"]).unwrap();
+        exec_elevated(
+            "Windows 11",
+            &[r"C:\Users\hakesson\.vm\bin\vm.exe", "_exec"],
+        )
+        .unwrap();
+
+        let big = "A".repeat(EXEC_ARGV_LIMIT + 1);
+        let err = exec_elevated("Ubuntu 24.04", &["sh", "-c", &big])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hangs forever"), "{err}");
+    }
+
+    /// The one prlctl error a caller must not treat as failure: Tools' exec
+    /// session lags a resumed guest's IP by ~10s (macOS), and that is a wake to
+    /// wait out, not a broken VM.
+    #[test]
+    fn a_lagging_tools_session_is_recognized() {
+        assert!(is_session_not_ready(
+            "Failed to execute the command: Unable to open new session in this virtual machine."
+        ));
+        assert!(!is_session_not_ready(
+            "Unable to perform the operation because \"macOS\" is not started."
+        ));
     }
 
     #[test]

@@ -122,6 +122,10 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         argv: build_argv(&opts.cmd, &genv, vm.os),
         env,
         cwd: cwd.clone(),
+        // An exec's guest command gets the null device: vm's own stdin is the
+        // liveness channel and never travels. `vm run` is the one that sends a
+        // payload (see `super::run`).
+        stdin: None,
     };
 
     eprintln!(
@@ -131,41 +135,7 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
     );
     let started = Instant::now();
 
-    let mut child = agent_exec_command(vm, &target)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("failed to spawn the exec transport")?;
-    let mut request_line = serde_json::to_string(&req)?;
-    request_line.push('\n');
-    // Take stdin OUT of the Child: Child::wait() closes child.stdin before
-    // blocking, and this pipe is the liveness channel — it must stay open for
-    // the whole run. If this process dies (Ctrl-C, kill), the pipe closes,
-    // the agent's watcher sees EOF, and the guest kills the child tree.
-    let mut agent_stdin = child.stdin.take().expect("piped stdin");
-    agent_stdin.write_all(request_line.as_bytes())?;
-    let status = child.wait().context("waiting on the exec transport")?;
-    drop(agent_stdin);
-    let code = match status.code() {
-        Some(code) => code,
-        // No exit code means the transport itself was killed by a signal while
-        // this process survived (the connection dropped, or ssh/prlctl was
-        // signalled) — a vm infra failure, not a result from the guest command.
-        None => bail!(
-            "the exec transport to {alias} was killed before the guest reported an \
-             exit status — the connection dropped, or ssh/prlctl was signalled"
-        ),
-    };
-
-    // 127 now doubles as the guest reporting command-not-found (see
-    // exec/guest.rs), so keep the hint suggestive rather than assertive.
-    if code == 127 {
-        eprintln!(
-            "vm ▸ {alias} ▸ exit 127 — command not found in the guest \
-             (or the agent is missing — try `vm deploy {alias}`)"
-        );
-    }
+    let code = drive_agent(alias, agent_exec_command(vm, &target)?, &req)?;
 
     // A failed command in a repo whose `.env` never left the host: the likeliest
     // cause of the failure the caller is now staring at, and the one thing the
@@ -200,6 +170,59 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         "vm ▸ {alias} ▸ exit {code} ▸ {:.1}s",
         started.elapsed().as_secs_f32()
     );
+    Ok(code)
+}
+
+/// Carry one request to the guest agent over an already-built transport
+/// (ssh, or one of the two `prlctl exec` channels), stream its output, and
+/// return the guest command's exit code. The single place vm talks to an agent
+/// — [`exec_in`] and [`super::run::run`] differ in everything *around* this and
+/// in nothing about it.
+///
+/// The open stdin pipe is the contract. It carries the request, and then it
+/// carries nothing at all: the agent keeps reading it, so if this process dies
+/// (Ctrl-C, kill) the pipe closes, the agent sees EOF and tears the guest's
+/// process tree down. It must therefore be held open across the wait — which is
+/// why the handle is taken *out* of the `Child`, whose own `wait()` would close
+/// it. (Measured on Parallels 26.4: over the prlctl channels a unix guest's
+/// nonzero exit code only comes back while that pipe is still open, so this is
+/// load-bearing for the exit-code contract too, not only for teardown.)
+pub(super) fn drive_agent(
+    alias: &str,
+    mut transport: std::process::Command,
+    req: &ExecRequest,
+) -> Result<i32> {
+    let mut child = transport
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to spawn the exec transport")?;
+    let mut request_line = serde_json::to_string(req)?;
+    request_line.push('\n');
+    let mut agent_stdin = child.stdin.take().expect("piped stdin");
+    agent_stdin.write_all(request_line.as_bytes())?;
+    let status = child.wait().context("waiting on the exec transport")?;
+    drop(agent_stdin);
+    let code = match status.code() {
+        Some(code) => code,
+        // No exit code means the transport itself was killed by a signal while
+        // this process survived (the connection dropped, or ssh/prlctl was
+        // signalled) — a vm infra failure, not a result from the guest command.
+        None => bail!(
+            "the exec transport to {alias} was killed before the guest reported an \
+             exit status — the connection dropped, or ssh/prlctl was signalled"
+        ),
+    };
+
+    // 127 now doubles as the guest reporting command-not-found (see
+    // exec/guest.rs), so keep the hint suggestive rather than assertive.
+    if code == 127 {
+        eprintln!(
+            "vm ▸ {alias} ▸ exit 127 — command not found in the guest \
+             (or the agent is missing — try `vm deploy {alias}`)"
+        );
+    }
     Ok(code)
 }
 
@@ -268,7 +291,7 @@ fn unsynced_env_files(repo_root: &std::path::Path, with_file: &[String]) -> Vec<
 ///
 /// Unix-only by construction — the vm host runs on macOS; in the Windows build
 /// (the guest agent) this is always `None`.
-fn stdin_source() -> Option<super::advise::StdinSource> {
+pub(super) fn stdin_source() -> Option<super::advise::StdinSource> {
     #[cfg(not(unix))]
     return None;
     #[cfg(unix)]
@@ -338,7 +361,7 @@ fn reject_removed_flags(cmd: &[String]) -> Result<()> {
 /// environment; prepended into the script instead, mise would try to exec `cd`
 /// as a binary, everything past the first pipe would escape the environment, and
 /// `exit 42` would come back as mise's own exit code of one.
-fn build_argv(cmd: &[String], genv: &ActiveEnv, guest_os: GuestOs) -> Vec<String> {
+pub(super) fn build_argv(cmd: &[String], genv: &ActiveEnv, guest_os: GuestOs) -> Vec<String> {
     let mut argv: Vec<String> = genv.wrap().iter().map(|s| s.to_string()).collect();
     match cmd {
         [script] => {
@@ -360,7 +383,7 @@ fn build_argv(cmd: &[String], genv: &ActiveEnv, guest_os: GuestOs) -> Vec<String
 /// to the guest, so one holding shell syntax (a script: `cd src && pwd`) must be
 /// shown quoted — joined bare it would read as though the `&&` split the command,
 /// which is exactly what it does *not* do.
-fn render_argv(argv: &[String]) -> String {
+pub(super) fn render_argv(argv: &[String]) -> String {
     argv.iter()
         .map(|a| {
             if a.is_empty()
@@ -413,7 +436,7 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
 ///
 /// A bad spec is the caller's own invocation (a typo, a variable they forgot to
 /// export), so it is a usage error: retrying it will never help.
-fn resolve_env(
+pub(super) fn resolve_env(
     specs: &[String],
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<BTreeMap<String, String>> {
@@ -444,22 +467,26 @@ fn resolve_env(
 /// Parallels Tools injects into the console session. Same agent, same
 /// protocol — stdout/stderr stream and stdin stays the liveness channel
 /// either way.
-fn agent_exec_command(vm: &VmConfig, target: &ssh::SshTarget) -> std::process::Command {
+pub(super) fn agent_exec_command(
+    vm: &VmConfig,
+    target: &ssh::SshTarget,
+) -> Result<std::process::Command> {
     match vm.os {
         GuestOs::Windows => {
-            let mut cmd = prl::exec_console(&vm.parallels_name);
             // Through cmd.exe so %USERPROFILE% in the agent path expands.
-            cmd.args([
-                "cmd",
-                "/c",
-                &format!("{} _exec", commands::agent_console_path(vm)),
-            ]);
-            cmd
+            prl::exec_console(
+                &vm.parallels_name,
+                &[
+                    "cmd",
+                    "/c",
+                    &format!("{} _exec", commands::agent_console_path(vm)),
+                ],
+            )
         }
         GuestOs::Linux | GuestOs::Macos => {
             let mut cmd = ssh::ssh_command(target);
             cmd.arg(commands::agent_path(vm)).arg("_exec");
-            cmd
+            Ok(cmd)
         }
     }
 }
