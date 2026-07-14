@@ -75,6 +75,15 @@ down. It shuts down rather than suspends: a suspended guest's saved state can
 turn out to be one Parallels itself refuses to restore, which strands the VM
 entirely, while a boot is only seconds slower and always works.
 
+For that graceful stop to stay graceful on a linux guest, `vm deploy` installs a
+systemd unit (`vm-prldnd-shutdown.service`). Parallels' drag-and-drop agent
+ignores the SIGTERM it is sent at shutdown and jams gnome-session's logout, so
+the Ubuntu guest took 92–99s to stop — and Parallels force-kills a guest that
+takes 120s. The unit SIGKILLs that agent as the shutdown opens; stops now take
+~4s. `vm doctor` fails if it is missing, disabled, inactive, or out of date,
+because nothing else would notice a guest drifting back to twenty seconds from a
+force-kill.
+
 ## Targets
 
 A target is always a **VM alias** — a `[vm.<alias>]` key in the machine config.

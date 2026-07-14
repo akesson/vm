@@ -13,6 +13,7 @@ pub mod idle;
 pub mod lock;
 pub mod mapping;
 pub mod prl;
+pub mod prldnd;
 pub mod proto;
 pub mod reap;
 pub mod ssh;

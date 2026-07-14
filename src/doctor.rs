@@ -9,7 +9,7 @@
 
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::proto::{PROTO_VERSION, VersionInfo};
-use crate::{commands, prl, ssh};
+use crate::{commands, prl, prldnd, ssh};
 use anyhow::Result;
 
 struct Report {
@@ -195,8 +195,10 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
         claude_checks(&mut r, &target);
         idle_checks(&mut r, name, vm);
 
-        if vm.os == GuestOs::Windows {
-            console_checks(&mut r, vm);
+        match vm.os {
+            GuestOs::Windows => console_checks(&mut r, vm),
+            GuestOs::Linux => shutdown_checks(&mut r, name, &target),
+            GuestOs::Macos => {}
         }
     }
 
@@ -272,6 +274,54 @@ fn idle_checks(r: &mut Report, name: &str, vm: &VmConfig) {
                 "{err:#} — reap will shut down regardless of console use (`vm deploy {name}`?)"
             ),
         ),
+    }
+}
+
+/// A linux guest without `vm deploy`'s shutdown unit takes ~95s to stop, and
+/// Parallels force-kills a guest that takes 120s — so the margin between a
+/// clean shutdown and a yanked power cord is about twenty seconds. Nothing else
+/// in vm would notice it had gone missing: reap's stop would just get slower,
+/// and then one day be a force-kill. See [`crate::prldnd`].
+fn shutdown_checks(r: &mut Report, name: &str, target: &ssh::SshTarget) {
+    let advice = format!("`vm deploy {name}` installs it");
+    match prldnd::check(target) {
+        Ok(prldnd::State::Good) => r.ok(
+            "shutdown unit",
+            &format!("{} active — stops take seconds", prldnd::UNIT_NAME),
+        ),
+        Ok(prldnd::State::Missing) => r.fail(
+            "shutdown unit",
+            &format!(
+                "{} not installed — this guest takes ~95s to shut down (prldnd jams \
+                 gnome-session's logout) and Parallels force-kills it at 120s. {advice}",
+                prldnd::UNIT_NAME
+            ),
+        ),
+        Ok(prldnd::State::NotEnabled(state)) => r.fail(
+            "shutdown unit",
+            &format!(
+                "{} is {state}, so nothing pulls it in at boot and it cannot run at \
+                 the next shutdown. {advice}",
+                prldnd::UNIT_NAME
+            ),
+        ),
+        Ok(prldnd::State::Inactive(state)) => r.fail(
+            "shutdown unit",
+            &format!(
+                "{} is enabled but {state} — a oneshot runs its ExecStop only while \
+                 active, so this one will not fire. {advice}",
+                prldnd::UNIT_NAME
+            ),
+        ),
+        Ok(prldnd::State::Stale) => r.fail(
+            "shutdown unit",
+            &format!(
+                "{} differs from the one this vm installs — an older copy may be \
+                 missing a detail it needs to work at all. {advice}",
+                prldnd::UNIT_NAME
+            ),
+        ),
+        Err(err) => r.fail("shutdown unit", &format!("{err:#}")),
     }
 }
 
