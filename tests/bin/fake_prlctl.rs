@@ -156,6 +156,12 @@ struct Rule {
     /// The argv starts with these — `["exec", "Windows 11"]`, never mind what follows.
     #[serde(default)]
     match_prefix: Option<Vec<String>>,
+    /// Every one of these appears somewhere in the argv. How an ssh command is
+    /// told from another: they all begin with the same dozen `-o` options, and
+    /// differ only in what they ask the guest to *run* (`_version`, `git
+    /// --version`, `claude -p`).
+    #[serde(default)]
+    match_contains: Option<Vec<String>>,
     responses: Vec<Response>,
 }
 
@@ -166,6 +172,10 @@ impl Rule {
         }
         if let Some(prefix) = &self.match_prefix {
             return args.len() >= prefix.len() && args[..prefix.len()] == prefix[..];
+        }
+        if let Some(needles) = &self.match_contains {
+            let joined = args.join(" ");
+            return needles.iter().all(|needle| joined.contains(needle));
         }
         false
     }
@@ -223,18 +233,25 @@ fn hang() -> ! {
     }
 }
 
-/// Run the real vm agent in place of the guest's, with the argv `prlctl exec` was
-/// given, and become its exit code.
+/// Run the real vm agent in place of the guest's, and become its exit code.
+///
+/// What arrives is the whole console invocation —
+/// `exec "Windows 11" --current-user cmd /c "%USERPROFILE%\.vm\bin\vm.exe _exec"`
+/// — of which only the *verb* is meaningful here: the agent it names is the same
+/// binary the host is running, and it is already on this machine. So the wrapping
+/// is dropped and the agent is run directly, with stdio wired straight through.
+/// The request, the heartbeat, the exit code and the teardown are all genuine;
+/// only Parallels is gone.
 fn passthrough(args: &[String]) -> ! {
     let vm = std::env::var("FAKE_PRLCTL_VM").expect("fake-prlctl: FAKE_PRLCTL_VM is not set");
-    // `exec <name> [--current-user] <argv…>`
-    let tail: Vec<&String> = args
-        .iter()
-        .skip(2)
-        .filter(|a| a.as_str() != "--current-user")
-        .collect();
+    let joined = args.join(" ");
+    let verb_at = joined
+        .find(" _")
+        .unwrap_or_else(|| panic!("fake-prlctl: no guest verb in {args:?}"));
+    let agent_args: Vec<&str> = joined[verb_at + 1..].split_whitespace().collect();
+
     let status = Command::new(vm)
-        .args(tail)
+        .args(agent_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

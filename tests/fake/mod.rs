@@ -65,6 +65,31 @@ pub fn running() -> Vec<Value> {
     vec![phase("running", LEASE)]
 }
 
+/// A guest command that runs for about `secs` seconds and then exits 0.
+///
+/// It runs on whatever OS the *test* is running on: the guests in these scenarios
+/// are Windows in the sense that matters — the transport is `prlctl exec`, which
+/// is what reaches the fake — but the agent answering is this machine's own.
+/// Several arguments, so the arity rule spawns them as given rather than handing
+/// a script to a shell that is not there.
+pub fn sleeps_for(secs: u32) -> Vec<String> {
+    let argv: Vec<&str> = if cfg!(windows) {
+        // No `sleep` on Windows, and `timeout` refuses a redirected stdin.
+        vec!["cmd", "/C", "ping"]
+    } else {
+        vec!["sh", "-c", "sleep"]
+    };
+    let tail = if cfg!(windows) {
+        format!("-n {} 127.0.0.1 >NUL", secs + 1)
+    } else {
+        secs.to_string()
+    };
+    let mut out: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let last = out.pop().expect("a command");
+    out.push(format!("{last} {tail}"));
+    out
+}
+
 pub struct Fake {
     dir: tempfile::TempDir,
     alias: String,
@@ -99,6 +124,15 @@ work_root = "~/work"
             ),
         )
         .expect("a config");
+
+        // The ssh key doctor looks for. It is never used to authenticate
+        // anything — the fake ssh answers whatever is asked of it — but a
+        // *missing* key is a real finding, and a test's temp home has no key in
+        // it unless one is put there.
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).expect("an .ssh dir");
+        std::fs::write(ssh.join("id_ed25519"), "not a key\n").expect("an ssh key");
+
         Fake {
             dir,
             alias: alias.to_string(),
@@ -150,6 +184,73 @@ work_root = "~/work"
     /// A `prlctl <verb> …` that fails, the way Parallels refuses one.
     pub fn rule_fails(&self, verb: &str, stderr: &str) -> Value {
         json!({ "match_prefix": [verb], "responses": [{ "exit": 1, "stderr": stderr }] })
+    }
+
+    /// An ssh command recognised by what it asks the guest to *run* — every one
+    /// of them starts with the same dozen `-o` options, so the tail is the only
+    /// thing that tells them apart.
+    pub fn rule_ssh(&self, running: &str, stdout: &str) -> Value {
+        json!({ "match_contains": [running], "responses": [{ "stdout": stdout }] })
+    }
+
+    pub fn rule_ssh_fails(&self, running: &str, stderr: &str) -> Value {
+        json!({ "match_contains": [running], "responses": [{ "exit": 1, "stderr": stderr }] })
+    }
+
+    /// Every check `vm doctor <alias>` makes of a *healthy* guest, answered the
+    /// way a healthy guest answers it. A test that wants one thing broken passes
+    /// its own rule for that one thing — rules are matched in order, so the first
+    /// match wins and this stays the backdrop.
+    pub fn healthy_guest(&self) -> Vec<Value> {
+        let version = serde_json::json!({
+            "binary": env!("CARGO_PKG_VERSION"),
+            "proto": vm::proto::PROTO_VERSION,
+        })
+        .to_string();
+        vec![
+            // `_version` is asked over both channels — ssh, and the Windows
+            // console — and one answer serves both.
+            self.rule_ssh("_version", &version),
+            self.rule_ssh("git --version", "git version 2.51.0"),
+            self.rule_ssh("mkdir -p", ""),
+            self.rule_ssh("claude", "ok"),
+            self.rule_ssh("_idle", "3600000"),
+            // The console session: `prlctl exec … whoami` answers with the user
+            // who owns the desktop, and doctor checks it is the config's user —
+            // an exec that lands as somebody else sees somebody else's checkout.
+            self.rule_ssh("whoami", "WINBOX\\tester"),
+            // The bare reachability probe (`ssh … true`) — last, so the more
+            // specific commands above claim their own calls first.
+            self.rule_ssh("true", ""),
+        ]
+    }
+
+    /// Make the workspace a git repo, and create the checkout the guest command
+    /// will run in. What a `--no-sync` exec needs and no more: the repo is how vm
+    /// knows where it is, and the checkout is where the command lands.
+    pub fn with_repo(&self) -> std::path::PathBuf {
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(self.dir.path())
+                .args(args)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@local"]);
+
+        // `~/work/<repo>` in the guest — and the guest's home is this temp dir.
+        let checkout = self
+            .dir
+            .path()
+            .join("work")
+            .join(self.dir.path().file_name().expect("a repo name"));
+        std::fs::create_dir_all(&checkout).expect("the guest checkout");
+        checkout
     }
 
     /// `prlctl exec` answered by the *real* vm agent, run locally: the request,

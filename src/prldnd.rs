@@ -77,11 +77,25 @@ WantedBy=multi-user.target
 /// one string and hands it to a guest shell, so every quote and newline in it
 /// would be the shell's to mangle (and a long argv wedges the channel outright,
 /// see [`prl::exec_elevated`]).
-pub fn install(alias: &str, vm: &VmConfig) -> Result<()> {
-    let script = format!(
+/// The one command the install runs in the guest: it *reads the unit from
+/// stdin*. Nothing about the unit itself may appear here.
+///
+/// Two separate things make that mandatory, and both were learned the hard way.
+/// `prlctl exec` on a linux guest re-joins its argv into a single string and lets
+/// a guest shell re-split it, so every quote and newline in a unit file passed as
+/// an argument would be the shell's to mangle. And a large argv does not merely
+/// mangle: past ~3.9 KB the channel hangs forever, silently, deaf to SIGTERM
+/// (see [`prl::exec_elevated`]). A refactor that "simplified" this into an
+/// argument would work on the first line of the file and then wedge.
+fn install_script() -> String {
+    format!(
         "cat > {UNIT_PATH} && chmod 0644 {UNIT_PATH} && \
          systemctl daemon-reload && systemctl enable --now {UNIT_NAME}"
-    );
+    )
+}
+
+pub fn install(alias: &str, vm: &VmConfig) -> Result<()> {
+    let script = install_script();
     let mut child = prl::exec_elevated(&vm.parallels_name, &[&script])?
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -196,6 +210,32 @@ pub fn check(target: &SshTarget) -> Result<State> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The unit travels on stdin, and the command line stays a command line.
+    ///
+    /// Put the unit in the argv instead and two things happen: the guest shell
+    /// `prlctl exec` re-splits the argv through mangles its quotes and newlines,
+    /// and — because the unit is over a kilobyte — the channel crosses the size
+    /// at which it stops answering at all. The failure would not be a bad unit
+    /// file. It would be a `vm deploy` that hangs forever and ignores Ctrl-C.
+    #[test]
+    fn the_install_reads_the_unit_from_stdin_and_never_carries_it_in_the_argv() {
+        let script = install_script();
+
+        assert!(
+            script.starts_with("cat > "),
+            "the unit has to arrive on stdin: {script}"
+        );
+        // Nothing of the unit's body — not a directive, not a line of it.
+        for line in UNIT.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(
+                !script.contains(line.trim()),
+                "the unit's body leaked into the command line: {line}"
+            );
+        }
+        // And what is left is nowhere near the size that wedges the channel.
+        assert!(script.len() < 200, "a {}-byte command line", script.len());
+    }
 
     /// Each of these is a detail whose absence makes the unit compile, enable,
     /// activate, report healthy — and do nothing at the shutdown it exists for.
