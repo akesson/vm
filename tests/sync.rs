@@ -253,6 +253,103 @@ fn writeback_of_unchanged_guest_is_a_noop() {
     assert!(!applied);
 }
 
+/// Writeback is a patch applied to a working tree the host has kept editing for
+/// the whole run — a long `vm claude` is minutes of it. Where the two touched
+/// the same lines, the honest outcome is to refuse and say so: half-applying a
+/// patch over the user's own edit would be the one failure they could not undo.
+#[test]
+fn writeback_over_a_conflicting_host_edit_is_refused_and_names_the_cause() {
+    let repos = setup();
+    let base = sync(&repos);
+
+    // The guest fixes the file…
+    write(
+        &repos.guest,
+        "src/main.rs",
+        "fn main() { /* fixed by guest */ }\n",
+    );
+    let wb = guest::tree(repos.guest.to_str().unwrap()).unwrap();
+
+    // …while the host edits the very same line, after the snapshot was taken.
+    write(
+        &repos.host,
+        "src/main.rs",
+        "fn main() { /* edited on the host meanwhile */ }\n",
+    );
+
+    let err = host::apply_writeback(&repos.host, repos.guest.to_str().unwrap(), &base, &wb, None)
+        .expect_err("a conflicting writeback must not be forced onto the host tree");
+    assert!(
+        err.to_string().contains("host tree changed during the run"),
+        "the error has to name the cause: {err}"
+    );
+    // And the host's own edit is exactly as they left it.
+    assert_eq!(
+        fs::read_to_string(repos.host.join("src/main.rs")).unwrap(),
+        "fn main() { /* edited on the host meanwhile */ }\n",
+        "a refused writeback must leave the working tree untouched"
+    );
+}
+
+/// The other half of that rule: a host edit *elsewhere* in the tree is not a
+/// conflict, and must not cost the user their writeback.
+#[test]
+fn writeback_lands_alongside_a_host_edit_to_another_file() {
+    let repos = setup();
+    let base = sync(&repos);
+
+    write(
+        &repos.guest,
+        "src/main.rs",
+        "fn main() { /* fixed by guest */ }\n",
+    );
+    let wb = guest::tree(repos.guest.to_str().unwrap()).unwrap();
+
+    write(&repos.host, "notes.md", "written while the guest worked\n");
+
+    let applied =
+        host::apply_writeback(&repos.host, repos.guest.to_str().unwrap(), &base, &wb, None)
+            .unwrap();
+    assert!(applied);
+    assert_eq!(
+        fs::read_to_string(repos.host.join("src/main.rs")).unwrap(),
+        "fn main() { /* fixed by guest */ }\n",
+        "the guest's fix arrives"
+    );
+    assert_eq!(
+        fs::read_to_string(repos.host.join("notes.md")).unwrap(),
+        "written while the guest worked\n",
+        "and the host's unrelated edit survives it"
+    );
+}
+
+/// The tree hash the guest reports is checked against the objects actually
+/// fetched, so what lands on the host is *proven* to be what the guest published
+/// — not merely what it claimed. Same reasoning as the forward sync's tree-hash
+/// verify, in the direction that writes to the user's own files.
+#[test]
+fn a_writeback_whose_tree_is_not_what_was_fetched_is_refused() {
+    let repos = setup();
+    let base = sync(&repos);
+
+    write(&repos.guest, "src/main.rs", "fn main() { /* guest */ }\n");
+    let mut wb = guest::tree(repos.guest.to_str().unwrap()).unwrap();
+    // A tree hash that is neither the base's nor the one the guest published.
+    wb.tree = "0000000000000000000000000000000000000000".to_string();
+
+    let err = host::apply_writeback(&repos.host, repos.guest.to_str().unwrap(), &base, &wb, None)
+        .expect_err("a writeback that does not match its objects must be refused");
+    assert!(
+        err.to_string().contains("writeback mismatch"),
+        "the error has to name the cause: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(repos.host.join("src/main.rs")).unwrap(),
+        "fn main() {}\n",
+        "nothing may be applied from a writeback that failed its check"
+    );
+}
+
 #[test]
 #[cfg(unix)] // hook script; the bypass logic itself is platform-independent
 fn sync_push_skips_pre_push_hooks() {

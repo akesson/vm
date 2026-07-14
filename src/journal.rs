@@ -303,6 +303,40 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Print a line to the terminal, tolerating a reader that has gone away.
+///
+/// A closed pipe downstream is not vm failing — it is the reader saying
+/// "enough". `vm doctor | grep -q prlctl` closes the pipe the moment grep
+/// matches, while vm is still writing. Rust ignores SIGPIPE, so that arrives as
+/// an `EPIPE` *write error*, and `println!`/`eprintln!` panic on write errors:
+/// vm died with exit 101 and printed nothing at all to say why, the panic
+/// message going to the very pipe that had just closed (#36).
+///
+/// The SIGPIPE disposition is deliberately left as Rust sets it. Two places
+/// depend on a broken pipe arriving as an error rather than as a signal:
+/// [`crate::exec::host`]'s heartbeat thread, which learns the transport is gone
+/// by writing to it, and [`crate::exec::guest`]'s `feed_stdin`. Restoring
+/// `SIG_DFL` would fix the panic by killing the process instead — and take those
+/// with it.
+///
+/// Nothing else that goes wrong writing here is reportable either: the channel
+/// vm would report it on is the one that just failed.
+fn print_line(mut out: impl std::io::Write, line: &str) {
+    let _ = writeln!(out, "{line}");
+}
+
+/// Print to stderr — vm's own channel: breadcrumbs, notes, errors.
+pub fn to_stderr(line: &str) {
+    print_line(std::io::stderr().lock(), line);
+}
+
+/// Print to stdout, which stays the command's own everywhere except the handful
+/// of verbs whose output *is* the answer (`vm ls`'s table, the guest verbs'
+/// protocol replies). `vm ls | head -1` closes it on the second row.
+pub fn to_stdout(line: &str) {
+    print_line(std::io::stdout().lock(), line);
+}
+
 /// Print a progress breadcrumb: to stderr unless `--quiet`, and to the journal
 /// always. For narration — what vm is doing and how long it took.
 #[macro_export]
@@ -310,20 +344,20 @@ macro_rules! crumb {
     ($($arg:tt)*) => {{
         let line = format!($($arg)*);
         if !$crate::journal::quiet() {
-            eprintln!("{line}");
+            $crate::journal::to_stderr(&line);
         }
         $crate::journal::emit(&line);
     }};
 }
 
 /// Print something the user has to act on — a `vm ▸ note:`, a `WARNING:`, a
-/// command that was not found, a fatal error. Always reaches stderr, `--quiet`
-/// or not: quiet suppresses narration, never news.
+/// command that was not found, a fatal error, a `vm doctor` verdict. Always
+/// reaches stderr, `--quiet` or not: quiet suppresses narration, never news.
 #[macro_export]
 macro_rules! notice {
     ($($arg:tt)*) => {{
         let line = format!($($arg)*);
-        eprintln!("{line}");
+        $crate::journal::to_stderr(&line);
         $crate::journal::emit(&line);
     }};
 }

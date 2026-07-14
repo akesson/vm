@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -54,11 +55,24 @@ pub fn guest_repo_path(work_root: &str, repo_name: &str) -> String {
 /// `/` that git-receive-pack on Windows cannot resolve); home-relative paths
 /// simply drop the `~/` (scp-style paths resolve relative to $HOME).
 pub fn ssh_remote_url(user: &str, host: &str, guest_repo_path: &str) -> String {
+    let host = url_host(host);
     let path = guest_repo_path.replace('\\', "/");
     match path {
         p if p.starts_with("~/") => format!("{user}@{host}:{}", &p[2..]),
         p if p.starts_with('/') => format!("ssh://{user}@{host}{p}"),
         p => format!("{user}@{host}:{p}"), // e.g. "C:/work/repo"
+    }
+}
+
+/// A host as it must appear inside a git remote. An IPv6 literal has to be
+/// bracketed: scp-style syntax splits host from path on the *first* colon, so
+/// a bare `fdb2:2c26:…` reads as the host `fdb2` and ssh tries to resolve it
+/// (#35). Only a literal can contain a colon — no hostname or IPv4 does.
+fn url_host(host: &str) -> Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        Cow::Owned(format!("[{host}]"))
+    } else {
+        Cow::Borrowed(host)
     }
 }
 
@@ -134,6 +148,35 @@ mod tests {
         assert_eq!(
             ssh_remote_url("henrik", "mac-vm.local", "/Users/henrik/work/vm"),
             "ssh://henrik@mac-vm.local/Users/henrik/work/vm"
+        );
+    }
+
+    /// scp-style syntax splits host from path on the *first* colon, so a bare
+    /// IPv6 literal reads as host `fdb2` and ssh tries to resolve it (#35). A
+    /// guest reached over IPv6 — a configured `host`, now that `ip()` only ever
+    /// returns IPv4 — must be merely unusual, not broken.
+    #[test]
+    fn remote_urls_bracket_ipv6_hosts() {
+        assert_eq!(
+            ssh_remote_url(
+                "hakesson",
+                "fdb2:2c26:f4e4:0:357:80a2:89e0:6574",
+                "~/work/vm"
+            ),
+            "hakesson@[fdb2:2c26:f4e4:0:357:80a2:89e0:6574]:work/vm"
+        );
+        assert_eq!(
+            ssh_remote_url("hakesson", "fdb2::5", r"C:\work\vm"),
+            "hakesson@[fdb2::5]:C:/work/vm"
+        );
+        assert_eq!(
+            ssh_remote_url("henrik", "fdb2::5", "/Users/henrik/work/vm"),
+            "ssh://henrik@[fdb2::5]/Users/henrik/work/vm"
+        );
+        // An already-bracketed host is not bracketed twice.
+        assert_eq!(
+            ssh_remote_url("h", "[fdb2::5]", "~/work/vm"),
+            "h@[fdb2::5]:work/vm"
         );
     }
 }

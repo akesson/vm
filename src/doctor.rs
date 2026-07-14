@@ -18,21 +18,21 @@ struct Report {
 
 impl Report {
     fn ok(&mut self, what: &str, detail: &str) {
-        eprintln!("  ✓ {what}: {detail}");
+        notice!("  ✓ {what}: {detail}");
     }
     fn fail(&mut self, what: &str, detail: &str) {
         self.failures += 1;
-        eprintln!("  ✗ {what}: {detail}");
+        notice!("  ✗ {what}: {detail}");
     }
     fn skip(&mut self, what: &str, detail: &str) {
-        eprintln!("  - {what}: {detail}");
+        notice!("  - {what}: {detail}");
     }
 }
 
 pub fn doctor(alias: Option<&str>) -> Result<i32> {
     let mut r = Report { failures: 0 };
 
-    eprintln!("host");
+    notice!("host");
     let vms = match prl::list_all() {
         Ok(vms) => {
             r.ok("prlctl", &format!("{} VMs registered", vms.len()));
@@ -108,7 +108,7 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
         if alias.is_some_and(|a| a != name) {
             continue;
         }
-        eprintln!("{name} ({})", vm.parallels_name);
+        notice!("{name} ({})", vm.parallels_name);
         let Some(prl_vm) = vms.iter().find(|p| p.name == vm.parallels_name) else {
             r.fail("vm", "not registered in Parallels (`prlctl list -a`)");
             continue;

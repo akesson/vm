@@ -3,7 +3,7 @@ mod cli;
 use anyhow::Result;
 use clap::Parser;
 use vm::exec::host::ExecOptions;
-use vm::{commands, deploy, doctor, exec, notice, proto, sync};
+use vm::{commands, deploy, doctor, exec, journal, notice, proto, sync};
 
 impl From<cli::ExecOpts> for ExecOptions {
     fn from(opts: cli::ExecOpts) -> ExecOptions {
@@ -96,7 +96,7 @@ fn run(cli: cli::Cli) -> Result<i32> {
 
         // Guest-side plumbing verbs (invoked by a host `vm` over ssh)
         GuestVersion => {
-            println!("{}", serde_json::to_string(&proto::VersionInfo::current())?);
+            journal::to_stdout(&serde_json::to_string(&proto::VersionInfo::current())?);
             Ok(0)
         }
         GuestSyncInit { repo } => {
@@ -104,17 +104,17 @@ fn run(cli: cli::Cli) -> Result<i32> {
             Ok(0)
         }
         GuestSyncApply { repo, sha } => {
-            println!("{}", sync::guest::apply(&repo, &sha)?);
+            journal::to_stdout(&sync::guest::apply(&repo, &sha)?);
             Ok(0)
         }
         GuestTree { repo } => {
             let snap = sync::guest::tree(&repo)?;
-            println!("{}", serde_json::to_string(&snap)?);
+            journal::to_stdout(&serde_json::to_string(&snap)?);
             Ok(0)
         }
         GuestFirstSync { repo, cmd } => exec::guest::first_sync(&repo, &cmd),
         GuestIdle => {
-            println!("{}", vm::idle::guest_idle_ms()?);
+            journal::to_stdout(&vm::idle::guest_idle_ms()?.to_string());
             Ok(0)
         }
 

@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::exit::usage;
 use crate::ssh::SshTarget;
-use crate::{crumb, lock, mapping, notice, prl, ssh, sync};
+use crate::{crumb, journal, lock, mapping, notice, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -220,7 +220,7 @@ pub fn ls() -> Result<i32> {
     }
     let widths = column_widths(&rows);
     for row in &rows {
-        println!("{}", format_row(row, &widths));
+        journal::to_stdout(&format_row(row, &widths));
     }
     Ok(0)
 }
