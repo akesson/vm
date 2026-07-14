@@ -1,6 +1,6 @@
 //! Guest input-idle probe: how long since the last keyboard/mouse input at
 //! the guest's console. Reap consults it so a VM being used manually through
-//! the Parallels GUI (invisible to the lock files) is not suspended mid-use.
+//! the Parallels GUI (invisible to the lock files) is not shut down mid-use.
 //!
 //! Guest side: the hidden `vm _idle` verb prints milliseconds since the last
 //! input event. Host side: `input_idle` invokes it over the same transports

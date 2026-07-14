@@ -11,10 +11,10 @@ use vm::guest_env::GuestEnv;
 /// files excluded. Builds run on guest-local disk: no shared folders, no
 /// cross-platform artifact conflicts.
 ///
-/// VM lifecycle takes care of itself: any command that needs a guest starts or
-/// resumes it first (a resume takes about a second, and vm says what it is
-/// waiting for), and `vm reap` suspends VMs nobody is using. There is nothing
-/// to start or stop by hand.
+/// VM lifecycle takes care of itself: any command that needs a guest starts it
+/// first (a boot takes seconds, and vm says what it is waiting for), and
+/// `vm reap` shuts down VMs nobody is using. There is nothing to start or stop
+/// by hand.
 #[derive(Parser)]
 #[command(name = "vm", version, about, max_term_width = 100)]
 pub struct Cli {
@@ -81,8 +81,8 @@ pub enum Command {
     /// the host tree (writeback) when it finishes. Requires the claude CLI
     /// installed and authenticated in the guest (`vm doctor` verifies).
     Claude(ClaudeArgs),
-    /// Suspend VMs that no vm process is using and that have been idle a while
-    /// (any `vm exec` resumes them in about a second)
+    /// Shut down VMs that no vm process is using and that have been idle a
+    /// while (any `vm exec` boots them again)
     Reap {
         /// Only consider this VM (default: all configured VMs)
         alias: Option<String>,
@@ -284,7 +284,7 @@ mod tests {
     }
 
     /// `vm start` and `vm stop` are gone. Every command that needs a guest brings
-    /// it up itself, and `vm reap` suspends the ones nobody is using — so the two
+    /// it up itself, and `vm reap` shuts down the ones nobody is using — so the two
     /// verbs did nothing a caller had to do, while implying they were a step one
     /// had to remember. Pinned so they cannot quietly come back: a `start` in the
     /// help text is an instruction to use it.

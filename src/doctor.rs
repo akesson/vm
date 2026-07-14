@@ -77,7 +77,7 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
     } else {
         r.skip(
             "reap timer",
-            "not installed — `vm reap --install` auto-suspends idle VMs",
+            "not installed — `vm reap --install` shuts down idle VMs",
         );
     }
 
@@ -113,7 +113,7 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
         }
         // Named VM that is down: bring it up, since the caller asked about this
         // one and the live checks are the point. The use lock keeps reap from
-        // suspending it again while we are checking it.
+        // shutting it down again while we are checking it.
         let _use;
         let target = if prl_vm.status == "running" {
             r.ok("status", "running");
@@ -254,21 +254,23 @@ fn claude_checks(r: &mut Report, target: &ssh::SshTarget) {
     }
 }
 
-/// Reap asks the guest agent for input idle before suspending, so manual GUI
-/// use is protected; verify that probe works. On Windows this exercises the
-/// console transport (GetLastInputInfo is per-session).
+/// Reap asks the guest agent for input idle before shutting down, so manual
+/// GUI use is protected; verify that probe works. On Windows this exercises
+/// the console transport (GetLastInputInfo is per-session).
 fn idle_checks(r: &mut Report, name: &str, vm: &VmConfig) {
     match crate::idle::input_idle(vm) {
         Ok(idle) => r.ok(
             "input idle",
             &format!(
-                "{}m — reap won't suspend while you're at the console",
+                "{}m — reap won't shut down while you're at the console",
                 idle.as_secs() / 60
             ),
         ),
         Err(err) => r.fail(
             "input idle",
-            &format!("{err:#} — reap will suspend regardless of console use (`vm deploy {name}`?)"),
+            &format!(
+                "{err:#} — reap will shut down regardless of console use (`vm deploy {name}`?)"
+            ),
         ),
     }
 }

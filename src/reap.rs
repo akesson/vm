@@ -1,18 +1,19 @@
-//! `vm reap` — suspend VMs that nobody is using.
+//! `vm reap` — shut down VMs that nobody is using.
 //!
 //! For each configured (or the named) VM: skip it while any `vm` process
 //! holds a use on it, skip it inside the idle window, skip it while someone
 //! is at its console (guest input idle below the window — manual GUI use
-//! leaves no trace in the lock files), otherwise suspend it. The console
+//! leaves no trace in the lock files), otherwise shut it down. The console
 //! probe fails open: reclaiming RAM stays guaranteed, and a wrongly
-//! suspended VM costs one resume (a few seconds).
+//! stopped VM costs one boot (seconds).
 //!
 //! Idleness is measured from the per-VM lock file, which only `vm` touches —
-//! so a VM resumed by hand (`prlctl resume`) still looks idle here and gets
-//! suspended at the next sweep. That is working as intended, but it is worth
-//! knowing when a hand-resumed VM goes back down on its own.
-//! Suspend, not stop: it frees the VM's host RAM, and the next `vm exec`
-//! resumes in about a second instead of paying a full boot.
+//! so a VM started by hand (`prlctl start`) still looks idle here and gets
+//! shut down at the next sweep. That is working as intended, but it is worth
+//! knowing when a hand-started VM goes back down on its own.
+//! Stop, not suspend: reap used to suspend, until suspension proved the
+//! unreliable half of the pair — see [`prl::stop`] for what went wrong. A
+//! boot costs seconds more than a resume, and that is the whole price.
 //!
 //! Meant to run from a launchd interval job (`vm reap --install`); no
 //! long-running daemon of our own.
@@ -64,12 +65,12 @@ pub fn reap(alias: Option<&str>, idle_minutes: u64) -> Result<i32> {
             }
             Ok(_) => {}
             Err(err) => eprintln!(
-                "vm ▸ reap ▸ {name} input-idle probe failed ({err:#}) — suspending anyway"
+                "vm ▸ reap ▸ {name} input-idle probe failed ({err:#}) — shutting down anyway"
             ),
         }
-        prl::suspend(&vm.parallels_name)?;
+        prl::stop(&vm.parallels_name)?;
         eprintln!(
-            "vm ▸ reap ▸ {name} suspended after {}m idle (any `vm exec` resumes it)",
+            "vm ▸ reap ▸ {name} shut down after {}m idle (any `vm exec` boots it)",
             idle.as_secs() / 60
         );
     }
@@ -77,7 +78,7 @@ pub fn reap(alias: Option<&str>, idle_minutes: u64) -> Result<i32> {
 }
 
 pub const LAUNCHD_LABEL: &str = "com.akesson.vm.reap";
-/// Sweep every 5 minutes; with the default 30m idle window a VM is suspended
+/// Sweep every 5 minutes; with the default 30m idle window a VM is shut down
 /// at most ~35m after its last use.
 const LAUNCHD_INTERVAL_SECS: u32 = 300;
 
@@ -128,7 +129,7 @@ pub fn install(idle_minutes: u64) -> Result<i32> {
     let _ = launchctl(&["bootout", &gui_domain_target()]);
     launchctl(&["bootstrap", &gui_domain(), &path.display().to_string()])?;
     eprintln!(
-        "vm ▸ reap ▸ launchd job {LAUNCHD_LABEL} installed: every {}m, suspend VMs idle ≥{idle_minutes}m\n\
+        "vm ▸ reap ▸ launchd job {LAUNCHD_LABEL} installed: every {}m, shut down VMs idle ≥{idle_minutes}m\n\
          vm ▸ reap ▸ runs {exe} — reinstall after moving the binary (`vm reap --install`)",
         LAUNCHD_INTERVAL_SECS / 60,
     );
