@@ -141,13 +141,20 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
     // Checked before the timeout: it is the more specific diagnosis, and the
     // one whose advice is actionable.
     if is_off(status) && waited >= TRANSITION_GRACE {
+        // The advice has to match the state it is advice about: a stopped VM
+        // resumes to an error, and a suspended one starts to one.
+        let verb = if status == "stopped" {
+            "start"
+        } else {
+            "resume"
+        };
         return Step::Fail(format!(
             "VM '{name}' is {status} {}s after vm asked Parallels to bring it up, so it \
              will never report an IP.\n  \
              Either the start/resume did not take effect, or something put the VM back \
-             down while vm was waiting for it (`vm reap`, or a suspend from the Parallels \
-             GUI).\n  \
-             `prlctl list -a` shows the current state; `prlctl resume \"{name}\"` brings \
+             down while vm was waiting for it (`vm reap`, or a stop/suspend from the \
+             Parallels GUI).\n  \
+             `prlctl list -a` shows the current state; `prlctl {verb} \"{name}\"` brings \
              it up by hand.",
             waited.as_secs()
         ));
@@ -170,7 +177,7 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
 /// running can never report one — so sitting out the full timeout on a
 /// suspended VM buys nothing but a 90-second delay in front of a wrong answer
 /// ("the guest may still be booting"). And a VM can be down here even though
-/// `ensure_running` just brought it up: `vm reap` or a suspend from the
+/// `ensure_running` just brought it up: `vm reap` or a stop/suspend from the
 /// Parallels GUI can put it back down while this loop is waiting on it.
 fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
     let start = Instant::now();
@@ -281,12 +288,19 @@ pub fn is_session_not_ready(stderr: &str) -> bool {
     stderr.contains("Unable to open new session")
 }
 
-/// Suspend (RAM image to disk; [`ensure_running`] resumes in ~1s). Reap
-/// plumbing only — suspending is the *only* way vm ever puts a VM down, and it
-/// does so on its own schedule, so there is deliberately no `vm suspend` and no
-/// `vm stop`. A full power-off is a Parallels-level operation (`prlctl stop`).
-pub fn suspend(name: &str) -> Result<()> {
-    prlctl(&["suspend", name]).map(drop)
+/// Graceful shutdown via Parallels Tools ([`ensure_running`] boots it again).
+/// Reap plumbing only — stopping is the *only* way vm ever puts a VM down, and
+/// it does so on its own schedule, so there is deliberately no `vm stop` and no
+/// `vm suspend`.
+///
+/// Stop rather than suspend: suspension proved unreliable on this stack — a
+/// macOS guest's saved state can be one Parallels itself refuses to restore
+/// (VZErrorDomain 12, and the "cannot restore" question is unanswerable
+/// headless, leaving the VM stuck), and guests have re-suspended themselves
+/// right after a resume. A saved state that will not restore is a VM that
+/// cannot be used at all; a boot is seconds slower and always works.
+pub fn stop(name: &str) -> Result<()> {
+    prlctl(&["stop", name]).map(drop)
 }
 
 /// Existing snapshots as (id, name) pairs.
@@ -591,7 +605,14 @@ mod tests {
             // The two causes seen in the wild, and the way out of both.
             assert!(msg.contains("did not take effect"), "{msg}");
             assert!(msg.contains("vm reap"), "{msg}");
-            assert!(msg.contains(r#"prlctl resume "macOS""#), "{msg}");
+            // The way out must fit the state: `prlctl resume` on a stopped VM
+            // is itself an error.
+            let verb = if status == "stopped" {
+                "start"
+            } else {
+                "resume"
+            };
+            assert!(msg.contains(&format!(r#"prlctl {verb} "macOS""#)), "{msg}");
         }
     }
 

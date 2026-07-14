@@ -49,13 +49,13 @@ vm ls
 ## VM lifecycle
 
 A VM being down is not a state you have to fix before you can use it — it is a
-VM one second away from being up. So every command that needs a guest (`exec`,
-`sync`, `claude`, `deploy`, `clean`, `shot`, and `doctor <alias>`) starts or
-resumes it, and says so:
+VM a short boot away from being up. So every command that needs a guest (`exec`,
+`sync`, `claude`, `deploy`, `clean`, `shot`, and `doctor <alias>`) starts it,
+and says so:
 
 ```
-vm ▸ linux ▸ 'Ubuntu 24.04' is suspended — resuming it…
-vm ▸ linux ▸ ready at 10.211.55.4 ▸ 3.0s
+vm ▸ linux ▸ 'Ubuntu 24.04' is stopped — starting it…
+vm ▸ linux ▸ ready at 10.211.55.4 ▸ 10.5s
 ```
 
 A VM that is already running prints neither line — silence means there was
@@ -63,15 +63,17 @@ nothing to wait for. A long wait is narrated as it goes (`vm ▸ macos ▸ 'macO
 running, no IP yet — 10s of 90s`), and a VM that is not coming up at all fails
 in ~15s rather than sitting out the full timeout.
 
-The other half is `vm reap`, which **suspends** VMs that no vm process is using
-and that have been idle a while (30m by default; `vm reap --install` runs it
-every 5 minutes from launchd). It leaves a VM alone while someone is typing at
-its console, so a guest you are driving by hand in the Parallels GUI is not
+The other half is `vm reap`, which **shuts down** VMs that no vm process is
+using and that have been idle a while (30m by default; `vm reap --install` runs
+it every 5 minutes from launchd). It leaves a VM alone while someone is typing
+at its console, so a guest you are driving by hand in the Parallels GUI is not
 pulled out from under you.
 
 Between the two, VM lifecycle is never a step anyone has to remember — which is
-why the verbs for it do not exist. Suspending is the only way vm puts a VM down;
-a full power-off is a Parallels operation (`prlctl stop`).
+why the verbs for it do not exist. A graceful stop is the only way vm puts a VM
+down. It shuts down rather than suspends: a suspended guest's saved state can
+turn out to be one Parallels itself refuses to restore, which strands the VM
+entirely, while a boot is only seconds slower and always works.
 
 ## Targets
 
@@ -161,8 +163,8 @@ vm run macos --elevated -- sh < maintenance.sh   # a script, on stdin
 
 It works from anywhere — no git repo required — and takes the same command forms
 as exec (several arguments are an argv; one argument is a script for the guest's
-shell). It holds the same use-lock as exec, so `vm reap` will not suspend a guest
-out from under a long `apt-get upgrade`.
+shell). It holds the same use-lock as exec, so `vm reap` will not shut a guest
+down out from under a long `apt-get upgrade`.
 
 **`--elevated`** runs as **root** (linux/macos) or **SYSTEM** (windows) through
 Parallels Tools. It is the only elevation there is: `sudo` over ssh wants a

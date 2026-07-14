@@ -26,7 +26,7 @@ vm ls                                   # aliases, OS, status (works outside a g
 
 That is all the setup there is. **Do not resume guests, poll for IPs, or touch
 lock files** — `vm run` brings a guest up itself, says so, and holds the VM's use
-lock for the whole command, so `vm reap` cannot suspend one mid-sweep. Aliases are
+lock for the whole command, so `vm reap` cannot shut one down mid-sweep. Aliases are
 `linux`, `macos`, `windows`.
 
 ## 2. The two channels

@@ -66,7 +66,7 @@ pub fn run(alias: &str, opts: &RunOptions) -> Result<i32> {
     let vm = cfg.get(alias)?;
 
     // Registers this run as a use of the VM, exactly as exec does, so reap
-    // cannot suspend the guest out from under a long `apt-get upgrade`.
+    // cannot shut the guest down out from under a long `apt-get upgrade`.
     let _use = crate::lock::shared(alias)?;
 
     let transport = if opts.elevated {

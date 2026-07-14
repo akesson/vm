@@ -105,7 +105,7 @@ vm run <alias> -- sh < step.sh # stdin DOES travel here (≤8 MiB text) — this
                                # a script reaches an elevated guest. Exit code is the
                                # script's own
 vm sync <alias>                # sync only (--with-file works here too)
-vm reap [alias] [--idle-minutes N]  # suspend VMs idle ≥N min (default 30) and not in
+vm reap [alias] [--idle-minutes N]  # shut down VMs idle ≥N min (default 30) and not in
                                     # use; --install/--uninstall manage a launchd job
                                     # that runs it every 5 min (--install bakes in the
                                     # --idle-minutes you pass alongside it)
@@ -126,18 +126,19 @@ vm clean <alias>               # delete the guest checkout of this repo (next sy
 
 **There is no `vm start` and no `vm stop` — never go looking for them.** VM
 lifecycle is not your problem: every command that needs a guest (`exec`, `sync`,
-`claude`, `deploy`, `clean`, `shot`, `doctor <alias>`) starts or resumes the VM
-itself and tells you it is doing so, and `vm reap` suspends VMs nobody is using.
-So a suspended VM is not a blocker to clear first — just run the command you
-actually wanted:
+`claude`, `deploy`, `clean`, `shot`, `doctor <alias>`) starts the VM itself and
+tells you it is doing so, and `vm reap` shuts down VMs nobody is using. So a
+stopped VM is not a blocker to clear first — just run the command you actually
+wanted:
 
 ```
-vm ▸ linux ▸ 'Ubuntu 24.04' is suspended — resuming it…
-vm ▸ linux ▸ ready at 10.211.55.4 ▸ 3.0s
+vm ▸ linux ▸ 'Ubuntu 24.04' is stopped — starting it…
+vm ▸ linux ▸ ready at 10.211.55.4 ▸ 10.5s
 ```
 
-A resume is ~1–3s (a cold macOS boot is longer). A VM that is already running
-prints none of this — silence there means there was nothing to wait for.
+A cold boot to ready is ~10–15s on all three guests (measured 2026-07-14). A VM
+that is already running prints none of this — silence there means there was
+nothing to wait for.
 
 **`vm` executes in a VM by default — never on the host.** Even `vm exec macos`
 on a macOS host goes to the macOS VM. The one opt-in exception is
@@ -278,8 +279,8 @@ on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and co
 ## Gotchas
 
 - Nothing to clean up when you're done: you never started a VM, so don't try to
-  put one away. The reap timer suspends idle VMs on its own, and the next
-  command resumes whatever it needs. Parallel `vm` invocations are safe: uses
+  put one away. The reap timer shuts down idle VMs on its own, and the next
+  command boots whatever it needs. Parallel `vm` invocations are safe: uses
   hold a shared per-VM lock, so `--with-snapshot`/reap won't fire while another
   vm process is using the VM. Parallel `vm exec` of the *same* repo to the
   *same* guest (e.g. a `mise` fan-out) is safe too — the syncs serialize behind
@@ -287,9 +288,9 @@ on. Paste the failing `vm ▸ …` breadcrumb line — it names the guest and co
   than racing on the shared git snapshot.
 - A wait for a VM is never silent: the wake is announced, past 10s vm prints
   where it has got to (`vm ▸ macos ▸ 'macOS' running, no IP yet — 10s of 90s`),
-  and readiness closes it out. If a VM is not coming up at all — a resume that
-  Parallels reported as successful but did not perform, or something suspending
-  it again underneath — vm says so within ~15s (exit 125) instead of waiting the
+  and readiness closes it out. If a VM is not coming up at all — a start that
+  Parallels reported as successful but did not perform, or something putting it
+  back down underneath — vm says so within ~15s (exit 125) instead of waiting the
   guest out. `vm ls` shows every VM's status and IP, so a wait can be watched
   from another terminal.
 - A lone path with a **space in its filename** is the one place the one-argument

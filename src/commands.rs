@@ -51,11 +51,11 @@ pub fn ssh_target(vm: &VmConfig) -> Result<SshTarget> {
 /// This is why there is no `vm start`: a VM that is down is not an error state a
 /// caller has to resolve first, it is a VM one second away from being up, and
 /// the command that wants it says so and waits (see [`prl::ensure_up`]). The
-/// mirror image is `vm reap`, which suspends VMs nobody is using — together they
-/// mean VM lifecycle is never something a caller has to think about.
+/// mirror image is `vm reap`, which shuts down VMs nobody is using — together
+/// they mean VM lifecycle is never something a caller has to think about.
 ///
 /// The caller is responsible for holding the VM's use lock (`lock::shared`)
-/// across the work that follows, so reap cannot suspend the VM back out from
+/// across the work that follows, so reap cannot shut the VM down out from
 /// under it.
 pub fn bring_up(alias: &str, vm: &VmConfig) -> Result<SshTarget> {
     let started = Instant::now();
