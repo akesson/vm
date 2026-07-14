@@ -33,7 +33,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      # Released binaries are built by the compiler the repo names, not by
+      # whatever `stable` meant on the day of the tag: rust-toolchain.toml
+      # decides, and the rustup on every runner image installs it.
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
       - name: Package
