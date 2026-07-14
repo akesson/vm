@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs};
 use crate::proto::{PROTO_VERSION, VersionInfo};
 use crate::ssh::SshTarget;
-use crate::{commands, mapping, ssh, sync};
+use crate::{commands, mapping, prldnd, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -53,6 +53,15 @@ pub fn deploy(alias: &str) -> Result<i32> {
         "vm ▸ {alias} ▸ agent v{} (proto v{}) installed",
         info.binary, info.proto
     );
+
+    // Deploy is where a guest gets provisioned, and this is the other thing a
+    // usable linux guest needs: without it every shutdown takes ~95s and lands
+    // 20s short of Parallels' 120s force-kill (see `crate::prldnd`). A failure
+    // here is fatal rather than a warning — a guest that quietly kept the hang
+    // would look deployed and behave like a hazard.
+    if vm.os == GuestOs::Linux {
+        prldnd::install(alias, vm)?;
+    }
     Ok(0)
 }
 

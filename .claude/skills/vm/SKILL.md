@@ -115,7 +115,9 @@ vm claude <alias> "<prompt>" [claude flags…]  # headless `claude -p` in the gu
                                      # (--no-writeback opts out); --with-snapshot
                                      # rolls the guest back afterwards; -e forwards
                                      # env vars. vm's own flags go BEFORE the prompt
-vm deploy <alias>              # rebuild + install the guest agent (after vm src changes)
+vm deploy <alias>              # rebuild + install the guest agent (after vm src changes).
+                               # On linux it also installs the systemd unit that keeps a
+                               # graceful stop from taking ~95s (see src/prldnd.rs)
 vm doctor [alias]              # check prlctl/config/ssh/agent/git per guest. Naming an
                                # alias brings that VM up and runs the live checks; the
                                # bare form surveys all VMs and skips the ones that are
