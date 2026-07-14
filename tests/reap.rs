@@ -153,6 +153,11 @@ fn a_console_probe_that_fails_shuts_the_vm_down_but_never_quietly() {
 /// The lock is held here on the file itself, which is what a `vm exec` holds for
 /// the whole of its life (shared, where this is exclusive — reap's attempt is
 /// non-blocking and fails against either, and it is reap's attempt under test).
+///
+/// Unix-only, like `tests/sync_race.rs`: the lock is an flock, and vm's host half
+/// runs on macOS. In the Windows build — which is the guest agent, and never reaps
+/// anything — `crate::lock` is a no-op by construction.
+#[cfg(unix)]
 #[test]
 fn a_vm_in_use_is_never_reaped() {
     let fake = Fake::new("windows");

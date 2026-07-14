@@ -51,6 +51,11 @@ fn two_execs_on_one_guest_run_at_the_same_time() {
 ///
 /// The exec here is a real one, holding its real lock, for as long as its guest
 /// command runs.
+///
+/// Unix-only, like `tests/sync_race.rs`: the lock is an flock, and vm's host half
+/// runs on macOS. In the Windows build — the guest agent — `crate::lock` is a
+/// no-op by construction, so there would be nothing here to test.
+#[cfg(unix)]
 #[test]
 fn reap_cannot_take_a_guest_out_from_under_a_running_exec() {
     let fake = Fake::new("windows");
