@@ -143,7 +143,11 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
     if is_off(status) && waited >= TRANSITION_GRACE {
         // The advice has to match the state it is advice about: a stopped VM
         // resumes to an error, and a suspended one starts to one.
-        let verb = if status == "stopped" { "start" } else { "resume" };
+        let verb = if status == "stopped" {
+            "start"
+        } else {
+            "resume"
+        };
         return Step::Fail(format!(
             "VM '{name}' is {status} {}s after vm asked Parallels to bring it up, so it \
              will never report an IP.\n  \
@@ -603,7 +607,11 @@ mod tests {
             assert!(msg.contains("vm reap"), "{msg}");
             // The way out must fit the state: `prlctl resume` on a stopped VM
             // is itself an error.
-            let verb = if status == "stopped" { "start" } else { "resume" };
+            let verb = if status == "stopped" {
+                "start"
+            } else {
+                "resume"
+            };
             assert!(msg.contains(&format!(r#"prlctl {verb} "macOS""#)), "{msg}");
         }
     }
