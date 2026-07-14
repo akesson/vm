@@ -372,7 +372,7 @@ runners:
 ```toml
 # mise.toml
 [tools]
-"ubi:akesson/vm" = "0.1.0"   # pin it: CI stays reproducible, and a release is one git tag
+"ubi:akesson/vm" = "0.2.0"   # pin it: CI stays reproducible, and a release is one git tag
 ```
 
 A `[tools]` entry shadows any `vm` already on PATH — including a
