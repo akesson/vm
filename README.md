@@ -317,6 +317,22 @@ long after the host is gone, which is how a killed `vm run --elevated macos`
 used to leave its command running forever — so there the silence is the news,
 and the tree comes down within the minute instead.
 
+**A killed `vm run --elevated macos` leaves a wake**, and it is worth knowing the
+shape of it. Parallels frees the host-side session immediately but leaves the
+guest's stdin open, so the orphaned agent lives out its silence budget and only
+then tears down — and a minute after *that*, Parallels fires a delayed cleanup
+retry for the session it already forgot. The retry closes the stdin of whichever
+session now holds the slot. A run started in the ~60s between those two events
+therefore dies with an **exit 130** it never earned, up to a minute in, while
+behaving perfectly. Re-run it: a run started before the teardown or after the
+retry is safe. It is a Parallels bug on the macOS guest (the Windows console
+channel is unaffected), and not one vm can absorb — once that pipe is closed no
+more keepalives arrive, so the silence budget would end the run anyway. To tell
+it from a real Ctrl-C, look for a `Failed to find guest exec session` line in
+`~/Parallels/macOS.macvm/parallels.log` within milliseconds of the death; an
+interrupt you actually sent leaves none. See
+[#27](https://github.com/akesson/vm/issues/27).
+
 So `echo hi | vm exec linux -- 'cat > f'` writes an empty file and
 exits 0 — vm prints a `vm ▸ note:` when it sees input wired into its stdin, so
 that near-miss is never silent. To feed an exec'd command data, put it in a file
