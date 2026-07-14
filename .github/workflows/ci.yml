@@ -18,9 +18,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain action: rust-toolchain.toml names the version and its
+      # components, and the rustup every runner image ships installs it on the
+      # first cargo call. Pinning it here as well would be a second source of
+      # truth that the file silently wins against.
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -35,9 +36,10 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
+      # Coverage-only, so it is not in rust-toolchain.toml's components — every
+      # guest and contributor would pay for it. Added to the pinned toolchain
+      # rather than to whichever one rustup happens to default to.
+      - run: rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
