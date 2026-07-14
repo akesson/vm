@@ -16,6 +16,12 @@
 //! with it. Every check here is therefore biased hard toward silence — a missed
 //! note leaves the reader exactly where they were, while a false one costs the
 //! channel. Nothing else fires.
+//!
+//! The fifth pair ([`path_searched`], [`half_posix_path_note`]) pays no premium
+//! into that budget at all: it speaks only once a spawn has already come back
+//! `NotFound`, where the run is over and stderr is the whole product. The first
+//! of the two is not even guesswork — the PATH is a fact vm holds and the reader
+//! does not.
 
 /// Shell operators that are never a command's own argument. No flag takes `&&`
 /// or `2>&1` as its value, so seeing one in exec form is a mistake regardless
@@ -216,6 +222,144 @@ fn spaced_file_prefix(script: &str, is_file: &impl Fn(&str) -> bool) -> Option<u
         // host file once separators are normalized — the host is where we look.
         is_file(candidate) || is_file(&candidate.replace('\\', "/"))
     })
+}
+
+/// How much of one PATH entry prints before it is elided. A half-converted PATH
+/// (see [`half_posix_path_note`]) packs its entire POSIX tail into a *single*
+/// entry — kilobytes of it — and what the reader needs from that entry is its
+/// shape, not its forty-fourth path. Never a silent cut: the count on the line
+/// below it is of the whole thing.
+const ENTRY_WIDTH: usize = 76;
+
+/// The PATH vm was about to search, printed after a spawn came back with the one
+/// failure a PATH fully explains: command not found.
+///
+/// This is the piece of state the reader cannot see and vm can. It is not the
+/// PATH of the shell they are standing in: a guest command searches the agent's
+/// augmented PATH, `--or-native` on a CI runner searches whatever that runner
+/// exported, and `-e PATH=…` overrides either. Printing it is what makes a
+/// not-found a one-minute diagnosis instead of three CI rounds (#25).
+///
+/// Entries no resolver can search are marked `⚠` — see [`is_posix`], which only
+/// ever fires on Windows.
+pub fn path_searched(path: Option<&str>, windows: bool) -> String {
+    let entries = split_path(path.unwrap_or_default(), windows);
+    if entries.is_empty() {
+        // Not pedantry: an empty PATH is itself the whole answer, and it is what
+        // a task that builds a child's environment from scratch tends to hand it.
+        return "vm ▸ the PATH it searched was empty".to_string();
+    }
+    let unusable = entries.iter().filter(|e| e.posix).count();
+    let plural = if entries.len() == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    let mut out = match unusable {
+        0 => format!("vm ▸ the PATH it searched ({} {plural}):", entries.len()),
+        n => format!(
+            "vm ▸ the PATH it searched ({} {plural}, {n} of them unusable):",
+            entries.len()
+        ),
+    };
+    for entry in &entries {
+        if entry.posix {
+            out.push_str(&format!("\n    ⚠ {}", elide(entry.text, ENTRY_WIDTH)));
+            out.push_str(&match posix_paths(entry.text) {
+                1 => "\n      ↑ POSIX form — no Win32 resolver can search it".to_string(),
+                n => format!(
+                    "\n      ↑ POSIX form, colon-joined: {n} paths, none of them searchable \
+                     by a Win32 resolver"
+                ),
+            });
+        } else {
+            out.push_str(&format!("\n      {}", entry.text));
+        }
+    }
+    out
+}
+
+/// The note for a PATH that reached a native Windows process still (partly) in
+/// POSIX form — the failure behind #25, where three converted entries were
+/// followed by the rest of the list as one colon-joined POSIX run. Win32 searches
+/// the three and stops, so a `cargo` that is plainly installed comes back
+/// not-found, and every obvious next move (reinstall it, run `where cargo`, echo
+/// `%PATH%` from a *different* shell) looks fine.
+///
+/// Suggestive about the cause, certain about the fact: that those bytes cannot be
+/// searched needs no theory about whose bug it is, while the trigger — a mise task
+/// with `shell = "bash -c"`, whose Git Bash hands native grandchildren a
+/// half-converted PATH — is the observed source, not a proven one. So it is named
+/// as the usual suspect rather than as the verdict.
+///
+/// `None` on unix, always: a PATH there is POSIX by definition and nothing in it
+/// classifies (see [`split_path`]).
+pub fn half_posix_path_note(path: Option<&str>, windows: bool) -> Option<String> {
+    let entries = split_path(path.unwrap_or_default(), windows);
+    if !entries.iter().any(|e| e.posix) {
+        return None;
+    }
+    Some(format!(
+        "a POSIX PATH reached a native Windows process — nothing on Win32 can search those \
+         entries, so the command was never going to be found there, however well it is \
+         installed.\
+         {INDENT}The usual source is a shell that converts only the head of the list on the \
+         way out: a mise task with `shell = \"bash -c\"` hands its native grandchildren \
+         exactly this.\
+         {INDENT}Run the task without the bash shell, or pass a Windows PATH explicitly with \
+         `-e PATH=…`."
+    ))
+}
+
+/// One entry of a PATH, and whether any resolver can search it.
+struct PathEntry<'a> {
+    text: &'a str,
+    posix: bool,
+}
+
+/// A PATH split the way the *target* platform splits it — `;` on Windows, `:` on
+/// unix — with the unusable entries told apart. Empty entries are dropped: they
+/// name no directory, and a blank line in the report would read as a bug.
+///
+/// The classification is Windows-only by construction. On unix a leading `/` is
+/// simply what a path looks like, and the flag would fire on every entry of every
+/// healthy PATH there is.
+fn split_path(path: &str, windows: bool) -> Vec<PathEntry<'_>> {
+    let sep = if windows { ';' } else { ':' };
+    path.split(sep)
+        .filter(|text| !text.is_empty())
+        .map(|text| PathEntry {
+            text,
+            posix: windows && is_posix(text),
+        })
+        .collect()
+}
+
+/// Whether a Windows PATH entry is really a POSIX one. Two cheap tells, and
+/// neither has to know how the entry got there:
+///
+/// - it starts with `/` — `C:\tools` and `\\host\share` do not;
+/// - it holds a `:` *past* index 1 — a drive letter's colon sits exactly at 1, so
+///   a later one is the POSIX separator, which means `;` never split this entry
+///   and a whole colon-joined run of POSIX paths is hiding inside it.
+fn is_posix(entry: &str) -> bool {
+    entry.starts_with('/') || entry.match_indices(':').any(|(i, _)| i > 1)
+}
+
+/// How many POSIX paths are packed into one unsearchable entry — 1 for a lone
+/// `/c/tools`, and the length of the run for a colon-joined tail.
+fn posix_paths(entry: &str) -> usize {
+    entry.split(':').filter(|p| !p.is_empty()).count()
+}
+
+/// `s` cut to `max` characters, marked `…` whenever anything was cut. Counts
+/// characters, not bytes: a path with an umlaut in it must not get sliced through
+/// a codepoint and panic on the way to reporting someone else's error.
+fn elide(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_string(),
+    }
 }
 
 fn backticked(ops: &[String]) -> String {
@@ -503,6 +647,142 @@ mod tests {
     fn redirected_stdin_names_the_redirect() {
         let note = stdin_note(Some(StdinSource::Redirected)).expect("a note");
         assert!(note.contains("redirected into vm from a file"), "{note}");
+    }
+
+    // ── Advisory 5: the PATH behind a command-not-found ───────────────────────
+
+    /// The PATH off the `windows-latest` runner in #25, trimmed: three converted
+    /// Windows entries, and then the entire rest of the list still in POSIX form
+    /// — which, holding no `;`, survives the split as one entry. `cargo` lives in
+    /// that tail, and Win32 was never going to look there.
+    const HALF_POSIX: &str = r"C:\Program Files\Git\mingw64\bin;C:\Program Files\Git\usr\bin;C:\Users\runneradmin\bin;/c/Program Files/Git/mingw64/bin:/c/Program Files/Git/usr/bin:/c/Users/runneradmin/.cargo/bin";
+
+    /// Every assertion here injects `windows` rather than reading `cfg!(windows)`,
+    /// so the Windows rules are tested on the machine the maintainer is sitting
+    /// at. A `#[cfg(windows)]` on this section would re-create the exact blind
+    /// spot that let #24 ship off a runner nobody was testing on.
+    #[test]
+    fn the_report_lists_the_entries_it_searched() {
+        let report = path_searched(Some("/usr/local/bin:/usr/bin:/bin"), false);
+        assert!(report.contains("(3 entries)"), "{report}");
+        for dir in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            assert!(report.contains(dir), "{dir} missing from: {report}");
+        }
+    }
+
+    #[test]
+    fn a_unix_path_is_never_unusable() {
+        // Every entry starts with `/`. On unix that is not a finding, it is a
+        // PATH — the classifier must not fire on literally every healthy run.
+        let path = "/usr/local/bin:/usr/bin:/bin";
+        assert!(!path_searched(Some(path), false).contains('⚠'), "flagged");
+        assert!(half_posix_path_note(Some(path), false).is_none());
+    }
+
+    #[test]
+    fn a_healthy_windows_path_is_never_unusable() {
+        let path = r"C:\Windows\system32;C:\Users\me\.cargo\bin;\\host\share\bin";
+        let report = path_searched(Some(path), true);
+        assert!(report.contains("(3 entries)"), "{report}");
+        assert!(!report.contains('⚠'), "{report}");
+        assert!(half_posix_path_note(Some(path), true).is_none());
+    }
+
+    #[test]
+    fn a_drive_letters_colon_is_not_a_posix_separator() {
+        // The whole rule rests on this: `C:\tools` carries a colon at index 1,
+        // and only a colon *past* it means the entry is a colon-joined POSIX run.
+        assert!(!is_posix(r"C:\tools"));
+        assert!(!is_posix(r"C:/tools")); // mixed slashes, still a Win32 path
+        assert!(is_posix("/c/tools"));
+        assert!(is_posix("/c/a:/c/b"));
+    }
+
+    #[test]
+    fn a_half_posix_path_is_flagged_counted_and_explained() {
+        let report = path_searched(Some(HALF_POSIX), true);
+        // The headline number is the finding: usable entries, then the rest.
+        assert!(
+            report.contains("(4 entries, 1 of them unusable)"),
+            "{report}"
+        );
+        assert!(
+            report.contains('⚠'),
+            "the POSIX tail is not marked: {report}"
+        );
+        // Its three colon-joined paths are counted, not just shown.
+        assert!(report.contains("colon-joined: 3 paths"), "{report}");
+        // The usable entries still print — the reader has to see what *was*
+        // searched to believe what was not.
+        assert!(report.contains(r"C:\Users\runneradmin\bin"), "{report}");
+    }
+
+    #[test]
+    fn the_note_names_the_trigger_and_both_fixes() {
+        let note = half_posix_path_note(Some(HALF_POSIX), true).expect("a note");
+        assert!(
+            note.contains("POSIX PATH reached a native Windows process"),
+            "{note}"
+        );
+        // The observed trigger, named as the usual source and not as a verdict:
+        // vm cannot prove whose bug it is, only that the PATH is unsearchable.
+        assert!(note.contains("The usual source"), "{note}");
+        assert!(note.contains(r#"shell = "bash -c""#), "{note}");
+        // Both ways out, in the order a reader can act on them.
+        assert!(note.contains("without the bash shell"), "{note}");
+        assert!(note.contains("-e PATH=…"), "{note}");
+    }
+
+    #[test]
+    fn a_lone_posix_entry_is_flagged_without_the_colon_wording() {
+        // One POSIX dir among Windows ones — unsearchable all the same, but there
+        // is no colon-joined run to count, and claiming "1 paths" would be sloppy.
+        let report = path_searched(Some(r"C:\Windows\system32;/usr/bin"), true);
+        assert!(
+            report.contains("(2 entries, 1 of them unusable)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("POSIX form — no Win32 resolver"),
+            "{report}"
+        );
+        assert!(!report.contains("colon-joined"), "{report}");
+    }
+
+    #[test]
+    fn a_giant_posix_run_is_elided_but_its_paths_are_all_counted() {
+        // The real one was kilobytes. The shape is the finding; the count is the
+        // proof — and nothing is cut without the `…` and the number saying so.
+        let tail = (0..60)
+            .map(|i| format!("/c/tools/dir{i}/bin"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let report = path_searched(Some(&format!(r"C:\Windows\system32;{tail}")), true);
+        assert!(report.contains('…'), "elided without saying so: {report}");
+        assert!(report.contains("colon-joined: 60 paths"), "{report}");
+        // The elision is of the *entry*, not of the report: no line runs away.
+        for line in report.lines() {
+            assert!(line.chars().count() < 100, "runaway line: {line}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_unset_path_says_exactly_that() {
+        // The child was handed nothing to search, which is the entire diagnosis.
+        for path in [None, Some(""), Some(";;")] {
+            let report = path_searched(path, true);
+            assert_eq!(report, "vm ▸ the PATH it searched was empty", "{path:?}");
+        }
+        assert!(half_posix_path_note(None, true).is_none());
+    }
+
+    #[test]
+    fn elide_never_splits_a_codepoint() {
+        // A path with an umlaut must not panic vm on its way to reporting someone
+        // else's error. Cutting at a byte index would do exactly that.
+        assert_eq!(elide("ööööö", 3), "ööö…");
+        assert_eq!(elide("ööö", 3), "ööö");
+        assert_eq!(elide("ab", 5), "ab");
     }
 
     // ── Cross-cutting ────────────────────────────────────────────────────────

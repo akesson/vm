@@ -269,6 +269,13 @@ command failed" from "vm failed" and retry only the latter:
 | `126` / `127` | guest command found-but-not-executable / not found |
 | other | the guest command's own exit code, untouched (signal death shows as `128 + signal`) |
 
+On `127`, vm also prints the PATH the command was searched on — which is never
+the PATH of the shell you are standing in: the agent augments the guest's,
+`--or-native` gets whatever the runner exported, and `-e PATH=…` overrides
+either. On Windows it flags entries left in POSIX form (`/c/tools`, or a whole
+colon-joined run of them), which no Win32 resolver can search and which a `mise`
+task with `shell = "bash -c"` hands its native children.
+
 `vm doctor` is the one exception: it reports **1** when any check fails (it has
 no guest command whose status it could be confused with).
 

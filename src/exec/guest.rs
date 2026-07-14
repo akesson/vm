@@ -32,10 +32,17 @@ pub fn exec() -> Result<i32> {
     // Always a plain argv: the host composed any shell invocation before sending
     // it (it knows this guest's OS from the config), so there is nothing here to
     // interpret — just spawn what was asked for, byte for byte.
+    //
+    // The PATH the child gets is the agent's augmented one, unless the request
+    // carried its own — so that is also the PATH a not-found below has to report.
+    let path = augmented_path();
+    let searched = super::path_override(&req.env)
+        .map(str::to_string)
+        .unwrap_or_else(|| path.clone());
     let mut cmd = Command::new(&req.argv[0]);
     cmd.args(&req.argv[1..]);
     cmd.current_dir(&cwd)
-        .env("PATH", augmented_path())
+        .env("PATH", path)
         .envs(&req.env)
         .stdin(if payload.is_some() {
             Stdio::piped()
@@ -54,22 +61,16 @@ pub fn exec() -> Result<i32> {
         Ok(status) => status,
         Err(err) => {
             // A command that isn't found or isn't executable is the *command's*
-            // own result, not a vm failure — report it with the shell's own
-            // codes (127 / 126) on the Ok path, so it never collides with the
-            // infra exit code the host would otherwise read back. (A script
-            // already yields these from the sh/cmd the host wrapped it in.)
-            if let Some(io) = err.downcast_ref::<std::io::Error>() {
-                match io.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        eprintln!("vm: command not found: {}", req.argv[0]);
-                        return Ok(127);
-                    }
-                    std::io::ErrorKind::PermissionDenied => {
-                        eprintln!("vm: command not executable: {}", req.argv[0]);
-                        return Ok(126);
-                    }
-                    _ => {}
-                }
+            // own result, not a vm failure — reported with the shell's own codes
+            // (127 / 126) on the Ok path, so it never collides with the infra
+            // exit code the host would otherwise read back, and carrying the PATH
+            // that explains it. (A script already yields these codes from the
+            // sh/cmd the host wrapped it in.) Same call the host's native path
+            // makes, so a guest and an `--or-native` run answer alike.
+            if let Some(io) = err.downcast_ref::<std::io::Error>()
+                && let Some(code) = super::spawn_failure(io, &req.argv[0], Some(&searched))
+            {
+                return Ok(code);
             }
             return Err(err)
                 .with_context(|| format!("running {:?} in {}", req.argv.join(" "), cwd.display()));
