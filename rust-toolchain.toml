@@ -1,0 +1,14 @@
+# The compiler that decides whether this repo builds — and whether a clippy lint
+# fires. Pinned, not floating: a guest whose rustup default had drifted three
+# releases behind CI failed `cargo clippy` on code CI passes clean, which is the
+# "same command, different answer" this tool exists to deny. rustup reads this
+# file ahead of its own default and installs the version on first use, so the
+# host, every guest, and every CI runner now agree by construction rather than by
+# whoever last ran `rustup update`.
+#
+# Bumping is a one-line, deliberate act: nothing here moves on its own, and no
+# new stable can turn CI red overnight.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
