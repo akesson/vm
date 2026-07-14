@@ -18,6 +18,14 @@ use vm::guest_env::GuestEnv;
 #[derive(Parser)]
 #[command(name = "vm", version, about, max_term_width = 100)]
 pub struct Cli {
+    /// Silence vm's progress breadcrumbs on stderr (notes, warnings and errors still print)
+    ///
+    /// Narration only. The journal still records every line, so a quiet run is
+    /// still a run you can read back afterwards. Must come before the `--`:
+    /// after it, the guest command owns the argv.
+    #[arg(short = 'q', long, global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

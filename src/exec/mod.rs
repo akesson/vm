@@ -12,6 +12,8 @@
 //! guest checkout the sync keeps current. [`run`] is `vm run`: no repo, no sync,
 //! optionally elevated — the guest itself as the subject rather than the stage.
 
+use crate::notice;
+
 pub mod advise;
 pub mod guest;
 pub mod host;
@@ -46,15 +48,15 @@ pub(crate) fn spawn_failure(
 ) -> Option<i32> {
     match err.kind() {
         std::io::ErrorKind::NotFound => {
-            eprintln!("vm: command not found: {program}");
-            eprintln!("{}", advise::path_searched(path, cfg!(windows)));
+            notice!("vm: command not found: {program}");
+            notice!("{}", advise::path_searched(path, cfg!(windows)));
             if let Some(note) = advise::half_posix_path_note(path, cfg!(windows)) {
-                eprintln!("vm ▸ note: {note}");
+                notice!("vm ▸ note: {note}");
             }
             Some(127)
         }
         std::io::ErrorKind::PermissionDenied => {
-            eprintln!("vm: command not executable: {program}");
+            notice!("vm: command not executable: {program}");
             Some(126)
         }
         _ => None,

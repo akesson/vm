@@ -67,7 +67,11 @@ The other half is `vm reap`, which **shuts down** VMs that no vm process is
 using and that have been idle a while (30m by default; `vm reap --install` runs
 it every 5 minutes from launchd). It leaves a VM alone while someone is typing
 at its console, so a guest you are driving by hand in the Parallels GUI is not
-pulled out from under you.
+pulled out from under you. Nobody is watching a launchd job, so every sweep's
+decision — kept, skipped, shut down, and why — goes to [the
+journal](#the-journal) with the time it was made. If you upgraded from a vm that
+predates the journal, `vm doctor` will tell you to re-run `vm reap --install`:
+the old job keeps writing to a log nothing rotates until you do.
 
 Between the two, VM lifecycle is never a step anyone has to remember — which is
 why the verbs for it do not exist. A graceful stop is the only way vm puts a VM
@@ -305,6 +309,11 @@ therefore exactly the command's own: `vm exec linux -- 'cargo test 2>&1' >
 log.txt` captures a clean log, and piping vm's stdout into another tool never
 picks up vm chatter.
 
+**`-q` silences the narration, never the news.** Breadcrumbs (`vm ▸ linux ▸ exit
+0 ▸ 3.2s`) disappear; notes, `WARNING:` lines and errors still print, because a
+quiet flag that swallowed the reason a run failed would be a trap. It has to come
+before the `--` — after it, the guest command owns the argv.
+
 Stdin is the deliberate exception: **`vm exec` never forwards it.** vm keeps the
 host↔guest pipe for itself as the liveness channel — it sends the request, then
 a keepalive every 15s for as long as the command runs — and the guest command
@@ -328,9 +337,12 @@ behaving perfectly. Re-run it: a run started before the teardown or after the
 retry is safe. It is a Parallels bug on the macOS guest (the Windows console
 channel is unaffected), and not one vm can absorb — once that pipe is closed no
 more keepalives arrive, so the silence budget would end the run anyway. To tell
-it from a real Ctrl-C, look for a `Failed to find guest exec session` line in
-`~/Parallels/macOS.macvm/parallels.log` within milliseconds of the death; an
-interrupt you actually sent leaves none. See
+it from a real Ctrl-C, take the death's timestamp from [the
+journal](#the-journal) — `grep 'exit 130' ~/.config/vm/log/vm.log` — and look for
+a `Failed to find guest exec session` line in `~/Parallels/macOS.macvm/parallels.log`
+within milliseconds of it; an interrupt you actually sent leaves none. (This is
+the correlation the journal was added for: before it, vm recorded no time of
+death, so there was nothing to line up against.) See
 [#27](https://github.com/akesson/vm/issues/27).
 
 So `echo hi | vm exec linux -- 'cat > f'` writes an empty file and
@@ -343,6 +355,38 @@ into vm *is* the guest command's stdin (≤ 8 MiB of text), and vm says so — `
 linux ▸ stdin ▸ 91 bytes → the guest command`. It rides inside the request rather
 than down the pipe, so the liveness channel is untouched. Binary input is refused
 rather than mangled. See [Ad-hoc commands](#ad-hoc-commands-vm-run).
+
+## The journal
+
+Every line vm prints to stderr it also *keeps*, in `~/.config/vm/log/vm.log`,
+stamped with the local time and the pid that wrote it:
+
+```
+2026-07-14T16:19:48.412+02:00 [8831] vm ▸ macos (macOS) ▸ ~/work/vm ▸ $ cargo test
+2026-07-14T16:19:58.905+02:00 [8831] vm ▸ macos ▸ 'macOS' is stopped — starting it…
+2026-07-14T16:20:36.107+02:00 [8831] vm ▸ macos ▸ exit 130 ▸ 47.2s
+2026-07-14T16:24:48.001+02:00 [9014] vm ▸ reap ▸ linux idle 12m of 30m — kept
+```
+
+It is a transcript, not an event stream: the line in the file is the line you
+saw, so it cannot drift out of sync with what vm actually said. The pid ties one
+invocation's lines together — concurrent `vm` runs against one guest are normal,
+and they share the file. `-q` does not silence it; a quiet run is still a run you
+can read back.
+
+It exists because the unattended half of vm had no memory. `vm reap` decides
+every five minutes whether to shut a VM down, and those decisions used to go to a
+file launchd redirected on vm's behalf — with **no timestamps**, so the one file
+you would open to ask *why did my VM go down at 3pm* could not tell you when
+anything happened, and no rotation, so it grew forever. vm now writes its own,
+rotating at 8 MiB and keeping one generation behind it (a 16 MiB ceiling).
+`vm doctor` reports where it is and how big it has got.
+
+Two things worth knowing. The journal keeps the **command lines you ran**, which
+were previously ephemeral on a terminal — hence mode `0600`, and `VM_JOURNAL=off`
+to opt out of a file entirely. And it keeps *vm's* lines: a guest command's own
+output streams through to your terminal untouched, as it always has, and is not
+captured. `vm exec linux -- 'cargo test' > log.txt` is still how you keep that.
 
 ## Claude in a VM
 

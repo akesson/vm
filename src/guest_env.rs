@@ -8,6 +8,7 @@
 //! host repo root; detection is never silent — an active env is announced with
 //! a breadcrumb, and `--guest-env` forces or disables it per invocation.
 
+use crate::crumb;
 use std::path::Path;
 
 /// The `--guest-env` choices. An absent flag means auto-detect.
@@ -67,11 +68,11 @@ impl ActiveEnv {
             return;
         }
         match self.detected_from {
-            Some(marker) => eprintln!(
+            Some(marker) => crumb!(
                 "vm ▸ {alias} ▸ guest env: mise (detected {marker}) — `mise trust` on first \
                  sync, exec commands wrapped `mise exec --`; --guest-env none disables"
             ),
-            None => eprintln!("vm ▸ {alias} ▸ guest env: mise (--guest-env)"),
+            None => crumb!("vm ▸ {alias} ▸ guest env: mise (--guest-env)"),
         }
     }
 

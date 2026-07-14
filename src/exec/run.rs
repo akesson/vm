@@ -28,7 +28,7 @@ use crate::config::{Config, GuestOs};
 use crate::exit::usage;
 use crate::guest_env::GuestEnv;
 use crate::proto::{ExecRequest, PROTO_VERSION};
-use crate::{commands, prl};
+use crate::{commands, crumb, prl};
 use anyhow::{Context, Result};
 use std::io::Read;
 use std::time::Instant;
@@ -111,7 +111,7 @@ pub fn run(alias: &str, opts: &RunOptions) -> Result<i32> {
         (true, GuestOs::Windows) => " ▸ elevated (SYSTEM)".to_string(),
         (true, _) => " ▸ elevated (root)".to_string(),
     };
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ({}) ▸ {cwd}{who} ▸ $ {}",
         vm.parallels_name,
         super::host::render_argv(&req.argv)
@@ -120,7 +120,7 @@ pub fn run(alias: &str, opts: &RunOptions) -> Result<i32> {
     // vm's stdin is dropped and noted. Here it travels, and the reader has to be
     // able to tell the two apart at a glance.
     if let Some(payload) = &req.stdin {
-        eprintln!(
+        crumb!(
             "vm ▸ {alias} ▸ stdin ▸ {} bytes → the guest command",
             payload.len()
         );
@@ -128,7 +128,7 @@ pub fn run(alias: &str, opts: &RunOptions) -> Result<i32> {
     let started = Instant::now();
 
     let code = super::host::drive_agent(alias, transport, &req)?;
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ▸ exit {code} ▸ {:.1}s",
         started.elapsed().as_secs_f32()
     );

@@ -1,4 +1,5 @@
 use super::{Git, Snapshot, snapshot};
+use crate::crumb;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -23,7 +24,7 @@ pub fn lock_sync(repo_root: &Path, peer: &str) -> Result<crate::lock::PathLock> 
         .git_dir()?
         .join(format!("vm-sync-{peer}.flock"));
     crate::lock::exclusive_path(&path, || {
-        eprintln!("vm ▸ {peer} ▸ waiting for a concurrent sync of this repo…");
+        crumb!("vm ▸ {peer} ▸ waiting for a concurrent sync of this repo…");
     })
 }
 

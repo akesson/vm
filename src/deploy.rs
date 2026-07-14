@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs};
 use crate::proto::{PROTO_VERSION, VersionInfo};
 use crate::ssh::SshTarget;
-use crate::{commands, mapping, prldnd, ssh, sync};
+use crate::{commands, crumb, mapping, prldnd, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -26,7 +26,7 @@ pub fn deploy(alias: &str) -> Result<i32> {
 
     let _use = crate::lock::shared(alias)?;
     let target = commands::bring_up(alias, vm)?;
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ▸ deploying agent (build-in-guest from {})…",
         src.display()
     );
@@ -49,9 +49,10 @@ pub fn deploy(alias: &str) -> Result<i32> {
             info.proto
         );
     }
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ▸ agent v{} (proto v{}) installed",
-        info.binary, info.proto
+        info.binary,
+        info.proto
     );
 
     // Deploy is where a guest gets provisioned, and this is the other thing a
@@ -104,7 +105,7 @@ fn build_in_guest(alias: &str, target: &SshTarget, src: &Path, bin: &str) -> Res
             snap.commit
         ),
     )?;
-    eprintln!("vm ▸ {alias} ▸ building agent in guest (first build takes a while)…");
+    crumb!("vm ▸ {alias} ▸ building agent in guest (first build takes a while)…");
     // Install via rename: replacing a currently-executing agent binary fails
     // with `cp` (busy) but a rename always succeeds.
     remote(

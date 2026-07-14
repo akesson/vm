@@ -2,7 +2,7 @@ use crate::config::{Config, GuestOs, VmConfig};
 use crate::exit::usage;
 use crate::guest_env::{ActiveEnv, GuestEnv};
 use crate::proto::{ExecRequest, HEARTBEAT_INTERVAL, PROTO_VERSION};
-use crate::{commands, mapping, prl, ssh, sync};
+use crate::{commands, crumb, mapping, notice, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -74,7 +74,7 @@ pub fn exec(target: &str, opts: &ExecOptions) -> Result<i32> {
     // may well *succeed*, so this cannot wait for a failure). Placed after the
     // --or-native returns: a native run inherits stdin and uses it normally.
     if let Some(note) = super::advise::stdin_note(stdin_source()) {
-        eprintln!("vm ▸ note: {note}");
+        notice!("vm ▸ note: {note}");
     }
     if opts.with_snapshot {
         // Takes the VM exclusively and rolls it back around the run.
@@ -130,7 +130,7 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         heartbeat_timeout_ms: None,
     };
 
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ({}) ▸ {cwd} ▸ $ {}",
         vm.parallels_name,
         render_argv(&req.argv)
@@ -148,7 +148,7 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         && let Some(note) =
             super::advise::unsynced_env_note(&unsynced_env_files(&repo.root, &opts.with_file))
     {
-        eprintln!("vm ▸ note: {note}");
+        notice!("vm ▸ note: {note}");
     }
 
     if opts.writeback
@@ -159,7 +159,7 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         // result of a completed run. Skip the writeback, but say so: a silently
         // missing diff would look like the command simply changed nothing.
         if code == 255 {
-            eprintln!(
+            notice!(
                 "vm ▸ {alias} ▸ writeback skipped — exit 255 may be a dropped connection \
                  rather than the command's own status, so the guest tree is not trusted"
             );
@@ -168,7 +168,7 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
         }
     }
 
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ▸ exit {code} ▸ {:.1}s",
         started.elapsed().as_secs_f32()
     );
@@ -245,7 +245,7 @@ pub(super) fn drive_agent(
     // 127 now doubles as the guest reporting command-not-found (see
     // exec/guest.rs), so keep the hint suggestive rather than assertive.
     if code == 127 {
-        eprintln!(
+        notice!(
             "vm ▸ {alias} ▸ exit 127 — command not found in the guest \
              (or the agent is missing — try `vm deploy {alias}`)"
         );
@@ -450,7 +450,7 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
     let argv = build_argv(&opts.cmd, &no_wrap, GuestOs::current());
     // Composed first, printed second: the breadcrumb owes the reader the command
     // that actually runs, here as much as in a guest.
-    eprintln!(
+    crumb!(
         "vm ▸ native ({}) ▸ $ {}",
         GuestOs::current().as_str(),
         render_argv(&argv)
@@ -574,7 +574,7 @@ fn writeback(
     let applied =
         sync::host::apply_writeback(&repo.root, &url, base, &wb, Some(&ssh::git_ssh_command()))?;
     if applied {
-        eprintln!("vm ▸ {alias} ▸ writeback applied to host tree");
+        crumb!("vm ▸ {alias} ▸ writeback applied to host tree");
     }
     Ok(())
 }

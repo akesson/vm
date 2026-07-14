@@ -1,4 +1,5 @@
 use super::{Git, Snapshot, expand_home, snapshot};
+use crate::crumb;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -61,6 +62,6 @@ fn init(git: &Git, path: &Path) -> Result<()> {
     // writeback snapshot objects, which carry their own fixed identity.
     git.run(&["config", "user.name", "vm-sync"])?;
     git.run(&["config", "user.email", "vm-sync@local"])?;
-    eprintln!("vm ▸ initialized checkout at {}", path.display());
+    crumb!("vm ▸ initialized checkout at {}", path.display());
     Ok(())
 }
