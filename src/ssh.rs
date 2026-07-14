@@ -44,9 +44,21 @@ const SSH_OPTIONS: &[&str] = &[
     "LogLevel=ERROR",
 ];
 
+/// The `ssh` to run — the second of the two names vm reaches the outside world
+/// by (see `prl::prlctl_bin` for the first, and why the seam is here).
+///
+/// `VM_SSH` points it somewhere else, which is what lets a test hold the network
+/// as well as Parallels: a guest that answers, one that refuses, one that is not
+/// there at all. Without it the lifecycle tests would reach for a real address —
+/// and on the machine vm is developed on, that address belongs to a real guest.
+/// A seam only a test moves.
+fn ssh_bin() -> std::ffi::OsString {
+    std::env::var_os("VM_SSH").unwrap_or_else(|| "ssh".into())
+}
+
 /// Base ssh invocation for a target.
 pub fn ssh_command(target: &SshTarget) -> Command {
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(ssh_bin());
     cmd.args(SSH_OPTIONS).arg(target.destination());
     cmd
 }
@@ -54,7 +66,7 @@ pub fn ssh_command(target: &SshTarget) -> Command {
 /// The same options as a GIT_SSH_COMMAND string, so `git push`/`fetch`
 /// reuse the multiplexed connection and the dedicated known-hosts file.
 pub fn git_ssh_command() -> String {
-    let mut s = String::from("ssh");
+    let mut s = ssh_bin().to_string_lossy().into_owned();
     for opt in SSH_OPTIONS {
         s.push(' ');
         s.push_str(opt);

@@ -50,5 +50,7 @@ cargo crap --lcov target/lcov.info
 description = "Rank complex-and-untested functions (CRAP metric)"
 
 [tasks.install]
-run = "cargo install --path . --locked"
+# --bin vm: the package also builds `fake-prlctl` for the lifecycle tests, and
+# a test double has no business in anyone's PATH.
+run = "cargo install --path . --locked --bin vm"
 description = "Install vm into ~/.cargo/bin"

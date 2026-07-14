@@ -1,3 +1,4 @@
+use crate::clock::ticks;
 use crate::crumb;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -68,8 +69,28 @@ fn unusable_addrs(field: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The `prlctl` to run. Every VM operation vm performs goes through one of the
+/// three `Command::new(prlctl_bin())` sites in this module, so this one name is
+/// the whole surface Parallels presents to vm — and the whole surface a test has
+/// to stand in for.
+///
+/// `VM_PRLCTL` points it somewhere else. That is what lets the lifecycle be
+/// tested at all: `wait_for_ip`'s status machine, reap's decision matrix and
+/// doctor's live checks are all pure logic wrapped around this one command, and
+/// none of it could be exercised without a Parallels install and a VM to break.
+/// The seam is deliberately *here*, at the process boundary, rather than a trait
+/// above it: what goes wrong with prlctl goes wrong in the argv (an oversized
+/// command line hangs it forever, `--current-user` decides which Windows session
+/// a command lands in), so a test has to be able to see the real argv, not a
+/// mock of the call that would have built it.
+///
+/// Like [`crate::clock`]'s tick, this is a seam only a test moves.
+fn prlctl_bin() -> std::ffi::OsString {
+    std::env::var_os("VM_PRLCTL").unwrap_or_else(|| "prlctl".into())
+}
+
 fn prlctl(args: &[&str]) -> Result<String> {
-    let out = Command::new("prlctl")
+    let out = Command::new(prlctl_bin())
         .args(args)
         .output()
         .context("failed to run prlctl (is Parallels installed?)")?;
@@ -143,16 +164,24 @@ pub fn ensure_up(alias: &str, name: &str) -> Result<Up> {
     Ok(Up { ip, woke })
 }
 
-/// How long a guest gets to report an IP once Parallels has it running.
-const IP_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a guest gets to report an IP once Parallels has it running. A cold
+/// Windows guest's DHCP lease lands ~37s in (see [`usable`]), so this is a wide
+/// margin over the slowest wake actually measured.
+fn ip_timeout() -> Duration {
+    ticks(90)
+}
 
 /// How often the VM's state is re-read while waiting.
-const POLL: Duration = Duration::from_secs(2);
+fn poll() -> Duration {
+    ticks(2)
+}
 
 /// A wait that passes this says so, and keeps saying so this often. Below it
 /// the wait is not worth a line: the overwhelmingly common case is a VM that
 /// is already up, which returns on the first look and prints nothing.
-const HEARTBEAT: Duration = Duration::from_secs(10);
+fn heartbeat() -> Duration {
+    ticks(10)
+}
 
 /// How long Parallels gets to move a VM out of a settled off-state after
 /// reporting a successful start or resume. Measured on Parallels 26.4: a
@@ -160,7 +189,9 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 /// resume of a 20 GB macOS VM reads `running` ~2.5s after `prlctl resume`
 /// returns. 15s is a wide margin over that — so a VM still `suspended` here is
 /// not a slow one, it is one that is not coming up.
-const TRANSITION_GRACE: Duration = Duration::from_secs(15);
+fn transition_grace() -> Duration {
+    ticks(15)
+}
 
 /// Statuses a VM never leaves on its own — it has to be started or resumed, so
 /// one of these means no IP is ever coming. Everything else is left to the
@@ -187,7 +218,7 @@ fn assess(name: &str, status: &str, addrs: &str, waited: Duration, timeout: Dura
     }
     // Checked before the timeout: it is the more specific diagnosis, and the
     // one whose advice is actionable.
-    if is_off(status) && waited >= TRANSITION_GRACE {
+    if is_off(status) && waited >= transition_grace() {
         // The advice has to match the state it is advice about: a stopped VM
         // resumes to an error, and a suspended one starts to one.
         let verb = if status == "stopped" {
@@ -243,11 +274,11 @@ fn assess(name: &str, status: &str, addrs: &str, waited: Duration, timeout: Dura
 /// Parallels GUI can put it back down while this loop is waiting on it.
 fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
     let start = Instant::now();
-    let mut next_beat = HEARTBEAT;
+    let mut next_beat = heartbeat();
     loop {
         let vm = find(name)?;
         let waited = start.elapsed();
-        match assess(name, &vm.status, &vm.ip_configured, waited, IP_TIMEOUT) {
+        match assess(name, &vm.status, &vm.ip_configured, waited, ip_timeout()) {
             Step::Up(ip) => return Ok(ip),
             Step::Fail(msg) => bail!("{msg}"),
             Step::Wait => {
@@ -256,11 +287,11 @@ fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
                         "vm ▸ {alias} ▸ '{name}' {}, no IP yet — {}s of {}s",
                         vm.status,
                         waited.as_secs(),
-                        IP_TIMEOUT.as_secs()
+                        ip_timeout().as_secs()
                     );
-                    next_beat = waited + HEARTBEAT;
+                    next_beat = waited + heartbeat();
                 }
-                std::thread::sleep(POLL);
+                std::thread::sleep(poll());
             }
         }
     }
@@ -302,7 +333,7 @@ fn check_exec_argv(name: &str, args: &[&str]) -> Result<()> {
 /// complete argv up front instead of returning a base `Command` to extend.
 pub fn exec_console(name: &str, args: &[&str]) -> Result<Command> {
     check_exec_argv(name, args)?;
-    let mut cmd = Command::new("prlctl");
+    let mut cmd = Command::new(prlctl_bin());
     cmd.args(["exec", name, "--current-user"]);
     cmd.args(args);
     Ok(cmd)
@@ -336,7 +367,7 @@ pub fn exec_console_capture(name: &str, args: &[&str]) -> Result<Output> {
 /// open across the wait. A simpler caller here would silently lose output.
 pub fn exec_elevated(name: &str, args: &[&str]) -> Result<Command> {
     check_exec_argv(name, args)?;
-    let mut cmd = Command::new("prlctl");
+    let mut cmd = Command::new(prlctl_bin());
     cmd.args(["exec", name]);
     cmd.args(args);
     Ok(cmd)
