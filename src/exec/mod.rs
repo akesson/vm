@@ -26,6 +26,46 @@ mod job;
 #[path = "job_windows.rs"]
 mod job;
 
+/// A [`std::process::Command`] for `argv` — with the one exception to "just
+/// `.args()` it" that Windows forces.
+///
+/// `cmd.exe` has no argv. It parses a raw command line by its own rules, and
+/// those rules do not include the CRT's backslash escapes — the convention
+/// `std` quotes with. So spawning `["cmd", "/C", script]` through `.args()`
+/// turns every `"` inside the script into `\"`, which cmd passes along as
+/// literal bytes: `echo "QQ"` prints `\"QQ\"`, and a `find /c "x"` gets a stray
+/// `\` argument and dies (measured on the real Windows guest, 2026-07-15).
+/// `raw_arg` hands cmd the line verbatim, which is the only correct way to
+/// invoke it. Everything after `/C` *is* one command line to cmd, so verbatim
+/// args joined by spaces are exactly what it expects.
+///
+/// Every other program gets `.args()` unchanged: native executables parse
+/// their command line with the CRT rules std quotes for, and on unix there is
+/// a real argv and no quoting layer at all.
+pub(crate) fn command_for(argv: &[String]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&argv[0]);
+    #[cfg(windows)]
+    if is_cmd_exe(&argv[0]) {
+        use std::os::windows::process::CommandExt;
+        for arg in &argv[1..] {
+            cmd.raw_arg(arg);
+        }
+        return cmd;
+    }
+    cmd.args(&argv[1..]);
+    cmd
+}
+
+/// Whether `program` will resolve to cmd.exe — the caller may say `cmd`,
+/// `cmd.exe`, or a full path to it.
+#[cfg(windows)]
+fn is_cmd_exe(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("cmd") || n.eq_ignore_ascii_case("cmd.exe"))
+}
+
 /// A spawn that never started: report it the way a shell would, and answer with
 /// the shell's code — 127 not-found, 126 not-executable. `None` when the failure
 /// is none of the command's doing, which leaves it an infra error for the caller
@@ -77,4 +117,32 @@ pub(crate) fn path_override(env: &std::collections::BTreeMap<String, String>) ->
             }
         })
         .map(|(_, value)| value.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The regression [`super::command_for`] exists for: through `.args()`,
+    /// cmd would receive `echo \"QQ\"` and print the backslashes.
+    #[cfg(windows)]
+    #[test]
+    fn a_quoted_script_reaches_cmd_verbatim() {
+        let out = super::command_for(&argv(&["cmd", "/C", r#"echo "QQ""#]))
+            .output()
+            .expect("cmd runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#""QQ""#);
+    }
+
+    /// The unix path is plain `.args()` — the quotes are `sh`'s to consume.
+    #[cfg(unix)]
+    #[test]
+    fn a_quoted_script_reaches_sh_verbatim() {
+        let out = super::command_for(&argv(&["sh", "-c", r#"echo "QQ""#]))
+            .output()
+            .expect("sh runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "QQ");
+    }
 }

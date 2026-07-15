@@ -481,8 +481,10 @@ fn run_native(opts: &ExecOptions) -> Result<i32> {
         GuestOs::current().as_str(),
         render_argv(&argv)
     );
-    let mut cmd = std::process::Command::new(&argv[0]);
-    cmd.args(&argv[1..]);
+    // Through [`super::command_for`], not a bare `.args()` spawn: on a Windows
+    // host the script form composed `cmd /C …`, and cmd must be handed its
+    // line verbatim or every `"` in the script arrives backslash-mangled.
+    let mut cmd = super::command_for(&argv);
     cmd.envs(&env);
     let status = match cmd.status() {
         Ok(status) => status,

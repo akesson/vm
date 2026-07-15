@@ -334,6 +334,33 @@ fn hostile_arguments_reach_the_guest_byte_for_byte() {
     }
 }
 
+/// A double quote, through the guest's shell and back. Spawning
+/// `["cmd", "/C", script]` with std's `.args()` backslash-escapes embedded `"`
+/// — CRT quoting, which cmd.exe does not parse — so before the agent stepped
+/// around it (`raw_arg`, see `exec::command_for`), every quoted Windows script
+/// arrived mangled: `echo "QQ"` printed `\"QQ\"`, and this is the test that
+/// proves it stays fixed against the real guest.
+///
+/// `--guest-env none` is load-bearing: mise (2026.7.5) spawns cmd with the
+/// same std quoting, so through the wrap the quotes stay lost until mise fixes
+/// it upstream — that failure would be mise's, not the agent's, and this test
+/// pins the agent.
+#[test]
+#[ignore = "drives a real Parallels guest"]
+fn a_double_quote_in_a_script_survives_the_trip_to_the_guest_shell() {
+    for alias in targets() {
+        let run = vm(&["exec", &alias, "--guest-env", "none", "--", r#"echo "QQ""#]);
+        assert_eq!(run.code, 0, "{alias}: {}", run.stderr);
+        // sh consumes the quotes (`QQ`); cmd echoes them back (`"QQ"`). Either
+        // way no backslash was ever sent — one in the output *is* the mangling.
+        assert!(
+            run.stdout.contains("QQ") && !run.stdout.contains('\\'),
+            "{alias}: the quote was mangled on the way to the shell: {:?}",
+            run.stdout
+        );
+    }
+}
+
 // ── the guest's own health ───────────────────────────────────────────────────
 
 /// `vm doctor` is what a user is sent to when something is wrong. On a guest with
