@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Lib-side mirror of the CLI exec flags.
 pub struct ExecOptions {
@@ -197,7 +197,13 @@ pub fn exec_in(alias: &str, vm: &VmConfig, opts: &ExecOptions) -> Result<i32> {
 /// prlctl channels a unix guest's nonzero exit code only comes back while that
 /// pipe is still open, so this is load-bearing for the exit-code contract too,
 /// not only for teardown.)
-pub(super) fn drive_agent(
+///
+/// Exposed for `tests/host_agent.rs`, which drives it with a `vm _exec` transport
+/// of its own: this is the one function both `vm exec` and `vm run` funnel
+/// through, and the half of the liveness contract the agent's own tests cannot
+/// see, because they *are* the agent.
+#[doc(hidden)]
+pub fn drive_agent(
     alias: &str,
     mut transport: std::process::Command,
     req: &ExecRequest,
@@ -221,9 +227,10 @@ pub(super) fn drive_agent(
     // write is only safe because Rust ignores SIGPIPE at startup (the same
     // reasoning [`super::guest::feed_stdin`] runs on). So the thread outlives
     // the command by at most one interval, asleep, holding a dead pipe.
+    let interval = beat_interval(req);
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(HEARTBEAT_INTERVAL);
+            std::thread::sleep(interval);
             if agent_stdin.write_all(b"\n").is_err() {
                 break;
             }
@@ -251,6 +258,25 @@ pub(super) fn drive_agent(
         );
     }
     Ok(code)
+}
+
+/// How often to beat, for a given silence budget.
+///
+/// Four beats to a budget. That ratio is the contract — enough that a stalled
+/// scheduler or a loaded host can lose a beat, or two, without the agent
+/// concluding vm is dead and killing a healthy build — and the fifteen seconds is
+/// only what it works out to against the real minute.
+///
+/// So a request that shortens the budget shortens the pulse with it. The host
+/// never shortens it; only a test does, to watch a minute's worth of contract
+/// play out in a second ([`crate::proto::ExecRequest::heartbeat_timeout_ms`]) —
+/// and a test whose agent gave up after half a second while the host beat every
+/// fifteen would be testing nothing but its own impatience.
+fn beat_interval(req: &ExecRequest) -> Duration {
+    match req.heartbeat_timeout_ms {
+        Some(ms) => Duration::from_millis(ms) / 4,
+        None => HEARTBEAT_INTERVAL,
+    }
 }
 
 /// Validate the `--with-file` paths up front, discarding the result — the real
@@ -582,6 +608,34 @@ fn writeback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Four beats to a budget, whatever the budget — including the real one.
+    /// A pulse slower than the budget it is keeping alive would be a host that
+    /// reports itself dead on a schedule.
+    #[test]
+    fn the_pulse_always_fits_four_beats_into_the_silence_budget() {
+        let real = beat_interval(&request_with_budget(None));
+        assert_eq!(real, HEARTBEAT_INTERVAL);
+        assert_eq!(real * 4, crate::proto::HEARTBEAT_TIMEOUT);
+
+        // And a test's shortened budget shortens the pulse with it, or the agent
+        // would call a beating host dead.
+        for budget_ms in [200, 1000, 60_000] {
+            let beat = beat_interval(&request_with_budget(Some(budget_ms)));
+            assert_eq!(beat * 4, Duration::from_millis(budget_ms), "{budget_ms}ms");
+        }
+    }
+
+    fn request_with_budget(heartbeat_timeout_ms: Option<u64>) -> ExecRequest {
+        ExecRequest {
+            version: PROTO_VERSION,
+            argv: vec!["true".into()],
+            env: BTreeMap::new(),
+            cwd: ".".into(),
+            stdin: None,
+            heartbeat_timeout_ms,
+        }
+    }
 
     /// A host environment stub, so the tests never touch the real process env
     /// (mutating it is `unsafe` on edition 2024 and races other tests).

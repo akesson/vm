@@ -458,6 +458,38 @@ repo's guest setup is derived from the repo itself (see **Guest environments**).
 `vm doctor` checks host and guests; `vm deploy <alias>` builds and installs
 the agent inside a guest.
 
+## Tests
+
+`mise run test` is the whole suite, and it needs no VM: Parallels is reached
+through one name (`prlctl`) and the network through one more (`ssh`), and
+`$VM_PRLCTL` / `$VM_SSH` point both at a scriptable stand-in
+(`tests/bin/fake_prlctl.rs`). A guest that wakes up through six addresses, a VM
+that never comes up, a reap sweep firing into a run in flight, two execs racing
+each other on one guest — all of it runs in CI on all three OSes, in seconds,
+because vm's clock is a unit that `$VM_TEST_TICK_MS` can shrink.
+
+Two lanes need real guests, so they are opt-in and never run in CI:
+
+```bash
+mise run test-real [alias]      # the suite, against real Parallels guests
+mise run quirk-canary [alias]   # re-measure the Parallels behaviour vm is built on
+```
+
+**`test-real`** is the only lane that can catch what a fake never will: a killed
+host leaving its guest command orphaned, a cold boot picking an address the guest
+will not keep, an exit code collapsing to zero over the console channel.
+
+**`quirk-canary`** is the one that matters over time. vm's hardest code is not
+defensive against bugs of its own — it is defensive against Parallels, and every
+one of those defences encodes something somebody *measured*: the ~3.9 KB command
+line that hangs `prlctl exec` forever (deaf to SIGTERM), the exact wording of a
+refused Tools session, the eight status words a VM can report. Parallels updates
+itself, and when one of those facts changes, nothing breaks loudly — a guard
+silently stops guarding, and weeks later it is "vm hangs, sometimes". The canary
+asks the questions again, records each answer in the journal with the Parallels
+version, and fails when one has moved. Run it either side of an upgrade and
+believe the diff.
+
 ## Issues
 
 Bugs and rough edges go to

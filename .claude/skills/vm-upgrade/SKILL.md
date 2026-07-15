@@ -136,7 +136,35 @@ one-liner (`'for t in …'`) fails with "was not expected at this time". Pass
 Windows commands as **several** arguments, or write PowerShell and feed it on
 stdin.
 
-## 5. Hard-won details you will otherwise re-learn the hard way
+## 5. After the guests: re-measure the ground vm stands on
+
+An upgrade sweep is the most likely moment for vm to start failing in ways nobody
+can explain — because Parallels Tools live *inside* the guests and get updated
+with them, and vm's hardest code is built on measured facts about how those Tools
+behave. The command line that hangs `prlctl exec` forever. The exact wording of a
+refused session. The status words a VM reports. When one of those changes, nothing
+breaks loudly: a guard silently stops guarding, and three weeks later "vm hangs
+sometimes".
+
+So, from the vm repo:
+
+```bash
+mise run quirk-canary          # before the sweep, if you have not run it recently
+… upgrade the guests …
+mise run quirk-canary          # after
+```
+
+Each probe records its measurement in vm's journal with a timestamp and the
+Parallels version, so the two runs can be compared — and a drift can be pinned to
+the upgrade that caused it. A **failing** probe is not a flaky test: it means
+Parallels changed under vm, and the guard named in the failure now has to be
+taught the new behaviour. Put it in the report under §7 as something the human has
+to act on.
+
+It stops and starts guests, and the argv-cliff probe leaves a killed `prlctl`
+behind by design — so run it when the sweep is otherwise done, not in the middle.
+
+## 6. Hard-won details you will otherwise re-learn the hard way
 
 **winget has two scopes and one pass sees only one of them.** SYSTEM sees
 machine-scope (Git, VC++ redists, VS Build Tools, PowerShell); the user's own
@@ -168,7 +196,7 @@ serializes its progress, information and error streams to CLIXML (`#< CLIXML
 - Say what you are about to do **before** the call that can block — creating the
   Windows Update COM session can stall for minutes.
 
-## 6. Stop and ask the human
+## 7. Stop and ask the human
 
 Do not resolve these yourself. Collect them and put them in the final report as
 explicit questions.
@@ -187,9 +215,9 @@ explicit questions.
 - **Anything destructive** — removing packages, changing a tap, resetting a
   toolchain — even if it looks like the obvious fix.
 
-## 7. Report
+## 8. Report
 
 Finish with a short table: one row per guest, what actually changed (with
 versions, e.g. `git 2.53 → 2.55`), and what needs the user. Lead with anything
-from §6 — that is the part they have to act on. If nothing needs them, say so
+from §7 — that is the part they have to act on. If nothing needs them, say so
 plainly in one line.

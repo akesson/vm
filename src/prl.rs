@@ -1,6 +1,8 @@
+use crate::clock::ticks;
 use crate::crumb;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::net::Ipv4Addr;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,18 +17,80 @@ pub struct PrlVm {
 }
 
 impl PrlVm {
-    /// The guest's usable IP, or None while it has none yet. A waking VM
-    /// briefly reports only a link-local IPv6 (fe80::…) which isn't routable
-    /// without a zone id — treat that the same as "no IP yet" and keep
-    /// waiting for the DHCP address.
+    /// The guest's usable IP, or None while it has none yet.
+    ///
+    /// The field is a list once the guest has settled
+    /// (`10.211.55.3 fdb2:… fe80:…`), so the address is picked out of it rather
+    /// than assumed to stand alone. See [`usable`] for what qualifies.
     pub fn ip(&self) -> Option<&str> {
-        let ip = self.ip_configured.as_str();
-        (ip != "-" && !ip.starts_with("fe80:")).then_some(ip)
+        ipv4(&self.ip_configured)
     }
 }
 
+/// Whether an address a guest reports is one vm can actually reach it on.
+///
+/// A booting guest advertises addresses in *stages*, and only the last is the
+/// one it settles on. Measured on a cold Windows 11 guest (Parallels 26.4):
+///
+/// ```text
+///   0s  -                                        no address at all
+///  15s  fe80::bcca:2118:95a7:5e25                link-local IPv6
+///  18s  fdb2:2c26:f4e4:0:357:80a2:89e0:6574      Parallels ULA IPv6
+///  24s  169.254.96.137                           link-local IPv4 (APIPA)
+///  37s  10.211.55.3                              the DHCP lease — the address
+/// ```
+///
+/// Every one of the first three has been taken for the real thing at some point,
+/// and each fails differently: the link-local IPv6 gave ssh "No route to host",
+/// the ULA broke the git sync push outright (`ssh: Could not resolve hostname
+/// fdb2` — a scp-style remote splits the host on its first colon, #35), and the
+/// APIPA address let ssh time out with "Host is down" 60s later. So the rule is
+/// the *address*, not the family: a routable IPv4 is the one thing that works,
+/// and anything else means the guest is still coming up. Parallels' shared
+/// network always leases one, so waiting for it terminates — and the timeout
+/// says which stopgap it was stuck on if it somehow does not.
+fn usable(addr: &str) -> bool {
+    addr.parse::<Ipv4Addr>()
+        .is_ok_and(|ip| !ip.is_link_local() && !ip.is_loopback() && !ip.is_unspecified())
+}
+
+/// The address to use out of an `ip_configured` field, if it carries one yet.
+/// Parallels writes `-` for a guest with no address at all.
+fn ipv4(field: &str) -> Option<&str> {
+    field.split_whitespace().find(|addr| usable(addr))
+}
+
+/// The addresses a guest reports that vm cannot use — the mid-boot stopgaps.
+/// Empty for a guest with no address at all.
+fn unusable_addrs(field: &str) -> Vec<&str> {
+    field
+        .split_whitespace()
+        .filter(|addr| *addr != "-" && !usable(addr))
+        .collect()
+}
+
+/// The `prlctl` to run. Every VM operation vm performs goes through one of the
+/// three `Command::new(prlctl_bin())` sites in this module, so this one name is
+/// the whole surface Parallels presents to vm — and the whole surface a test has
+/// to stand in for.
+///
+/// `VM_PRLCTL` points it somewhere else. That is what lets the lifecycle be
+/// tested at all: `wait_for_ip`'s status machine, reap's decision matrix and
+/// doctor's live checks are all pure logic wrapped around this one command, and
+/// none of it could be exercised without a Parallels install and a VM to break.
+/// The seam is deliberately *here*, at the process boundary, rather than a trait
+/// above it: what goes wrong with prlctl goes wrong in the argv (an oversized
+/// command line hangs it forever, `--current-user` decides which Windows session
+/// a command lands in), so a test has to be able to see the real argv, not a
+/// mock of the call that would have built it.
+///
+/// Like [`crate::clock`]'s tick, this is a seam only a test moves.
+fn prlctl_bin() -> std::ffi::OsString {
+    std::env::var_os("VM_PRLCTL").unwrap_or_else(|| "prlctl".into())
+}
+
 fn prlctl(args: &[&str]) -> Result<String> {
-    let out = Command::new("prlctl")
+    let out = Command::new(prlctl_bin())
         .args(args)
         .output()
         .context("failed to run prlctl (is Parallels installed?)")?;
@@ -100,16 +164,24 @@ pub fn ensure_up(alias: &str, name: &str) -> Result<Up> {
     Ok(Up { ip, woke })
 }
 
-/// How long a guest gets to report an IP once Parallels has it running.
-const IP_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long a guest gets to report an IP once Parallels has it running. A cold
+/// Windows guest's DHCP lease lands ~37s in (see [`usable`]), so this is a wide
+/// margin over the slowest wake actually measured.
+fn ip_timeout() -> Duration {
+    ticks(90)
+}
 
 /// How often the VM's state is re-read while waiting.
-const POLL: Duration = Duration::from_secs(2);
+fn poll() -> Duration {
+    ticks(2)
+}
 
 /// A wait that passes this says so, and keeps saying so this often. Below it
 /// the wait is not worth a line: the overwhelmingly common case is a VM that
 /// is already up, which returns on the first look and prints nothing.
-const HEARTBEAT: Duration = Duration::from_secs(10);
+fn heartbeat() -> Duration {
+    ticks(10)
+}
 
 /// How long Parallels gets to move a VM out of a settled off-state after
 /// reporting a successful start or resume. Measured on Parallels 26.4: a
@@ -117,7 +189,9 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 /// resume of a 20 GB macOS VM reads `running` ~2.5s after `prlctl resume`
 /// returns. 15s is a wide margin over that — so a VM still `suspended` here is
 /// not a slow one, it is one that is not coming up.
-const TRANSITION_GRACE: Duration = Duration::from_secs(15);
+fn transition_grace() -> Duration {
+    ticks(15)
+}
 
 /// Statuses a VM never leaves on its own — it has to be started or resumed, so
 /// one of these means no IP is ever coming. Everything else is left to the
@@ -135,13 +209,16 @@ enum Step {
     Fail(String),
 }
 
-fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout: Duration) -> Step {
-    if let Some(ip) = ip {
+/// `addrs` is the raw `ip_configured` field, not a decided address: what the
+/// guest reports but vm cannot use is the difference between a guest that has
+/// no network yet and one whose network will never be the one vm needs.
+fn assess(name: &str, status: &str, addrs: &str, waited: Duration, timeout: Duration) -> Step {
+    if let Some(ip) = ipv4(addrs) {
         return Step::Up(ip.to_string());
     }
     // Checked before the timeout: it is the more specific diagnosis, and the
     // one whose advice is actionable.
-    if is_off(status) && waited >= TRANSITION_GRACE {
+    if is_off(status) && waited >= transition_grace() {
         // The advice has to match the state it is advice about: a stopped VM
         // resumes to an error, and a suspended one starts to one.
         let verb = if status == "stopped" {
@@ -161,6 +238,21 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
         ));
     }
     if waited >= timeout {
+        // A guest that reports addresses vm cannot use has Parallels Tools
+        // running perfectly well — its DHCP lease is what never arrived. The
+        // booting-guest story would send the reader after the wrong problem.
+        let unusable = unusable_addrs(addrs);
+        if !unusable.is_empty() {
+            return Step::Fail(format!(
+                "VM '{name}' is {status} but reported no IPv4 within {}s — only {}.\n  \
+                 vm reaches a guest over IPv4: it is what Parallels' shared network \
+                 leases, and the only address the git sync push can be pointed at.\n  \
+                 Check the guest's network adapter is on Shared Networking and its DHCP \
+                 client is up.",
+                timeout.as_secs(),
+                unusable.join(", ")
+            ));
+        }
         return Step::Fail(format!(
             "VM '{name}' is {status} but did not report an IP within {}s — the guest may \
              still be booting, or Parallels Tools isn't running in it",
@@ -182,11 +274,11 @@ fn assess(name: &str, status: &str, ip: Option<&str>, waited: Duration, timeout:
 /// Parallels GUI can put it back down while this loop is waiting on it.
 fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
     let start = Instant::now();
-    let mut next_beat = HEARTBEAT;
+    let mut next_beat = heartbeat();
     loop {
         let vm = find(name)?;
         let waited = start.elapsed();
-        match assess(name, &vm.status, vm.ip(), waited, IP_TIMEOUT) {
+        match assess(name, &vm.status, &vm.ip_configured, waited, ip_timeout()) {
             Step::Up(ip) => return Ok(ip),
             Step::Fail(msg) => bail!("{msg}"),
             Step::Wait => {
@@ -195,11 +287,11 @@ fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
                         "vm ▸ {alias} ▸ '{name}' {}, no IP yet — {}s of {}s",
                         vm.status,
                         waited.as_secs(),
-                        IP_TIMEOUT.as_secs()
+                        ip_timeout().as_secs()
                     );
-                    next_beat = waited + HEARTBEAT;
+                    next_beat = waited + heartbeat();
                 }
-                std::thread::sleep(POLL);
+                std::thread::sleep(poll());
             }
         }
     }
@@ -241,7 +333,7 @@ fn check_exec_argv(name: &str, args: &[&str]) -> Result<()> {
 /// complete argv up front instead of returning a base `Command` to extend.
 pub fn exec_console(name: &str, args: &[&str]) -> Result<Command> {
     check_exec_argv(name, args)?;
-    let mut cmd = Command::new("prlctl");
+    let mut cmd = Command::new(prlctl_bin());
     cmd.args(["exec", name, "--current-user"]);
     cmd.args(args);
     Ok(cmd)
@@ -275,7 +367,7 @@ pub fn exec_console_capture(name: &str, args: &[&str]) -> Result<Output> {
 /// open across the wait. A simpler caller here would silently lose output.
 pub fn exec_elevated(name: &str, args: &[&str]) -> Result<Command> {
     check_exec_argv(name, args)?;
-    let mut cmd = Command::new("prlctl");
+    let mut cmd = Command::new(prlctl_bin());
     cmd.args(["exec", name]);
     cmd.args(args);
     Ok(cmd)
@@ -551,14 +643,11 @@ mod tests {
     #[test]
     fn an_ip_ends_the_wait() {
         let up = Step::Up("10.211.55.4".into());
-        assert_eq!(
-            assess("v", "running", Some("10.211.55.4"), secs(0), secs(90)),
-            up
-        );
+        assert_eq!(assess("v", "running", "10.211.55.4", secs(0), secs(90)), up);
         // Defensive: a stale status alongside a real IP must not lose to the
         // off-state check below — the address is the thing the caller needs.
         assert_eq!(
-            assess("v", "suspended", Some("10.211.55.4"), secs(60), secs(90)),
+            assess("v", "suspended", "10.211.55.4", secs(60), secs(90)),
             up
         );
     }
@@ -567,7 +656,7 @@ mod tests {
     fn a_booting_guest_is_given_its_full_timeout() {
         for waited in [0, 5, 30, 89] {
             assert_eq!(
-                assess("v", "running", None, secs(waited), secs(90)),
+                assess("v", "running", "-", secs(waited), secs(90)),
                 Step::Wait,
                 "{waited}s"
             );
@@ -580,26 +669,20 @@ mod tests {
     fn an_off_vm_is_given_the_grace_window_before_being_judged() {
         for waited in [0, 5, 14] {
             assert_eq!(
-                assess("v", "suspended", None, secs(waited), secs(90)),
+                assess("v", "suspended", "-", secs(waited), secs(90)),
                 Step::Wait,
                 "{waited}s"
             );
         }
         // Transients get no early exit at all: they are Parallels working.
-        assert_eq!(
-            assess("v", "starting", None, secs(60), secs(90)),
-            Step::Wait
-        );
-        assert_eq!(
-            assess("v", "resuming", None, secs(60), secs(90)),
-            Step::Wait
-        );
+        assert_eq!(assess("v", "starting", "-", secs(60), secs(90)), Step::Wait);
+        assert_eq!(assess("v", "resuming", "-", secs(60), secs(90)), Step::Wait);
     }
 
     #[test]
     fn an_off_vm_past_the_grace_window_fails_early_and_says_why() {
         for status in ["stopped", "suspended", "paused"] {
-            let Step::Fail(msg) = assess("macOS", status, None, secs(15), secs(90)) else {
+            let Step::Fail(msg) = assess("macOS", status, "-", secs(15), secs(90)) else {
                 panic!("{status} past grace must fail");
             };
             assert!(msg.contains(status), "{msg}");
@@ -622,7 +705,7 @@ mod tests {
     /// only fires where that story is actually the plausible one.
     #[test]
     fn the_timeout_message_names_the_status_it_timed_out_on() {
-        let Step::Fail(msg) = assess("macOS", "running", None, secs(90), secs(90)) else {
+        let Step::Fail(msg) = assess("macOS", "running", "-", secs(90), secs(90)) else {
             panic!("a running VM with no IP must time out");
         };
         assert!(msg.contains("is running"), "{msg}");
@@ -630,7 +713,7 @@ mod tests {
 
         // A suspended VM that also ran out the clock gets the *specific*
         // diagnosis, not the booting-guest guess.
-        let Step::Fail(msg) = assess("macOS", "suspended", None, secs(90), secs(90)) else {
+        let Step::Fail(msg) = assess("macOS", "suspended", "-", secs(90), secs(90)) else {
             panic!("suspended must fail");
         };
         assert!(msg.contains("will never report an IP"), "{msg}");
@@ -645,12 +728,79 @@ mod tests {
     fn link_local_ipv6_is_not_an_ip_yet() {
         // Seen live: a resuming Windows guest reports its link-local IPv6
         // before DHCP completes; ssh to it fails with "No route to host".
-        let vm = PrlVm {
+        assert_eq!(vm_reporting("fe80::bcca:2118:95a7:5e25").ip(), None);
+    }
+
+    /// The Parallels ULA comes up on a cold Windows guest *before* the DHCP
+    /// lease, and it clears the link-local guard. vm took it and the sync push
+    /// died on it (#35) — a retry 30s later, with the IPv4 up, always worked.
+    #[test]
+    fn a_ula_ipv6_is_not_an_ip_yet_either() {
+        assert_eq!(
+            vm_reporting("fdb2:2c26:f4e4:0:357:80a2:89e0:6574").ip(),
+            None
+        );
+    }
+
+    /// A link-local *IPv4* (APIPA) is what Windows hands itself while it waits
+    /// for DHCP, and it is the stage that survived the first fix for #35:
+    /// guarding the two IPv6 stopgaps simply moved the failure here, where ssh
+    /// sat for 60s and gave up with "Host is down". An address the guest has,
+    /// and not one anybody can reach it on.
+    #[test]
+    fn a_link_local_ipv4_is_not_an_ip_yet_either() {
+        assert_eq!(vm_reporting("169.254.96.137").ip(), None);
+    }
+
+    /// The staged wake in full, in the order a cold Windows 11 guest reports it
+    /// (measured on Parallels 26.4 — see [`usable`]). Every stage but the last
+    /// has been taken for the real address at some point, and each failed its
+    /// own way. This is the sequence that must be waited out.
+    #[test]
+    fn every_stage_of_a_cold_boot_is_held_out_for_the_dhcp_lease() {
+        let wake = [
+            ("-", None),
+            ("fe80::bcca:2118:95a7:5e25", None),
+            ("fdb2:2c26:f4e4:0:357:80a2:89e0:6574", None),
+            ("169.254.96.137", None),
+            ("10.211.55.3", Some("10.211.55.3")),
+        ];
+        for (reported, expected) in wake {
+            assert_eq!(
+                vm_reporting(reported).ip(),
+                expected,
+                "reported: {reported}"
+            );
+        }
+    }
+
+    /// A settled guest reports every address it has, space-separated. The IPv4
+    /// is the one to use wherever it sits in that list.
+    #[test]
+    fn the_ipv4_is_picked_out_of_the_addresses_reported() {
+        let vm = vm_reporting("fdb2:2c26:f4e4:0:357:80a2:89e0:6574 10.211.55.3 fe80::1");
+        assert_eq!(vm.ip(), Some("10.211.55.3"));
+    }
+
+    /// An IPv6-only guest is a network misconfiguration, not a guest without
+    /// Parallels Tools — and the timeout has to say the thing that is true, or
+    /// it sends the reader after the wrong problem.
+    #[test]
+    fn an_ipv6_only_guest_is_named_as_such_not_blamed_on_parallels_tools() {
+        let Step::Fail(msg) = assess("Windows 11", "running", "fdb2::5", secs(90), secs(90)) else {
+            panic!("an IPv6-only guest must time out");
+        };
+        assert!(msg.contains("fdb2::5"), "{msg}");
+        assert!(msg.contains("IPv4"), "{msg}");
+        assert!(!msg.contains("Parallels Tools"), "{msg}");
+    }
+
+    fn vm_reporting(ip_configured: &str) -> PrlVm {
+        PrlVm {
             uuid: "{x}".into(),
             status: "running".into(),
-            ip_configured: "fe80::bcca:2118:95a7:5e25".into(),
+            ip_configured: ip_configured.into(),
             name: "Windows 11".into(),
-        };
-        assert_eq!(vm.ip(), None);
+        }
     }
 }

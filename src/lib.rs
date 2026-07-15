@@ -2,6 +2,7 @@
 //! so integration tests can drive the machinery directly.
 
 pub mod claude;
+pub mod clock;
 pub mod commands;
 pub mod config;
 pub mod deploy;

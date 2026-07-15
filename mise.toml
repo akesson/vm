@@ -42,6 +42,36 @@ exit $rc
 '''
 description = "Run the tier-0 accessibility probe inside guest VMs"
 
+[tasks.test-real]
+# The lane that runs against real Parallels guests, and the only one that can:
+# every other test replaces Parallels with something that behaves the way vm
+# *believes* Parallels behaves, which is exactly what cannot be checked that way.
+# It takes VMs up and down and kills runs mid-flight, so it is opt-in and never
+# runs in CI.
+usage = 'arg "[target]" help="VM alias (conventionally windows|linux|macos), or all" default="all"'
+run = '''
+targets="${usage_target}"
+if [ "$targets" = "all" ]; then targets="linux,windows,macos"; fi
+VM_REAL_TARGETS="$targets" cargo nextest run --no-fail-fast \
+  --run-ignored ignored-only -E 'binary(real_vm)'
+'''
+description = "Run the test suite against real Parallels guests"
+
+[tasks.quirk-canary]
+# Re-measure the Parallels behaviours vm's guards are built on — the argv size
+# that hangs prlctl, the wording of a refused session, the status vocabulary, the
+# JSON shapes, the address ladder of a cold boot. A Parallels update that moves
+# one of these breaks vm silently, weeks later, as "it hangs sometimes". Run it
+# before and after an upgrade and believe the diff.
+usage = 'arg "[target]" help="VM alias (conventionally windows|linux|macos), or all" default="all"'
+run = '''
+targets="${usage_target}"
+if [ "$targets" = "all" ]; then targets="linux,windows,macos"; fi
+VM_REAL_TARGETS="$targets" cargo nextest run --no-fail-fast \
+  --run-ignored ignored-only -E 'binary(canary)'
+'''
+description = "Re-measure the Parallels quirks vm is built around"
+
 [tasks.crap]
 run = """
 cargo llvm-cov nextest --lcov --output-path target/lcov.info
@@ -50,5 +80,7 @@ cargo crap --lcov target/lcov.info
 description = "Rank complex-and-untested functions (CRAP metric)"
 
 [tasks.install]
-run = "cargo install --path . --locked"
+# --bin vm: the package also builds `fake-prlctl` for the lifecycle tests, and
+# a test double has no business in anyone's PATH.
+run = "cargo install --path . --locked --bin vm"
 description = "Install vm into ~/.cargo/bin"

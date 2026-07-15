@@ -217,6 +217,23 @@ fn a_big_payload_into_a_command_that_never_reads_it_does_not_deadlock() {
     assert_eq!(code, 7, "the command's own exit code, not a hang");
 }
 
+/// The same deadlock, in the guest it would actually wedge: a Windows pipe
+/// buffer fills exactly as readily, and the agent that fills it is the same one.
+/// Left to unix, this was a test of the thread on the platform whose pipes the
+/// thread was not written for.
+#[cfg(windows)]
+#[test]
+fn a_big_payload_into_a_command_that_never_reads_it_does_not_deadlock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = "x".repeat(1024 * 1024);
+    let (code, _) = agent_exec_stdin(
+        &["cmd", "/C", "exit 7"],
+        tmp.path().to_str().unwrap(),
+        &payload,
+    );
+    assert_eq!(code, 7, "the command's own exit code, not a hang");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_command_with_no_payload_reads_the_null_device() {
@@ -230,6 +247,19 @@ fn a_command_with_no_payload_reads_the_null_device() {
     );
     assert_eq!(code, 0);
     assert_eq!(stdout, "got:[]", "stdout: {stdout:?}");
+}
+
+/// The Windows half of the same contract. `sort` reads stdin to the end and
+/// prints what it read: it returns at all only because stdin is already at EOF,
+/// and it prints nothing only because that EOF came before any byte. An open
+/// pipe nobody will ever write to would hang it here, exactly as `cat` hangs.
+#[cfg(windows)]
+#[test]
+fn a_command_with_no_payload_reads_the_null_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout) = agent_exec(&["sort"], tmp.path().to_str().unwrap());
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
 }
 
 // ── the liveness channel ─────────────────────────────────────────────────────

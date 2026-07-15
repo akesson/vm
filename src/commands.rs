@@ -1,7 +1,8 @@
+use crate::clock::ticks;
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::exit::usage;
 use crate::ssh::SshTarget;
-use crate::{crumb, lock, mapping, notice, prl, ssh, sync};
+use crate::{crumb, journal, lock, mapping, notice, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -74,7 +75,7 @@ pub fn bring_up(alias: &str, vm: &VmConfig) -> Result<SshTarget> {
     if up.woke {
         wait_for_ssh(alias, &target);
     }
-    if up.woke || started.elapsed() >= HEARTBEAT {
+    if up.woke || started.elapsed() >= heartbeat() {
         crumb!(
             "vm ▸ {alias} ▸ ready at {} ▸ {:.1}s",
             target.host,
@@ -86,8 +87,17 @@ pub fn bring_up(alias: &str, vm: &VmConfig) -> Result<SshTarget> {
 
 /// A wait worth narrating, and the point past which a guest that has an IP but
 /// no ssh is more likely broken than slow.
-const HEARTBEAT: Duration = Duration::from_secs(10);
-const SSH_TIMEOUT: Duration = Duration::from_secs(60);
+fn heartbeat() -> Duration {
+    ticks(10)
+}
+fn ssh_timeout() -> Duration {
+    ticks(60)
+}
+
+/// How often a door that has not opened yet is knocked on again.
+fn poll() -> Duration {
+    ticks(2)
+}
 
 /// Wait for a freshly woken guest to accept ssh.
 ///
@@ -98,9 +108,9 @@ const SSH_TIMEOUT: Duration = Duration::from_secs(60);
 /// `--no-sync`) working instead of being blocked here on a door it never needed.
 fn wait_for_ssh(alias: &str, target: &SshTarget) {
     let started = Instant::now();
-    let mut next_beat = HEARTBEAT;
+    let mut next_beat = heartbeat();
     while !ssh::reachable(target) {
-        if started.elapsed() >= SSH_TIMEOUT {
+        if started.elapsed() >= ssh_timeout() {
             notice!(
                 "vm ▸ {alias} ▸ WARNING: no ssh at {} {}s after the guest came up — \
                  continuing anyway (guest sshd not running? see `vm doctor {alias}`)",
@@ -114,11 +124,11 @@ fn wait_for_ssh(alias: &str, target: &SshTarget) {
                 "vm ▸ {alias} ▸ waiting for ssh at {} — {}s of {}s",
                 target.destination(),
                 started.elapsed().as_secs(),
-                SSH_TIMEOUT.as_secs()
+                ssh_timeout().as_secs()
             );
-            next_beat = started.elapsed() + HEARTBEAT;
+            next_beat = started.elapsed() + heartbeat();
         }
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(poll());
     }
 }
 
@@ -142,7 +152,7 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
         return Ok(());
     }
     let agent = agent_abs_path(vm);
-    let mut next_beat = HEARTBEAT;
+    let mut next_beat = heartbeat();
     loop {
         match prl::exec_elevated(&vm.parallels_name, &[&agent, "_version"])?
             .stdin(std::process::Stdio::null())
@@ -159,7 +169,7 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
             Ok(_) => {}
             Err(err) => return Err(err).context("probing the guest's elevated session"),
         }
-        if started.elapsed() >= SESSION_TIMEOUT {
+        if started.elapsed() >= session_timeout() {
             notice!(
                 "vm ▸ {alias} ▸ WARNING: Parallels Tools accepted no elevated session {}s \
                  after the guest came up — continuing anyway (see `vm doctor {alias}`)",
@@ -171,11 +181,11 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
             crumb!(
                 "vm ▸ {alias} ▸ waiting for the guest's elevated session — {}s of {}s",
                 started.elapsed().as_secs(),
-                SESSION_TIMEOUT.as_secs()
+                session_timeout().as_secs()
             );
-            next_beat = started.elapsed() + HEARTBEAT;
+            next_beat = started.elapsed() + heartbeat();
         }
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(poll());
     }
     crumb!(
         "vm ▸ {alias} ▸ ready ▸ {:.1}s",
@@ -187,7 +197,9 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
 /// How long Parallels Tools gets to accept an exec session after a wake.
 /// Measured on Parallels 26.4: a resumed macOS guest takes ~10s; the rest are
 /// ready at once.
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+fn session_timeout() -> Duration {
+    ticks(60)
+}
 
 pub fn ls() -> Result<i32> {
     let cfg = Config::load()?;
@@ -220,7 +232,7 @@ pub fn ls() -> Result<i32> {
     }
     let widths = column_widths(&rows);
     for row in &rows {
-        println!("{}", format_row(row, &widths));
+        journal::to_stdout(&format_row(row, &widths));
     }
     Ok(0)
 }
