@@ -8,7 +8,23 @@ permissions:
   contents: write
 
 jobs:
+  # One job creates the release, alone, before any builder runs. When the five
+  # builders raced `gh release create || true`, two could win at once and GitHub
+  # minted two release objects on one tag — v0.2.0 shipped with an empty twin
+  # that "latest release" tooling could land on.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the release if the tag does not have one yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "${{ github.ref_name }}" \
+            || gh release create "${{ github.ref_name }}" --verify-tag --generate-notes
+
   build:
+    needs: create-release
     strategy:
       matrix:
         include:
@@ -47,5 +63,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" --generate-notes 2>/dev/null || true
           gh release upload "${{ github.ref_name }}" "vm-${{ matrix.triple }}"* --clobber
