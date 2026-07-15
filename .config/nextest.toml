@@ -1,0 +1,20 @@
+# The real-VM suite (`tests/real_vm.rs`) and the quirk canary (`tests/canary.rs`)
+# each drive one shared, mutable resource: the actual Parallels guest. They stop
+# it, cold-boot it, and SIGKILL runs against it mid-flight. Two such tests at once
+# fight over that single guest — one test's `prlctl start` lands while another has
+# it half-booted, Parallels rejects the second ("'macOS' is not stopped …"), and
+# vm reports that as an infra failure (exit 125). The failure is a race in the
+# tests, not in vm: on a fast-booting Linux guest the window is milliseconds and
+# nothing collided, but a macOS guest takes ~22s to boot, so every concurrent test
+# lost the race. So these two binaries run one test at a time.
+#
+# This changes nothing for the ordinary suite: no other binary matches, and both
+# binaries are `#[ignore]`d out of a normal `cargo nextest run` anyway. It only
+# takes effect under `mise run test-real` / `mise run quirk-canary`, which pass
+# `--run-ignored`.
+[test-groups.real-guest]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(real_vm) | binary(canary)'
+test-group = 'real-guest'

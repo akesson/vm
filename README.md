@@ -475,6 +475,11 @@ mise run test-real [alias]      # the suite, against real Parallels guests
 mise run quirk-canary [alias]   # re-measure the Parallels behaviour vm is built on
 ```
 
+Both lanes drive one shared thing — the actual guest — so they run one test at a
+time (`.config/nextest.toml` caps them at a single thread). Let two of them boot
+the same cold guest at once and one wins the `prlctl start` while the other is told
+"not stopped"; the rest of the suite stays fully parallel.
+
 **`test-real`** is the only lane that can catch what a fake never will: a killed
 host leaving its guest command orphaned, a cold boot picking an address the guest
 will not keep, an exit code collapsing to zero over the console channel.
