@@ -39,6 +39,7 @@
 //! hang instead of removing it, and still SIGKILLs gnome-session every time.
 
 use crate::config::VmConfig;
+use crate::crumb;
 use crate::prl;
 use crate::ssh::{self, SshTarget};
 use anyhow::{Context, Result, bail};
@@ -105,7 +106,7 @@ pub fn install(alias: &str, vm: &VmConfig) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    eprintln!("vm ▸ {alias} ▸ {UNIT_NAME} installed");
+    crumb!("vm ▸ {alias} ▸ {UNIT_NAME} installed");
     Ok(())
 }
 

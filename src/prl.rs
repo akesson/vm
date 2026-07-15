@@ -1,3 +1,4 @@
+use crate::crumb;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::process::{Command, Output, Stdio};
@@ -65,11 +66,11 @@ pub fn ensure_running(alias: &str, name: &str) -> Result<bool> {
     match vm.status.as_str() {
         "running" => Ok(false),
         "stopped" => {
-            eprintln!("vm ▸ {alias} ▸ '{name}' is stopped — starting it…");
+            crumb!("vm ▸ {alias} ▸ '{name}' is stopped — starting it…");
             prlctl(&["start", name]).map(|_| true)
         }
         status @ ("suspended" | "paused") => {
-            eprintln!("vm ▸ {alias} ▸ '{name}' is {status} — resuming it…");
+            crumb!("vm ▸ {alias} ▸ '{name}' is {status} — resuming it…");
             prlctl(&["resume", name]).map(|_| true)
         }
         other => bail!(
@@ -190,7 +191,7 @@ fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
             Step::Fail(msg) => bail!("{msg}"),
             Step::Wait => {
                 if waited >= next_beat {
-                    eprintln!(
+                    crumb!(
                         "vm ▸ {alias} ▸ '{name}' {}, no IP yet — {}s of {}s",
                         vm.status,
                         waited.as_secs(),

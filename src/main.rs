@@ -3,7 +3,7 @@ mod cli;
 use anyhow::Result;
 use clap::Parser;
 use vm::exec::host::ExecOptions;
-use vm::{commands, deploy, doctor, exec, proto, sync};
+use vm::{commands, deploy, doctor, exec, notice, proto, sync};
 
 impl From<cli::ExecOpts> for ExecOptions {
     fn from(opts: cli::ExecOpts) -> ExecOptions {
@@ -22,6 +22,15 @@ impl From<cli::ExecOpts> for ExecOptions {
 
 fn main() {
     let cli = cli::Cli::parse();
+    // Only the host half of vm keeps a journal. The guest verbs below are the
+    // agent, invoked inside a VM by a host `vm` over ssh or prlctl: their
+    // stdout is a wire protocol the host parses back, and a log file written
+    // inside a guest nobody shells into would be a log file nobody reads.
+    // See `vm::journal`.
+    if !is_guest_verb(&cli.command) {
+        vm::journal::install_panic_hook();
+        vm::journal::init(cli.quiet);
+    }
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
@@ -30,13 +39,29 @@ fn main() {
             // question is whether it's the user's setup (usage, exit 2) or an
             // operational fault (infra, exit 125). See `vm::exit`.
             if err.downcast_ref::<vm::exit::UsageError>().is_some() {
-                eprintln!("vm: config error: {err:#}");
+                notice!("vm: config error: {err:#}");
                 std::process::exit(vm::exit::USAGE);
             }
-            eprintln!("vm: error: {err:#}");
+            notice!("vm: error: {err:#}");
             std::process::exit(vm::exit::INFRA);
         }
     }
+}
+
+/// The agent-side verbs — the ones a host `vm` invokes inside a guest, never a
+/// human. Hidden in the CLI (`_exec`, `_tree`, …) and journal-free.
+fn is_guest_verb(command: &cli::Command) -> bool {
+    use cli::Command::*;
+    matches!(
+        command,
+        GuestVersion
+            | GuestSyncInit { .. }
+            | GuestSyncApply { .. }
+            | GuestTree { .. }
+            | GuestFirstSync { .. }
+            | GuestIdle
+            | GuestExec
+    )
 }
 
 /// Print the form advisories for a command line the caller typed, naming the
@@ -45,7 +70,7 @@ fn advise(verb: &str, target: &str, cmd: &[String]) {
     for note in exec::advise::advisories(verb, target, cmd, |path| {
         std::path::Path::new(path).is_file()
     }) {
-        eprintln!("vm ▸ note: {note}");
+        notice!("vm ▸ note: {note}");
     }
 }
 

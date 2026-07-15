@@ -1,4 +1,5 @@
 use super::job;
+use crate::crumb;
 use crate::proto::{self, ExecRequest};
 use crate::sync::expand_home;
 use anyhow::{Context, Result};
@@ -99,7 +100,7 @@ pub fn first_sync(repo: &str, cmd: &str) -> Result<i32> {
         return Ok(0); // already set up
     }
 
-    eprintln!("vm ▸ first-sync ▸ $ {cmd}");
+    crumb!("vm ▸ first-sync ▸ $ {cmd}");
     // Same environment as a normal `vm exec` command, so per-user tool dirs
     // (`mise`, `cargo`, …) resolve. Plain wait, not the stdin liveness watcher
     // exec() uses: the host holds our stdin at /dev/null, so a watcher would see

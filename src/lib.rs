@@ -10,6 +10,7 @@ pub mod exec;
 pub mod exit;
 pub mod guest_env;
 pub mod idle;
+pub mod journal;
 pub mod lock;
 pub mod mapping;
 pub mod prl;

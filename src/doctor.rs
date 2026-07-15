@@ -9,7 +9,7 @@
 
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::proto::{PROTO_VERSION, VersionInfo};
-use crate::{commands, prl, prldnd, ssh};
+use crate::{commands, crumb, notice, prl, prldnd, ssh};
 use anyhow::Result;
 
 struct Report {
@@ -54,7 +54,7 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
         }
         Err(err) => {
             r.fail("config", &format!("{err:#}"));
-            eprintln!("vm ▸ doctor ▸ {} problem(s)", r.failures);
+            notice!("vm ▸ doctor ▸ {} problem(s)", r.failures);
             return Ok(1);
         }
     };
@@ -72,13 +72,36 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             "~/.ssh/id_ed25519 missing — `ssh-keygen -t ed25519`",
         );
     }
-    if crate::reap::launchd_loaded() {
-        r.ok("reap timer", crate::reap::LAUNCHD_LABEL);
-    } else {
+    if !crate::reap::launchd_loaded() {
         r.skip(
             "reap timer",
             "not installed — `vm reap --install` shuts down idle VMs",
         );
+    } else if crate::reap::plist_is_stale() {
+        // Installed jobs keep running the plist they were installed with. A
+        // pre-journal one still redirects every sweep into ~/Library/Logs, a
+        // file nothing rotates and nothing timestamps — so it would go on
+        // growing forever, silently, on exactly the machines that upgraded.
+        r.fail(
+            "reap timer",
+            "installed from a pre-journal vm — sweeps still go to an unrotated log; \
+             `vm reap --install` to move them to the journal",
+        );
+    } else {
+        r.ok("reap timer", crate::reap::LAUNCHD_LABEL);
+    }
+    match crate::journal::status() {
+        Some((path, bytes)) => r.ok(
+            "journal",
+            &format!("{} — {} KB", path.display(), bytes.div_ceil(1024)),
+        ),
+        None => r.skip(
+            "journal",
+            &crate::journal::path().map_or_else(
+                || "no HOME — nowhere to keep one".to_string(),
+                |p| format!("{} — written on the next run", p.display()),
+            ),
+        ),
     }
 
     for (name, vm) in &cfg.vm {
@@ -203,10 +226,12 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
     }
 
     if r.failures == 0 {
-        eprintln!("vm ▸ doctor ▸ all checks passed");
+        crumb!("vm ▸ doctor ▸ all checks passed");
         Ok(0)
     } else {
-        eprintln!("vm ▸ doctor ▸ {} problem(s)", r.failures);
+        // A verdict, not narration: `vm doctor -q` printing thirty check lines
+        // and swallowing the count would be the wrong way round.
+        notice!("vm ▸ doctor ▸ {} problem(s)", r.failures);
         Ok(1)
     }
 }

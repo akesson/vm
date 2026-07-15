@@ -37,6 +37,8 @@ const VM_FLAGS: &[&str] = &[
     "--no-writeback",
     "--guest-env",
     "--with-file",
+    "--quiet",
+    "-q",
 ];
 
 pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
@@ -62,8 +64,8 @@ pub fn run(target: &str, opts: &ClaudeOptions) -> Result<i32> {
 /// effect here. Refuse rather than warn: the flags in question are the ones
 /// that hold vm back from touching things (`--no-writeback` keeps the host tree
 /// untouched), and a silently dropped safety flag is exactly the failure worth
-/// paying an exit-2 for. Claude's own flags are unaffected — only these three
-/// names are reserved.
+/// paying an exit-2 for. Claude's own flags are unaffected — only the names in
+/// [`VM_FLAGS`] are reserved.
 fn reject_misplaced_vm_flags(claude_args: &[String]) -> Result<()> {
     for arg in claude_args {
         let name = arg.split('=').next().unwrap_or(arg);

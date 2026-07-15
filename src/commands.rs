@@ -1,7 +1,7 @@
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::exit::usage;
 use crate::ssh::SshTarget;
-use crate::{lock, mapping, prl, ssh, sync};
+use crate::{crumb, lock, mapping, notice, prl, ssh, sync};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -75,7 +75,7 @@ pub fn bring_up(alias: &str, vm: &VmConfig) -> Result<SshTarget> {
         wait_for_ssh(alias, &target);
     }
     if up.woke || started.elapsed() >= HEARTBEAT {
-        eprintln!(
+        crumb!(
             "vm ▸ {alias} ▸ ready at {} ▸ {:.1}s",
             target.host,
             started.elapsed().as_secs_f32()
@@ -101,7 +101,7 @@ fn wait_for_ssh(alias: &str, target: &SshTarget) {
     let mut next_beat = HEARTBEAT;
     while !ssh::reachable(target) {
         if started.elapsed() >= SSH_TIMEOUT {
-            eprintln!(
+            notice!(
                 "vm ▸ {alias} ▸ WARNING: no ssh at {} {}s after the guest came up — \
                  continuing anyway (guest sshd not running? see `vm doctor {alias}`)",
                 target.destination(),
@@ -110,7 +110,7 @@ fn wait_for_ssh(alias: &str, target: &SshTarget) {
             return;
         }
         if started.elapsed() >= next_beat {
-            eprintln!(
+            crumb!(
                 "vm ▸ {alias} ▸ waiting for ssh at {} — {}s of {}s",
                 target.destination(),
                 started.elapsed().as_secs(),
@@ -160,7 +160,7 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
             Err(err) => return Err(err).context("probing the guest's elevated session"),
         }
         if started.elapsed() >= SESSION_TIMEOUT {
-            eprintln!(
+            notice!(
                 "vm ▸ {alias} ▸ WARNING: Parallels Tools accepted no elevated session {}s \
                  after the guest came up — continuing anyway (see `vm doctor {alias}`)",
                 started.elapsed().as_secs()
@@ -168,7 +168,7 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
             break;
         }
         if started.elapsed() >= next_beat {
-            eprintln!(
+            crumb!(
                 "vm ▸ {alias} ▸ waiting for the guest's elevated session — {}s of {}s",
                 started.elapsed().as_secs(),
                 SESSION_TIMEOUT.as_secs()
@@ -177,7 +177,7 @@ pub fn bring_up_elevated(alias: &str, vm: &VmConfig) -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ▸ ready ▸ {:.1}s",
         started.elapsed().as_secs_f32()
     );
@@ -393,7 +393,7 @@ pub fn sync_repo(
         [] => String::new(),
         extra => format!(" ▸ forced {}", extra.join(", ")),
     };
-    eprintln!(
+    crumb!(
         "vm ▸ {alias} ▸ synced {} ▸ tree {}{forced} ▸ {:.1}s",
         repo.name,
         &snap.tree[..10],
@@ -549,7 +549,7 @@ pub fn shot(alias: &str, file: Option<std::path::PathBuf>) -> Result<i32> {
     });
     let path = file.to_string_lossy().into_owned();
     prl::capture(&vm.parallels_name, &path)?;
-    eprintln!("vm ▸ {alias} ▸ screenshot ▸ {path}");
+    crumb!("vm ▸ {alias} ▸ screenshot ▸ {path}");
     Ok(0)
 }
 
@@ -571,7 +571,7 @@ pub fn clean(alias: &str) -> Result<i32> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    eprintln!("vm ▸ {alias} ▸ removed {guest_repo}");
+    crumb!("vm ▸ {alias} ▸ removed {guest_repo}");
     Ok(0)
 }
 
@@ -601,14 +601,14 @@ pub fn with_snapshot(
     ensure_snapshot_headroom(&vm.parallels_name)?;
 
     let id = prl::snapshot_create(&vm.parallels_name, &format!("vm-with-snapshot-{alias}"))?;
-    eprintln!("vm ▸ {alias} ▸ snapshot {id} taken");
+    crumb!("vm ▸ {alias} ▸ snapshot {id} taken");
     let run = crate::exec::host::exec_in(alias, vm, opts);
     // Roll back even when the command failed — that's the whole point.
     let restore = prl::snapshot_switch(&vm.parallels_name, &id)
         .and_then(|()| prl::snapshot_delete(&vm.parallels_name, &id));
     match restore {
-        Ok(()) => eprintln!("vm ▸ {alias} ▸ rolled back to pre-run state"),
-        Err(err) => eprintln!(
+        Ok(()) => crumb!("vm ▸ {alias} ▸ rolled back to pre-run state"),
+        Err(err) => notice!(
             "vm ▸ {alias} ▸ WARNING: rollback failed ({err:#}); snapshot {id} kept — \
              restore manually with `prlctl snapshot-switch '{}' --id '{id}'`",
             vm.parallels_name
@@ -623,7 +623,7 @@ pub fn with_snapshot(
 fn sweep_stale_snapshots(alias: &str, name: &str) -> Result<()> {
     for (id, snap) in prl::snapshot_list(name)? {
         if snap.starts_with("vm-with-snapshot-") {
-            eprintln!(
+            notice!(
                 "vm ▸ {alias} ▸ WARNING: deleting stale snapshot {snap} — a previous \
                  with-snapshot run died before rolling back; its changes are still in the VM"
             );
