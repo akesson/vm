@@ -27,9 +27,11 @@ jobs:
         with:
           tool: cargo-nextest
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # --features test-fake builds and lints the fake-prlctl test double, which
+      # is gated off by default so a plain `cargo install` never ships it.
+      - run: cargo clippy --all-targets --features test-fake -- -D warnings
       - run: cargo clippy -p a11y-probe --all-targets -- -D warnings
-      - run: cargo nextest run
+      - run: cargo nextest run --features test-fake
 
   crap:
     name: coverage + cargo-crap
@@ -45,5 +47,5 @@ jobs:
         with:
           tool: cargo-nextest,cargo-llvm-cov,cargo-binstall
       - run: cargo binstall -y --force cargo-crap  # --force: rust-cache restores .crates.toml without the binary
-      - run: cargo llvm-cov nextest --lcov --output-path target/lcov.info
+      - run: cargo llvm-cov nextest --features test-fake --lcov --output-path target/lcov.info
       - run: cargo crap --lcov target/lcov.info

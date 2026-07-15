@@ -6,14 +6,23 @@ edition = "2024"
 [workspace]
 members = ["probes/a11y-probe"]
 
+[features]
+# Off by default, and its only job is to gate the `fake-prlctl` bin below out of a
+# plain `cargo install`. The test tasks in mise.toml and CI turn it on; the
+# supported way to build and run the suite is `mise run test`, which does.
+test-fake = []
+
 # The stand-in for `prlctl` that the lifecycle tests point `$VM_PRLCTL` at. A
 # binary rather than a shell script so it runs on all three CI runners, and a
 # binary of *this* package so tests reach it through `CARGO_BIN_EXE_fake-prlctl`
-# instead of guessing at a path under target/. It ships nowhere: `mise install`
-# installs `--bin vm`, and the release workflow copies that one binary by name.
+# instead of guessing at a path under target/. `required-features` is what keeps
+# it out of anyone's PATH: with `test-fake` off — the default, and what a bare
+# `cargo install` uses — cargo neither builds nor installs it, so `vm` is the only
+# binary that ships. The release workflow copies `vm` by name regardless.
 [[bin]]
 name = "fake-prlctl"
 path = "tests/bin/fake_prlctl.rs"
+required-features = ["test-fake"]
 
 [dependencies]
 anyhow = "1.0.103"

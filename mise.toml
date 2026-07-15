@@ -8,18 +8,22 @@ run = "cargo build"
 description = "Build the vm binary"
 
 [tasks.test]
-run = "cargo nextest run"
+# --features test-fake builds the `fake-prlctl` test double the lifecycle tests
+# drive; it is off by default so a plain `cargo install` never ships it.
+run = "cargo nextest run --features test-fake"
 description = "Run tests"
 
 [tasks.lint]
 usage = 'flag "--check" help="Check only, do not auto-fix"'
 run = '''
+# --features test-fake so `--all-targets` also lints the fake-prlctl bin, which
+# is gated off by default (see [tasks.test]).
 if [ "${usage_check}" = "true" ]; then
   cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets -- -D warnings
+  cargo clippy --workspace --all-targets --features test-fake -- -D warnings
 else
   cargo fmt --all
-  cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings
+  cargo clippy --workspace --all-targets --features test-fake --fix --allow-dirty -- -D warnings
 fi
 '''
 description = "Format and lint (--check for CI mode)"
@@ -74,13 +78,14 @@ description = "Re-measure the Parallels quirks vm is built around"
 
 [tasks.crap]
 run = """
-cargo llvm-cov nextest --lcov --output-path target/lcov.info
+cargo llvm-cov nextest --features test-fake --lcov --output-path target/lcov.info
 cargo crap --lcov target/lcov.info
 """
 description = "Rank complex-and-untested functions (CRAP metric)"
 
 [tasks.install]
-# --bin vm: the package also builds `fake-prlctl` for the lifecycle tests, and
-# a test double has no business in anyone's PATH.
+# --bin vm is belt to the braces of `fake-prlctl`'s `required-features`: the fake
+# is gated off by default, so a plain `cargo install` already skips it — naming
+# the one real binary just says so out loud.
 run = "cargo install --path . --locked --bin vm"
 description = "Install vm into ~/.cargo/bin"
