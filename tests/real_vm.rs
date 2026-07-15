@@ -132,17 +132,46 @@ fn a_guest_commands_exit_code_comes_back_as_it_is() {
     }
 }
 
-/// A command the guest cannot find is 127 — its answer, not vm's. It must never
-/// be 125: a task runner reads that as "vm hiccuped" and would retry a typo until
-/// it gave up.
+/// A command the guest cannot find answers with a *not-found* code — the
+/// command's own result, never vm's. It must never be 125: a task runner reads
+/// that as "vm hiccuped" and would retry a typo until it gave up.
+///
+/// Which code depends on who answers. The script form rides the guest's own
+/// shell, and each shell has its convention: `sh` says 127, `cmd.exe` says 1
+/// (its convention, not a vm bug — the `--or-native` tests in exec/host.rs
+/// document the same fact). The exec form, unwrapped, is the agent's own spawn,
+/// and there the answer is vm's contract: 127 on every OS.
 #[test]
 #[ignore = "drives a real Parallels guest"]
-fn a_command_the_guest_cannot_find_is_127_and_never_an_infra_code() {
+fn a_command_the_guest_cannot_find_is_not_found_and_never_an_infra_code() {
     for alias in targets() {
+        // Script form: the shell's own code.
+        let expected = match guest_os(&alias) {
+            vm::config::GuestOs::Windows => 1,
+            _ => 127,
+        };
         let run = vm(&["exec", &alias, "--", "vm-test-definitely-not-an-executable"]);
         assert_eq!(
+            run.code, expected,
+            "{alias}: the shell answers a missing command with {expected}, not {}: {}",
+            run.code, run.stderr
+        );
+
+        // Exec form, unwrapped: the agent's spawn, 127 everywhere. Unwrapped
+        // because mise answers a missing binary with its own 1, which would
+        // test mise's convention rather than the agent's contract.
+        let run = vm(&[
+            "exec",
+            &alias,
+            "--guest-env",
+            "none",
+            "--",
+            "vm-test-definitely-not-an-executable",
+            "with-an-argument",
+        ]);
+        assert_eq!(
             run.code, 127,
-            "{alias}: a missing command must be 127, not {}: {}",
+            "{alias}: the agent answers a missing command with 127, not {}: {}",
             run.code, run.stderr
         );
     }
@@ -164,8 +193,14 @@ fn killing_the_host_kills_the_guest_command_it_left_behind() {
     for alias in targets() {
         let marker = format!("vm-orphan-{}", std::process::id());
         // A command that will outlive its host unless something stops it, and
-        // that can be found again from outside by the name it runs under.
-        let unix = format!("sleep 600 # {marker}");
+        // that can be found again from outside by the name it runs under. The
+        // marker must be a *command* (`: marker`), not a comment: a comment
+        // would be discarded when sh exec-replaces itself with the sleep
+        // (measured on the macOS guest), and no process would carry the marker
+        // — which is how this test once passed vacuously there, its probe
+        // seeing nothing before the kill as after. The compound form keeps sh
+        // resident with the whole script — marker included — in its argv.
+        let unix = format!("sleep 600; : {marker}");
         let windows = format!("ping -n 600 127.0.0.1 >NUL & rem {marker}");
 
         let mut child = Command::new(VM_BIN)
@@ -178,6 +213,15 @@ fn killing_the_host_kills_the_guest_command_it_left_behind() {
 
         // Long enough to be past the sync and actually running in the guest.
         std::thread::sleep(Duration::from_secs(20));
+        // The probe must see the command *before* the kill, or "gone" below
+        // would be vacuous — this probe once spent its life broken (its quotes
+        // were mangled on the way to cmd.exe) and reported "still running"
+        // forever; a positive control is what catches the next breakage.
+        assert!(
+            command_is_running(&alias, &marker),
+            "{alias}: the probe cannot see the command it is about to orphan — \
+             the probe is broken, not the contract"
+        );
         child.kill().expect("the host dies");
         child.wait().ok();
 
@@ -201,21 +245,37 @@ fn killing_the_host_kills_the_guest_command_it_left_behind() {
     }
 }
 
-/// Whether a command carrying `marker` is still running in the guest. Asked with
+/// Whether the orphan-test command is still running in the guest. Asked with
 /// a *fresh* `vm exec`, which is the only honest way: the guest is the authority
 /// on what the guest is doing.
+///
+/// On unix the probe greps for `marker` and excludes itself. On Windows it
+/// looks for the ping the command runs as, by image name: this test is the only
+/// thing that pings in the guest, the probe (findstr) never matches itself, and
+/// nothing here needs a quote — the previous probe (`find /c "marker"`) lost
+/// its quotes on the way into cmd.exe and answered "still running" forever.
+/// Case-insensitive because tasklist prints `PING.EXE`; findstr exits 1 on no
+/// match, so the verdict is read from stdout, not the exit code.
 fn command_is_running(alias: &str, marker: &str) -> bool {
-    let run = exec(
-        alias,
-        &format!("ps ax | grep -v grep | grep -c '{marker}' || true"),
-        &format!("tasklist /v | find /c \"{marker}\""),
-    );
-    run.stdout
-        .trim()
-        .lines()
-        .next()
-        .and_then(|n| n.trim().parse::<u32>().ok())
-        != Some(0)
+    match guest_os(alias) {
+        vm::config::GuestOs::Windows => {
+            let run = exec(alias, "", "tasklist | findstr /i ping");
+            !run.stdout.trim().is_empty()
+        }
+        _ => {
+            let run = exec(
+                alias,
+                &format!("ps ax | grep -v grep | grep -c '{marker}' || true"),
+                "",
+            );
+            run.stdout
+                .trim()
+                .lines()
+                .next()
+                .and_then(|n| n.trim().parse::<u32>().ok())
+                != Some(0)
+        }
+    }
 }
 
 // ── the wake ─────────────────────────────────────────────────────────────────
