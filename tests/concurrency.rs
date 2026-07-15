@@ -13,7 +13,7 @@
 
 mod fake;
 
-use fake::{Fake, cold_boot, running, sleeps_for};
+use fake::{Fake, running, sleeps_for};
 use std::time::{Duration, Instant};
 
 /// Two execs against one guest run at the same time. The use lock is *shared*
@@ -65,7 +65,7 @@ fn two_execs_on_one_guest_run_at_the_same_time() {
 fn concurrent_execs_against_a_cold_guest_all_run_and_start_it_once() {
     let fake = Fake::new("windows");
     fake.scenario(
-        &cold_boot(),
+        &fake::cold_boot(),
         &[fake.rule_exec_passthrough(), fake.rule_ssh("true", "")],
     );
     fake.with_repo();
