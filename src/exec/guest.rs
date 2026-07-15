@@ -32,7 +32,9 @@ pub fn exec() -> Result<i32> {
 
     // Always a plain argv: the host composed any shell invocation before sending
     // it (it knows this guest's OS from the config), so there is nothing here to
-    // interpret — just spawn what was asked for, byte for byte.
+    // interpret — just spawn what was asked for, byte for byte. "Byte for byte"
+    // is what [`super::command_for`] is for: for cmd.exe it must sidestep std's
+    // CRT-style quoting, which cmd does not parse.
     //
     // The PATH the child gets is the agent's augmented one, unless the request
     // carried its own — so that is also the PATH a not-found below has to report.
@@ -40,8 +42,7 @@ pub fn exec() -> Result<i32> {
     let searched = super::path_override(&req.env)
         .map(str::to_string)
         .unwrap_or_else(|| path.clone());
-    let mut cmd = Command::new(&req.argv[0]);
-    cmd.args(&req.argv[1..]);
+    let mut cmd = super::command_for(&req.argv);
     cmd.current_dir(&cwd)
         .env("PATH", path)
         .envs(&req.env)
@@ -210,15 +211,12 @@ fn start_liveness_watcher(timeout: Duration) {
 /// without having to be running on it); this is for the first-sync hook, whose
 /// command is a string the guest env hands us.
 fn shell_command(script: &str) -> Command {
-    if cfg!(windows) {
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", script]);
-        cmd
+    let (bin, flag) = if cfg!(windows) {
+        ("cmd", "/C")
     } else {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", script]);
-        cmd
-    }
+        ("sh", "-c")
+    };
+    super::command_for(&[bin.to_string(), flag.to_string(), script.to_string()])
 }
 
 /// Non-interactive ssh sessions get a bare PATH; put the usual per-user tool
