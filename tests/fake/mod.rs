@@ -19,7 +19,23 @@ use std::path::Path;
 use std::process::Command;
 
 const VM_BIN: &str = env!("CARGO_BIN_EXE_vm");
-const FAKE_BIN: &str = env!("CARGO_BIN_EXE_fake-prlctl");
+
+/// The compiled fake, or a message telling you how to build it. The fake lives
+/// behind the `test-fake` feature (Cargo.toml) so a bare `cargo install` never
+/// carries it into anyone's PATH — which means a suite run that forgot the
+/// feature has no fake to point vm at. `option_env!` (not `env!`) keeps that a
+/// clear runtime message rather than a cryptic missing-variable compile error,
+/// so `cargo build`/`cargo clippy` still work without the feature; only actually
+/// running a fake-driven test asks for it.
+fn fake_bin() -> &'static str {
+    match option_env!("CARGO_BIN_EXE_fake-prlctl") {
+        Some(path) => path,
+        None => panic!(
+            "the test fake was not built — run the suite with `mise run test` \
+             (or `cargo nextest run --features test-fake`)"
+        ),
+    }
+}
 
 /// vm's clock, shrunk: a 90-second IP timeout becomes 1.8s, a 2-second poll
 /// 40ms. Slow enough that a loaded CI box does not skip a state, fast enough
@@ -287,8 +303,8 @@ work_root = "~/work"
         cmd.args(args)
             .current_dir(self.dir.path())
             .env("VM_CONFIG", self.dir.path().join("config.toml"))
-            .env("VM_PRLCTL", FAKE_BIN)
-            .env("VM_SSH", FAKE_BIN)
+            .env("VM_PRLCTL", fake_bin())
+            .env("VM_SSH", fake_bin())
             .env("VM_TEST_TICK_MS", TICK_MS)
             .env("FAKE_PRLCTL_DIR", self.dir.path())
             .env("FAKE_PRLCTL_VM", VM_BIN)
