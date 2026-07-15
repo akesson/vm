@@ -29,6 +29,18 @@ fn two_execs_on_one_guest_run_at_the_same_time() {
     let mut args = vec!["exec", "windows", "--no-sync", "--"];
     args.extend(cmd.iter().map(String::as_str));
 
+    // One exec alone, timed on this machine right now, is the yardstick: a fixed
+    // cap flaked on a loaded CI runner where a single exec took 2.1s by itself.
+    let started = Instant::now();
+    let status = fake
+        .command(&args)
+        .spawn()
+        .expect("vm runs")
+        .wait()
+        .expect("vm exits");
+    assert!(status.success(), "the yardstick exec failed: {status:?}");
+    let single = started.elapsed();
+
     let started = Instant::now();
     let runs: Vec<_> = (0..2)
         .map(|_| fake.command(&args).spawn().expect("vm runs"))
@@ -39,9 +51,13 @@ fn two_execs_on_one_guest_run_at_the_same_time() {
     }
     let elapsed = started.elapsed();
 
+    // Together ≈ one exec's time; serialised = two of them. Halfway splits the
+    // outcomes however slow the machine is, and never tighter than the old cap.
+    let cap = (single * 3 / 2).max(Duration::from_millis(1800));
     assert!(
-        elapsed < Duration::from_millis(1800),
-        "two 1s commands took {elapsed:?} — they were serialised, not run together"
+        elapsed < cap,
+        "two 1s commands took {elapsed:?} (one alone took {single:?}) — \
+         they were serialised, not run together"
     );
 }
 
