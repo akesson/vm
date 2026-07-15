@@ -1,8 +1,8 @@
 //! Per-VM advisory locks: a kernel-maintained "use count".
 //!
-//! Every command that uses a VM (exec, sync, deploy, clean, start) holds a
+//! Every command that uses a VM (exec, run, sync, deploy, clean, shot) holds a
 //! shared flock on `~/.config/vm/locks/<alias>` for its duration; commands
-//! that take the VM away (stop, exec --with-snapshot, reap) take an exclusive one.
+//! that take the VM away (exec --with-snapshot, reap) take an exclusive one.
 //! An exclusive acquire succeeds exactly when no uses are in flight, and the
 //! kernel drops a holder's lock on process death — clean exit, panic, Ctrl-C
 //! or SIGKILL alike — so there are no stale counts to garbage-collect.
@@ -12,12 +12,22 @@
 //! of a run, not the start). Exclusive holders never touch it, so a reap
 //! sweep does not reset the idle clock it is measuring.
 //!
-//! A second, unrelated lock lives here too: [`exclusive_path`] takes a
-//! blocking exclusive flock on an arbitrary file. The sync engine uses it to
-//! serialize the per-(repo, guest) sync critical section — see
-//! [`crate::sync::host::lock_sync`] — which the shared per-VM lock above
-//! deliberately does *not* do (parallel execs on one VM must stay parallel;
-//! only their sync phase needs a single writer).
+//! Two more locks live here, both built on a blocking exclusive flock over an
+//! arbitrary file ([`exclusive_path`]) rather than the use count above:
+//!
+//! - [`bringup`] serialises the *start/resume* of one VM — held only across the
+//!   bring-up decision, so concurrent uses (which all hold the shared lock, and
+//!   so run in parallel) cannot all read a cold guest as `stopped` and all issue
+//!   `prlctl start`, every loser but one getting Parallels' "is not stopped"
+//!   (#40).
+//! - [`crate::sync::host::lock_sync`] serialises the per-(repo, guest) sync
+//!   critical section — which the shared use lock deliberately does *not* do
+//!   (parallel execs on one VM must stay parallel; only their sync phase needs a
+//!   single writer).
+//!
+//! A command that takes all three takes them in the order use → bringup → sync,
+//! and the bringup lock is released before the sync lock is taken, so there is
+//! no cycle.
 
 use anyhow::{Context, Result};
 use std::fs::File;
@@ -38,14 +48,18 @@ impl Drop for VmLock {
     }
 }
 
-fn lock_path(alias: &str) -> Result<PathBuf> {
+fn locks_dir() -> Result<PathBuf> {
     let dir = crate::config::Config::path()
         .parent()
         .map(|p| p.join("locks"))
         .context("config path has no parent directory")?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("cannot create lock dir {}", dir.display()))?;
-    Ok(dir.join(alias))
+    Ok(dir)
+}
+
+fn lock_path(alias: &str) -> Result<PathBuf> {
+    Ok(locks_dir()?.join(alias))
 }
 
 fn open_path(path: &Path) -> Result<File> {
@@ -110,6 +124,26 @@ pub fn exclusive_path(path: &Path, on_wait: impl FnOnce()) -> Result<PathLock> {
         lock_exclusive_blocking(&file)?;
     }
     Ok(PathLock { _file: file })
+}
+
+/// Serialise the bring-up of one VM: at most one `vm` process asks Parallels to
+/// start or resume a given alias at a time (#40).
+///
+/// The use lock ([`shared`]) is deliberately shared, so concurrent execs run in
+/// parallel — which also means nothing stops them all from reading a cold guest
+/// as `stopped` and all issuing `prlctl start`, every loser but one getting
+/// Parallels' "is not stopped". This is what does. It is held only across the
+/// bring-up *decision* — the status read and the one start/resume — never across
+/// the IP wait, so a loser blocks for a moment, not a whole boot.
+///
+/// Taken after the per-VM use lock and released before the sync lock, keeping
+/// the order use → bringup → sync with no cycle. A separate file from
+/// `locks/<alias>` so it does not contend with the shared use lock, and a
+/// formatted name rather than `Path::with_extension` so a dotted alias is not
+/// mangled (a VM literally named `foo.bringup` would then collide with `foo`'s —
+/// contrived enough to leave).
+pub fn bringup(alias: &str, on_wait: impl FnOnce()) -> Result<PathLock> {
+    exclusive_path(&locks_dir()?.join(format!("{alias}.bringup")), on_wait)
 }
 
 /// When the VM was last used via `vm` (lock-file mtime), if ever.
