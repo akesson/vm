@@ -29,6 +29,12 @@
 //! a stopped VM before it decides to start it, which is the whole point: a test
 //! says what the *guest* does, not what vm's nth call happens to get back.
 //!
+//! A `start`/`resume` that lands while the guest is *already* waking is rejected
+//! the way Parallels rejects it ("is not stopped"), so a bug that lets two vm
+//! processes both start one cold guest (#40) shows up as a second `start` in
+//! `calls.log` and a losing process to notice — not a silently-tolerated
+//! double start.
+//!
 //! That is how a cold boot is replayed — stopped, running-with-no-address, a
 //! link-local IPv6, the Parallels ULA, an APIPA address, and finally the DHCP
 //! lease — and how a resume replays the stale status Parallels reports for a beat
@@ -130,6 +136,24 @@ fn guest(dir: &Path, scenario: &Scenario, args: &[String]) -> ! {
             std::process::exit(0);
         }
         "start" | "resume" => {
+            // Parallels rejects a start/resume that lands while the guest is
+            // already on its way up — the collision #40 is about. The first
+            // caller wins and sets the guest moving; a second gets the real
+            // error, with the state left alone so the wake in flight is not
+            // reset. Serialised bring-up means vm never *should* reach here
+            // twice; if a regression does, the losers' `prlctl start` shows up
+            // in calls.log and the concurrency test's "started once" fails.
+            // (The wording is the one measured for a rejected `start`; a rejected
+            // `resume`'s is unmeasured, and nothing in vm parses it — it re-reads
+            // the status instead.)
+            if read(dir, "waking").unwrap_or(0) == 1 {
+                let name = args.get(1).map(String::as_str).unwrap_or("the VM");
+                eprintln!(
+                    "Failed to start the VM: The virtual machine \"{name}\" is not stopped. \
+                     This operation can be performed for stopped virtual machines only."
+                );
+                std::process::exit(1);
+            }
             write(dir, "waking", 1);
             // The phase Parallels reports for a beat *after* the call returns is
             // still the old one; phase 1 is that stale reading.
@@ -288,7 +312,19 @@ fn read(dir: &Path, key: &str) -> Option<usize> {
 }
 
 fn write(dir: &Path, key: &str, value: usize) {
-    let _ = std::fs::write(state_path(dir, key), value.to_string());
+    // Atomic replace, not a truncate-in-place: the concurrent-vm tests read
+    // these keys from other processes while this one advances them, and a plain
+    // `fs::write` has a window where the file is truncated-but-empty — a reader
+    // landing there would parse nothing, read it as 0, and mistake a guest that
+    // is already up for a stopped one (a second `prlctl start`, #40's own bug in
+    // miniature). Writing a per-process temp and renaming it over the key means
+    // a reader always sees the old value or the new one, never neither. `rename`
+    // replaces the destination on both unix and Windows.
+    let path = state_path(dir, key);
+    let tmp = state_path(dir, &format!("{key}.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, value.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// How many times this key has been hit, before this one. One byte appended per

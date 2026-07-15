@@ -149,3 +149,40 @@ fn stale_snapshots_from_killed_runs_are_reported() {
         run.stderr
     );
 }
+
+/// Doctor probes a *running* guest live — ssh, agent, git, the console user — so
+/// it holds the use lock across those checks, exactly as an exec does: otherwise
+/// reap, firing every five minutes, could shut the guest down mid-diagnosis and
+/// turn a healthy VM into a page of spurious failures. That the lock is held is
+/// visible where every use is — it resets the idle clock, so a guest doctored
+/// just now is one reap leaves alone, even though nothing had touched it in an
+/// hour beforehand.
+///
+/// Unix-only, like the reap/use-lock races: the coordination is an flock, and
+/// vm's host half runs on macOS.
+#[cfg(unix)]
+#[test]
+fn doctor_of_a_running_guest_counts_as_a_use_and_stays_reaps_hand() {
+    let fake = Fake::new("windows");
+    fake.scenario(&running(), &fake.healthy_guest());
+    // Nothing has used this guest in an hour; reap's window here is 30 minutes,
+    // so without the doctor counting as a use it would be shut down.
+    fake.last_used_minutes_ago(60);
+
+    let doctor = fake.vm(&["doctor", "windows"]);
+    assert_eq!(doctor.code, 0, "a healthy guest: {}", doctor.stderr);
+
+    let reap = fake.vm(&["reap", "--idle-minutes", "30"]);
+
+    assert_eq!(reap.code, 0, "{}", reap.stderr);
+    assert!(
+        fake.calls_starting_with(&["stop"]).is_empty(),
+        "reap shut down a guest a doctor had just held the use lock on: {:?}",
+        fake.calls()
+    );
+    assert!(
+        reap.stderr.contains("kept"),
+        "and it must count the doctor as the guest's last use: {}",
+        reap.stderr
+    );
+}

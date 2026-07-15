@@ -1,5 +1,6 @@
 use crate::clock::ticks;
 use crate::crumb;
+use crate::lock;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::net::Ipv4Addr;
@@ -118,35 +119,101 @@ pub fn find(name: &str) -> Result<PrlVm> {
 }
 
 /// Start or resume as appropriate; no-op when already running. `true` if it
-/// had to act.
+/// had to act (or joined a wake someone else had already started).
 ///
 /// There is no `vm start` — every command that needs a guest brings it up
 /// itself — so this is the only place a wake is announced, and it always is:
 /// the caller is about to sit through a boot or a resume, and silence there
 /// reads as a hang. A VM that is already running is the common case and says
 /// nothing.
+///
+/// Concurrent callers all hold the *shared* use lock, so they run in parallel —
+/// which is why the start/resume is serialised separately ([`lock::bringup`]):
+/// without it, a `mise` fan-out against a cold guest would have every process
+/// read `stopped` and issue `prlctl start`, and Parallels rejects all but the
+/// first with "is not stopped" (#40). The losers join the wake in flight instead
+/// of failing on it.
 pub fn ensure_running(alias: &str, name: &str) -> Result<bool> {
-    let vm = find(name)?;
-    match vm.status.as_str() {
-        "running" => Ok(false),
-        "stopped" => {
-            crumb!("vm ▸ {alias} ▸ '{name}' is stopped — starting it…");
-            prlctl(&["start", name]).map(|_| true)
+    // A guest that is already running needs no serialising: concurrent callers
+    // all read `running` and none acts, so taking the bring-up lock here would
+    // only put a status read in front of every warm exec. Only a wake needs it.
+    if find(name)?.status == "running" {
+        return Ok(false);
+    }
+    let _bringup = lock::bringup(alias, || {
+        crumb!("vm ▸ {alias} ▸ '{name}' is being brought up by another vm command — waiting…");
+    })?;
+    // Re-read under the lock — the state may have moved while we waited for it
+    // (the whole point: whoever held the lock was bringing this VM up). A guest
+    // still `stopping` is given the same grace window an off-state gets in the
+    // IP wait, since a stop landing right now (a manual/GUI one — reap holds the
+    // VM exclusively and cannot overlap a bring-up) settles in a beat.
+    let deadline = Instant::now() + transition_grace();
+    loop {
+        let vm = find(name)?;
+        match vm.status.as_str() {
+            // Someone beat us to it — the winner started it while we waited for
+            // the lock, or it came up on its own. Either way it is up now.
+            "running" => return Ok(false),
+            // A wake someone else asked for is already in flight (a racer past
+            // the lock, or a start from the Parallels GUI). Join it: `wait_for_ip`
+            // takes it from here, and it counts as woken so ssh is waited for.
+            status if is_waking(status) => {
+                crumb!(
+                    "vm ▸ {alias} ▸ '{name}' is {status} — a wake is already in flight; joining it"
+                );
+                return Ok(true);
+            }
+            "stopping" if Instant::now() < deadline => std::thread::sleep(poll()),
+            "stopping" => bail!(
+                "VM '{name}' is still stopping {}s after vm looked — something keeps \
+                 shutting it down (`vm reap`, or a stop from the Parallels GUI).\n  \
+                 `prlctl list -a` shows the current state; retry once it has stopped.",
+                transition_grace().as_secs()
+            ),
+            status if is_off(status) => return wake(alias, name, status),
+            other => bail!(
+                "VM '{name}' is in unexpected state '{other}' — expected running, stopped, \
+                 suspended, paused, starting, resuming, or stopping (see `prlctl list -a`)"
+            ),
         }
-        status @ ("suspended" | "paused") => {
-            crumb!("vm ▸ {alias} ▸ '{name}' is {status} — resuming it…");
-            prlctl(&["resume", name]).map(|_| true)
-        }
-        other => bail!(
-            "VM '{name}' is in unexpected state '{other}' — expected running, stopped, \
-             suspended, or paused (see `prlctl list -a`)"
-        ),
     }
 }
 
-/// A VM brought up: where to reach it, and whether vm had to wake it to get
-/// there. `woke` is what tells a caller the guest's services may still be
-/// coming up behind the IP (see `commands::bring_up`).
+/// Ask Parallels to start (a stopped VM) or resume (a suspended/paused one), and
+/// treat "it already left the off-state" as a wake to join, not a failure: a
+/// start/resume that lands a beat after someone else's gets Parallels' "is not
+/// stopped"/"is not suspended", which is not this caller's problem to report.
+///
+/// The status is *re-read* to make that call, never the error text parsed —
+/// `is_off` is a vocabulary the quirk-canary keeps honest across Parallels
+/// versions, and a wording match would not be. This mirrors how
+/// [`is_session_not_ready`] tolerates a lagging Tools session, one rung earlier.
+fn wake(alias: &str, name: &str, status: &str) -> Result<bool> {
+    let (verb, gerund) = if status == "stopped" {
+        ("start", "starting")
+    } else {
+        ("resume", "resuming")
+    };
+    crumb!("vm ▸ {alias} ▸ '{name}' is {status} — {gerund} it…");
+    match prlctl(&[verb, name]) {
+        Ok(_) => Ok(true),
+        Err(err) => match find(name) {
+            Ok(vm) if !is_off(&vm.status) => {
+                crumb!(
+                    "vm ▸ {alias} ▸ '{name}' is {} — something else brought it up; joining that wake",
+                    vm.status
+                );
+                Ok(true)
+            }
+            _ => Err(err),
+        },
+    }
+}
+
+/// A VM brought up: where to reach it, and whether it was still coming up when
+/// vm got there. `woke` is what tells a caller the guest's services may still be
+/// arriving behind the IP (see `commands::bring_up`).
 pub struct Up {
     pub ip: String,
     pub woke: bool,
@@ -159,9 +226,17 @@ pub struct Up {
 /// that was already up returns on the first look and prints nothing —
 /// `commands::bring_up` closes the loop with the readiness line.
 pub fn ensure_up(alias: &str, name: &str) -> Result<Up> {
-    let woke = ensure_running(alias, name)?;
-    let ip = wait_for_ip(alias, name)?;
-    Ok(Up { ip, woke })
+    let acted = ensure_running(alias, name)?;
+    let (ip, waited) = wait_for_ip(alias, name)?;
+    // `woke` gates whether the caller waits for sshd/Tools. A guest that made us
+    // wait for its IP was still coming up even if *this* process was not the one
+    // that started it — a racer we joined at #40 reads `running` and acts on
+    // nothing, but its guest is as green as the waker's, so the ssh wait it
+    // would otherwise skip is exactly the one it needs.
+    Ok(Up {
+        ip,
+        woke: acted || waited,
+    })
 }
 
 /// How long a guest gets to report an IP once Parallels has it running. A cold
@@ -199,6 +274,14 @@ fn transition_grace() -> Duration {
 /// (`starting`, `resuming`, `stopping`).
 fn is_off(status: &str) -> bool {
     matches!(status, "stopped" | "suspended" | "paused")
+}
+
+/// Statuses that mean a wake someone else asked for is already under way — a VM
+/// on its way up that a bring-up should *join* (wait out its IP) rather than
+/// start again. The mirror of [`is_off`] for the concurrent case (#40): an
+/// off-state is started, an in-flight one is joined.
+fn is_waking(status: &str) -> bool {
+    matches!(status, "starting" | "resuming")
 }
 
 /// What one observation of the VM means to a caller waiting on its IP.
@@ -272,24 +355,30 @@ fn assess(name: &str, status: &str, addrs: &str, waited: Duration, timeout: Dura
 /// ("the guest may still be booting"). And a VM can be down here even though
 /// `ensure_running` just brought it up: `vm reap` or a stop/suspend from the
 /// Parallels GUI can put it back down while this loop is waiting on it.
-fn wait_for_ip(alias: &str, name: &str) -> Result<String> {
+/// Returns the IP, and whether the caller had to wait at all for it — a guest
+/// that reported one on the first look was already up, one that made us poll was
+/// still coming up. `ensure_up` folds that into `woke` so a racer who did not
+/// start the VM but arrived while it was still booting still waits for its ssh.
+fn wait_for_ip(alias: &str, name: &str) -> Result<(String, bool)> {
     let start = Instant::now();
     let mut next_beat = heartbeat();
+    let mut waited = false;
     loop {
         let vm = find(name)?;
-        let waited = start.elapsed();
-        match assess(name, &vm.status, &vm.ip_configured, waited, ip_timeout()) {
-            Step::Up(ip) => return Ok(ip),
+        let elapsed = start.elapsed();
+        match assess(name, &vm.status, &vm.ip_configured, elapsed, ip_timeout()) {
+            Step::Up(ip) => return Ok((ip, waited)),
             Step::Fail(msg) => bail!("{msg}"),
             Step::Wait => {
-                if waited >= next_beat {
+                waited = true;
+                if elapsed >= next_beat {
                     crumb!(
                         "vm ▸ {alias} ▸ '{name}' {}, no IP yet — {}s of {}s",
                         vm.status,
-                        waited.as_secs(),
+                        elapsed.as_secs(),
                         ip_timeout().as_secs()
                     );
-                    next_beat = waited + heartbeat();
+                    next_beat = elapsed + heartbeat();
                 }
                 std::thread::sleep(poll());
             }
@@ -636,6 +725,19 @@ mod tests {
         // Observed live on Parallels 26.4 during start/resume/stop.
         for status in ["running", "starting", "resuming", "stopping"] {
             assert!(!is_off(status), "{status}");
+        }
+    }
+
+    /// The other half of the concurrent bring-up decision (#40): the transients
+    /// that mean a wake is already in flight, to be joined rather than restarted.
+    /// `stopping` is pointedly not one — it is a VM on its way *down*.
+    #[test]
+    fn only_in_flight_wakes_count_as_waking() {
+        for status in ["starting", "resuming"] {
+            assert!(is_waking(status), "{status}");
+        }
+        for status in ["running", "stopped", "suspended", "paused", "stopping"] {
+            assert!(!is_waking(status), "{status}");
         }
     }
 

@@ -17,6 +17,21 @@
 mod fake;
 
 use fake::{Fake, LEASE, cold_boot, phase, running};
+use serde_json::{Value, json};
+
+/// The guest as a fixed script of `prlctl list` answers (consumed one per call,
+/// the last repeating), for the concurrent-bring-up races that turn on *what a
+/// start returns* — which the phase-advancing built-in guest cannot stage, since
+/// a rule that fails a start would bypass the phase advance a real wake performs.
+fn list_returning(statuses: &[(&str, &str)]) -> Value {
+    let responses: Vec<Value> = statuses
+        .iter()
+        .map(|(status, ip)| {
+            json!({ "stdout": serde_json::to_string(&[phase(status, ip)]).unwrap() })
+        })
+        .collect();
+    json!({ "match_prefix": ["list"], "responses": responses })
+}
 
 /// A cold boot in full. Every stage but the last is an address the guest will
 /// not keep — the ULA broke the sync push (#35), the APIPA address left ssh
@@ -177,6 +192,141 @@ fn a_running_vm_is_used_as_it_is() {
         !run.stderr.contains("ready at"),
         "a warm guest is not an event: {}",
         run.stderr
+    );
+}
+
+/// A start that loses the race to a wake already under way is joined, not
+/// surfaced as a failure (#40). This is the loser that read `stopped` a beat
+/// before someone else's start took effect (or a start from the Parallels GUI
+/// landing first): its own `prlctl start` gets Parallels' "is not stopped", and
+/// vm re-reads the status — no longer off — rather than matching that wording,
+/// and carries on with the wake in flight.
+#[test]
+fn a_start_that_loses_to_a_wake_already_in_flight_is_joined_not_failed() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &[],
+        &[
+            // Stopped for the pre-lock look and the decision, then running: the
+            // guest someone else brought up between our start and our re-read.
+            list_returning(&[("stopped", "-"), ("stopped", "-"), ("running", LEASE)]),
+            fake.rule_fails(
+                "start",
+                "Failed to start the VM: The virtual machine \"Windows 11\" is not stopped. \
+                 This operation can be performed for stopped virtual machines only.",
+            ),
+            fake.rule_exec_passthrough(),
+            fake.rule_ssh("true", ""),
+        ],
+    );
+    fake.with_repo();
+
+    let run = fake.vm(&["exec", "windows", "--no-sync", "--", "echo", "hi"]);
+
+    assert_eq!(run.code, 0, "a lost start must not fail the run: {run:?}");
+    assert!(
+        run.stderr
+            .contains("something else brought it up; joining that wake"),
+        "and it must say it joined rather than failed on the error: {}",
+        run.stderr
+    );
+    assert_eq!(
+        fake.calls_starting_with(&["start"]).len(),
+        1,
+        "vm issued exactly one start — the one that lost the race: {:?}",
+        fake.calls()
+    );
+}
+
+/// A bring-up that finds the guest already `starting` joins that wake instead of
+/// issuing a redundant start — and still waits for ssh, because a guest someone
+/// else is mid-boot is no readier than one this process booted.
+#[test]
+fn a_bring_up_joins_a_wake_in_flight_without_starting_again() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &[],
+        &[
+            list_returning(&[("starting", "-"), ("starting", "-"), ("running", LEASE)]),
+            fake.rule_exec_passthrough(),
+            fake.rule_ssh("true", ""),
+        ],
+    );
+    fake.with_repo();
+
+    let run = fake.vm(&["exec", "windows", "--no-sync", "--", "echo", "hi"]);
+
+    assert_eq!(run.code, 0, "{run:?}");
+    assert!(
+        run.stderr
+            .contains("a wake is already in flight; joining it"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        fake.calls_starting_with(&["start"]).is_empty(),
+        "a guest already starting must not be started again: {:?}",
+        fake.calls()
+    );
+    assert!(
+        run.stderr.contains(&format!("ready at {LEASE}")),
+        "a joined wake still waits for the guest to come up: {}",
+        run.stderr
+    );
+}
+
+/// A racer that arrives after the winner's start but before the guest has an
+/// address reads `running` and issues no start — yet the guest is still coming
+/// up, so it must wait for ssh anyway. `woke` therefore follows whether the IP
+/// wait had to wait at all, not only whether this process was the one that acted.
+#[test]
+fn a_racer_reading_a_running_but_addressless_guest_still_waits_for_it() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &[],
+        &[
+            list_returning(&[("running", "-"), ("running", "-"), ("running", LEASE)]),
+            fake.rule_exec_passthrough(),
+            fake.rule_ssh("true", ""),
+        ],
+    );
+    fake.with_repo();
+
+    let run = fake.vm(&["exec", "windows", "--no-sync", "--", "echo", "hi"]);
+
+    assert_eq!(run.code, 0, "{run:?}");
+    assert!(
+        fake.calls_starting_with(&["start"]).is_empty(),
+        "a running guest is not started: {:?}",
+        fake.calls()
+    );
+    assert!(
+        run.stderr.contains(&format!("ready at {LEASE}")),
+        "a guest still finding its address is waited for, not used cold: {}",
+        run.stderr
+    );
+}
+
+/// A guest stuck `stopping` past the grace window is a stop that is not landing
+/// (a manual/GUI one — reap holds the VM exclusively and cannot overlap a
+/// bring-up), and vm says so rather than starting a VM mid-shutdown.
+#[test]
+fn a_vm_stuck_stopping_past_the_grace_window_fails_and_says_so() {
+    let fake = Fake::new("windows");
+    fake.guest(&[phase("stopping", "-")]);
+
+    let run = fake.vm(&["exec", "windows", "--", "echo hi"]);
+
+    assert_eq!(run.code, 125, "a VM that will not settle is infra: {run:?}");
+    assert!(
+        run.stderr.contains("stopping"),
+        "the message must name the state it gave up on: {}",
+        run.stderr
+    );
+    assert!(
+        fake.calls_starting_with(&["start"]).is_empty(),
+        "a VM on its way down must not be started: {:?}",
+        fake.calls()
     );
 }
 

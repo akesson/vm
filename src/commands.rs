@@ -572,7 +572,19 @@ pub fn clean(alias: &str) -> Result<i32> {
     let vm = cfg.get(alias)?;
     let repo = mapping::RepoLocation::discover()?;
     let guest_repo = mapping::guest_repo_path(&vm.work_root, &repo.name);
-    let _use = lock::shared(alias)?;
+    // Exclusive, not shared: clean `rm -rf`s a guest checkout, and a *shared*
+    // lock (which exec/sync hold) would let it delete the very directory a
+    // concurrent run is executing in. Refuse rather than wait — the same posture
+    // as --with-snapshot, and for the same reason. The cost is that clean of one
+    // repo is turned away while another run uses the guest, even a run in a
+    // different repo whose checkout clean would not have touched; a rare, manual,
+    // destructive command can afford to be asked again.
+    let Some(_use) = lock::try_exclusive(alias)? else {
+        bail!(
+            "'{alias}' is in use by another vm process — clean deletes the guest \
+             checkout a run may be executing in; retry once the VM is idle"
+        );
+    };
     let target = bring_up(alias, vm)?;
     // All guests speak POSIX (Windows sshd shell is Git Bash).
     let quoted = ssh::shell_quote(&guest_repo);

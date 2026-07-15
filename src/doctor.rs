@@ -134,11 +134,16 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             }
             Err(err) => r.fail("snapshots", &format!("{err:#}")),
         }
-        // Named VM that is down: bring it up, since the caller asked about this
-        // one and the live checks are the point. The use lock keeps reap from
-        // shutting it down again while we are checking it.
+        // The live checks below run against the guest, so hold the use lock
+        // across them: without it reap can shut the VM down mid-probe and turn a
+        // healthy guest into a string of spurious failures. Kept for the whole
+        // check block (its Drop runs at the end of the iteration). A bare `vm
+        // doctor` that only *surveys* a running guest still takes it — reap must
+        // not race the survey either — and the down-branch takes it before
+        // bringing the guest up.
         let _use;
         let target = if prl_vm.status == "running" {
+            _use = crate::lock::shared(name)?;
             r.ok("status", "running");
             match commands::ssh_target(vm) {
                 Ok(t) => t,
