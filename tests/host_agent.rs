@@ -17,7 +17,7 @@
 //! host's pulse with it (four beats to a budget, whatever the budget) — so a
 //! minute of contract plays out in a second.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 use vm::exec::host::drive_agent;
 use vm::proto::{ExecRequest, PROTO_VERSION};
@@ -122,6 +122,8 @@ fn a_command_the_guest_cannot_find_is_127_and_not_an_infra_code() {
 #[cfg(unix)]
 #[test]
 fn a_transport_killed_by_a_signal_is_an_infra_failure_not_an_exit_code() {
+    use std::process::Stdio;
+
     // ssh cut down mid-command, or a prlctl killed with the terminal it ran in:
     // the transport is gone and the guest never reported anything.
     let mut cmd = Command::new("sh");
