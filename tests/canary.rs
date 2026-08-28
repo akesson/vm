@@ -6,13 +6,16 @@
 //!
 //! - `prlctl exec` hangs forever past a ~3.9 KB command line — silently, and deaf
 //!   to SIGTERM. vm caps its own at 3 KB and refuses to build a longer one.
-//! - A refused Tools session says exactly `Unable to open new session`, and vm
-//!   waits that out rather than failing. It matches on the *string*.
+//! - A refused Tools session says `Unable to open new session` — or, since
+//!   Parallels 27, names the SDK call that failed (`PrlJob_*: Invalid argument`)
+//!   for the same wake. vm waits both out rather than failing, matching on the
+//!   *string*.
 //! - A VM's status is one of eight words. An unrecognised one makes `wait_for_ip`
 //!   wait forever, because nothing else can be assumed about it.
 //! - `prlctl list`, `list -i` and `snapshot-list` answer in shapes vm parses.
 //!
-//! Every one of those is a fact about Parallels 26.4 (2026-07), and Parallels
+//! Every one of those is a fact about Parallels 26.4 (2026-07) — re-measured on
+//! 27.0.0 (2026-08), which moved two of them — and Parallels
 //! updates itself. When one of them changes, nothing in vm breaks loudly: the cap
 //! silently stops protecting anything, a wake silently stops being waited out, a
 //! status word silently becomes an infinite wait. The failure surfaces weeks later
@@ -193,13 +196,22 @@ fn a_refused_tools_session_still_says_what_vm_listens_for() {
 
         // Hammer the session the moment the VM is up: the refusal is what we came
         // for, and it only exists in the first seconds of a wake.
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(90);
         let mut refusals = Vec::new();
         let mut answered = false;
+        let mut opened = Duration::MAX;
         while Instant::now() < deadline {
-            let (code, _, stderr) = prlctl(&["exec", &name, "true"]);
+            // `whoami`, not `true`: the probe needs a command that exists on
+            // every guest, and `true` is not one of them. On Windows it is not a
+            // program at all, so `prlctl exec … true` answers rc=2 with empty
+            // stderr on a *healthy* session — indistinguishable here from a
+            // session that never opened, which made this probe unable to pass on
+            // the Windows guest for reasons having nothing to do with Parallels.
+            let (code, _, stderr) = prlctl(&["exec", &name, "whoami"]);
             if code == 0 {
                 answered = true;
+                opened = started.elapsed();
                 break;
             }
             if !stderr.trim().is_empty() {
@@ -220,11 +232,19 @@ fn a_refused_tools_session_still_says_what_vm_listens_for() {
                 "{alias}: Parallels refused a session with a message vm does not \
                  recognise, so vm would fail the run instead of waiting the wake out:\n  \
                  {refusal}\n  \
-                 Teach `prl::is_session_not_ready` the new wording."
+                 Teach `prl::is_session_not_ready` the new wording — but confirm \
+                 first what it actually means, by running the same command against \
+                 a fully *running* guest. A wake and a command that does not exist \
+                 are different conditions and only the wake may be waited out."
             );
         }
+
+        // How long the wake took, kept in the journal. Not asserted: the probe's
+        // own 90s deadline already fails a session that never opens, and the
+        // series is what would show a guest getting slower over time.
         note(&format!(
-            "{alias}: {} session refusal(s) on the way up, all recognised",
+            "{alias}: {} session refusal(s) on the way up, all recognised; \
+             session opened in {opened:?}",
             refusals.len()
         ));
     }
