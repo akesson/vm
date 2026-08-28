@@ -393,6 +393,12 @@ fn wait_for_ip(alias: &str, name: &str) -> Result<(String, bool)> {
 /// line, not any single argument: ten 500-byte arguments hang as reliably as
 /// one 5000-byte one. The cap sits well under the cliff to leave room for the
 /// parts of the request not counted here (VM name, prlctl's own flags).
+///
+/// Parallels 27.0.0 (2026-08-28) moved the cliff *up*: linux and windows both
+/// answer at 4400 B, where 26.4 hung. Where it went is unmeasured — the canary
+/// only walks to 4400 B — so the cap stays where it is. It costs nothing (every
+/// payload rides stdin, not argv) and it is the only version-independent
+/// number here: a cliff that moved once can move back.
 const EXEC_ARGV_LIMIT: usize = 3 * 1024;
 
 /// Fail fast — with the real cause — where `prlctl exec` would hang forever.
@@ -466,8 +472,33 @@ pub fn exec_elevated(name: &str, args: &[&str]) -> Result<Command> {
 /// freshly resumed macOS guest refuses one for ~10s ("Unable to open new
 /// session"), which is a wake to wait out, not a failure to report. Callers
 /// retry a spawn that fails with this.
+///
+/// Parallels 27 added a second family of wordings for the same wake, naming the
+/// SDK call that failed instead of the condition. Measured on 27.0.0 (58628),
+/// 2026-08-28, by sampling a guest through a cold boot:
+///
+/// ```text
+///   stopped   PrlVm_TerminalConnect: PrlJob_Wait: PRL_ERR_IO_STOPPED
+///   booting   Unable to open new session in this virtual machine. …
+///   booting   PrlJob_GetRetCode: Invalid argument. An invalid argument was passed.
+///   booting   PrlJob_GetResult:  Invalid argument. An invalid argument was passed.
+///   running   (the command's own output)
+/// ```
+///
+/// The two `PrlJob_*: Invalid argument` lines interleave with the old wording
+/// through the same wake — different SDK entry points reporting one condition —
+/// so they are the same signal and are waited out the same way. Matching the
+/// *family* rather than the two names seen keeps a third sibling from
+/// reintroducing this bug.
+///
+/// A command that genuinely does not exist looks nothing like this: the guest
+/// shell answers it (`rc 127, bash: …: command not found` on linux/macos, `rc 2`
+/// and silence on windows), so waiting these out cannot swallow one. The
+/// stopped-VM line is excluded on purpose — it carries `PrlJob_` but not
+/// `Invalid argument`, and a stopped VM is not a wake to wait out.
 pub fn is_session_not_ready(stderr: &str) -> bool {
     stderr.contains("Unable to open new session")
+        || (stderr.contains("PrlJob_") && stderr.contains("Invalid argument"))
 }
 
 /// Graceful shutdown via Parallels Tools ([`ensure_running`] boots it again).
@@ -662,6 +693,32 @@ mod tests {
         ));
         assert!(!is_session_not_ready(
             "Unable to perform the operation because \"macOS\" is not started."
+        ));
+    }
+
+    /// Parallels 27 reports the same wake through more than one SDK call, so the
+    /// family is matched rather than the two names that happened to be measured.
+    #[test]
+    fn parallels_27_names_the_sdk_call_and_all_of_them_are_one_wake() {
+        assert!(is_session_not_ready(
+            "PrlJob_GetResult: Invalid argument. An invalid argument was passed."
+        ));
+        assert!(is_session_not_ready(
+            "PrlJob_GetRetCode: Invalid argument. An invalid argument was passed."
+        ));
+        // A sibling nobody has seen yet must not need another release to be
+        // waited out — that is the whole reason this matches the family.
+        assert!(is_session_not_ready(
+            "PrlJob_SomethingElse: Invalid argument. An invalid argument was passed."
+        ));
+
+        // A stopped VM carries `PrlJob_` too, and is NOT a wake to wait out.
+        assert!(!is_session_not_ready(
+            "PrlVm_TerminalConnect: PrlJob_Wait: PRL_ERR_IO_STOPPED"
+        ));
+        // Nor is a command that simply is not there.
+        assert!(!is_session_not_ready(
+            "bash: line 1: nosuchprogram: command not found"
         ));
     }
 
