@@ -196,6 +196,36 @@ serializes its progress, information and error streams to CLIXML (`#< CLIXML
 - Say what you are about to do **before** the call that can block — creating the
   Windows Update COM session can stall for minutes.
 
+**`-Command -` runs your script one statement at a time, not as a script**, and
+two things follow that will bite you. Both measured on the Windows guest,
+2026-08-28.
+
+*A multi-line block needs a blank line after its closing brace*, or the block —
+and everything after it, to EOF — is silently dropped. No output, no error,
+`exit 0`:
+
+```powershell
+Say "start"
+foreach ($c in @('x','y')) {
+  Say $c
+}
+Say "done"
+```
+```
+start                      <- and that is all. exit 0.
+```
+
+*And `trap` never fires*, because the statement that throws is its own top-level
+command. A COM failure then leaves `$result` null, `$null.Updates.Count -eq 0`
+is `$true`, and the script prints **"no updates available"** and exits 0 —
+which is what `windows-update.ps1` did on a guest whose Windows Update service
+was wedged, reporting a clean sweep for a search that never ran.
+
+The fix for both is one line: **wrap the whole body in `& { … }` and end the
+file with a blank line.** Then it is a single statement — `trap` fires, `exit N`
+becomes the process's exit code, and blocks inside need no blank lines. Both
+shipped scripts are written that way; keep them that way.
+
 ## 7. Stop and ask the human
 
 Do not resolve these yourself. Collect them and put them in the final report as
