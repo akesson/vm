@@ -109,12 +109,17 @@ vm reap [alias] [--idle-minutes N]  # shut down VMs idle ≥N min (default 30) a
                                     # use; --install/--uninstall manage a launchd job
                                     # that runs it every 5 min (--install bakes in the
                                     # --idle-minutes you pass alongside it)
-vm claude <alias> "<prompt>" [claude flags…]  # headless `claude -p` in the guest
-                                     # checkout; the VM is the permission boundary.
-                                     # Writeback of source edits is ON by default
-                                     # (--no-writeback opts out); --with-snapshot
-                                     # rolls the guest back afterwards; -e forwards
-                                     # env vars. vm's own flags go BEFORE the prompt
+vm claude <alias> "<prompt>" [claude flags…]  # headless `claude -p …` in the
+vm codex  <alias> "<prompt>" [codex flags…]   # guest checkout — codex's form is
+                                     # `codex exec …`. Same run either way: the VM is
+                                     # the permission boundary, so the agent runs with
+                                     # every confirmation off. Writeback of source
+                                     # edits is ON by default (--no-writeback opts
+                                     # out); --with-snapshot rolls the guest back
+                                     # afterwards; -e forwards env vars. vm's own
+                                     # flags go BEFORE the prompt, agent flags after.
+                                     # Needs that agent's CLI installed AND logged in
+                                     # inside the guest — `vm doctor` checks both
 vm deploy <alias>              # rebuild + install the guest agent (after vm src changes).
                                # On linux it also installs the systemd unit that keeps a
                                # graceful stop from taking ~95s (see src/prldnd.rs)
@@ -128,10 +133,10 @@ vm clean <alias>               # delete the guest checkout of this repo (next sy
 
 **There is no `vm start` and no `vm stop` — never go looking for them.** VM
 lifecycle is not your problem: every command that needs a guest (`exec`, `sync`,
-`claude`, `deploy`, `clean`, `shot`, `doctor <alias>`) starts the VM itself and
-tells you it is doing so, and `vm reap` shuts down VMs nobody is using. So a
-stopped VM is not a blocker to clear first — just run the command you actually
-wanted:
+`claude`, `codex`, `deploy`, `clean`, `shot`, `doctor <alias>`) starts the VM
+itself and tells you it is doing so, and `vm reap` shuts down VMs nobody is
+using. So a stopped VM is not a blocker to clear first — just run the command
+you actually wanted:
 
 ```
 vm ▸ linux ▸ 'Ubuntu 24.04' is stopped — starting it…
@@ -227,13 +232,13 @@ vm ▸ windows ▸ guest env: mise (detected mise.toml) — `mise trust` on firs
 ```
 
 So `vm exec windows -- cargo test` really runs `mise exec -- cargo test` in the
-guest. `vm claude` is wrapped too, so the commands Claude runs inside the guest
-resolve the repo's tools. For a script (one argument) the wrap goes *around* the
-shell — `mise exec -- sh -c '<script>'` — so builtins, pipes and exit codes all
-behave. Override with `--guest-env mise` (force) or `--guest-env none` (bare
-command, no setup, no wrap) on `exec` / `sync` / `claude`. There is **no per-repo
-config file** — an older `.vm.toml` with `on_first_sync` / `wrap` is obsolete and
-ignored.
+guest. `vm claude` and `vm codex` are wrapped too, so the commands the agent
+runs inside the guest resolve the repo's tools. For a script (one argument) the
+wrap goes *around* the shell — `mise exec -- sh -c '<script>'` — so builtins,
+pipes and exit codes all behave. Override with `--guest-env mise` (force) or
+`--guest-env none` (bare command, no setup, no wrap) on `exec` / `sync` /
+`claude` / `codex`. There is **no per-repo config file** — an older `.vm.toml`
+with `on_first_sync` / `wrap` is obsolete and ignored.
 
 **Expect the first wrapped exec in a fresh guest to be slow.** `mise exec`
 installs the repo's `[tools]` before running, so even a trivial command can take

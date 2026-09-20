@@ -74,6 +74,25 @@ fn advise(verb: &str, target: &str, cmd: &[String]) {
     }
 }
 
+/// `vm claude` and `vm codex` are the same run with a different binary at the
+/// end of it, so they parse into the same args and dispatch through here.
+fn agent(which: vm::agent::Agent, args: cli::AgentArgs) -> Result<i32> {
+    let target = args.target;
+    vm::agent::run(
+        &target,
+        &vm::agent::AgentOptions {
+            agent: which,
+            prompt: args.prompt,
+            agent_args: args.agent_args,
+            with_snapshot: args.with_snapshot,
+            no_writeback: args.no_writeback,
+            env: args.env,
+            with_file: args.with_file,
+            guest_env: args.guest_env,
+        },
+    )
+}
+
 fn run(cli: cli::Cli) -> Result<i32> {
     use cli::Command::*;
     match cli.command {
@@ -143,18 +162,8 @@ fn run(cli: cli::Cli) -> Result<i32> {
         GuestExec => exec::guest::exec(),
         Deploy { alias } => deploy::deploy(&alias),
         Shot { alias, file } => commands::shot(&alias, file),
-        Claude(args) => vm::claude::run(
-            &args.target,
-            &vm::claude::ClaudeOptions {
-                prompt: args.prompt,
-                claude_args: args.claude_args,
-                with_snapshot: args.with_snapshot,
-                no_writeback: args.no_writeback,
-                env: args.env,
-                with_file: args.with_file,
-                guest_env: args.guest_env,
-            },
-        ),
+        Claude(args) => agent(vm::agent::Agent::Claude, args),
+        Codex(args) => agent(vm::agent::Agent::Codex, args),
         Doctor { alias } => doctor::doctor(alias.as_deref()),
         Clean { alias } => commands::clean(&alias),
     }

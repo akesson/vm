@@ -229,7 +229,11 @@ work_root = "~/work"
             self.rule_ssh("_version", &version),
             self.rule_ssh("git --version", "git version 2.51.0"),
             self.rule_ssh("mkdir -p", ""),
+            // Both agent CLIs answer their `--version` and their auth probe.
+            // One rule each: `match_contains` sees the whole ssh argv, and the
+            // binary's own name is the only word in it that tells them apart.
             self.rule_ssh("claude", "ok"),
+            self.rule_ssh("codex", "ok"),
             self.rule_ssh("_idle", "3600000"),
             // The console session: `prlctl exec … whoami` answers with the user
             // who owns the desktop, and doctor checks it is the config's user —
