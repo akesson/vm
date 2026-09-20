@@ -1,6 +1,6 @@
 ---
 name: vm-upgrade
-description: Weekly maintenance sweep of the Parallels dev guests — OS updates and installed dev tooling (apt/snap, Homebrew + Apple updates, winget + Windows Update, plus rustup/mise/claude) run inside each VM. Use for /vm-upgrade, "update the VMs", "patch the guests", or any routine VM maintenance.
+description: Weekly maintenance sweep of the Parallels dev guests — OS updates and installed dev tooling (apt/snap, Homebrew + Apple updates, winget + Windows Update, plus rustup/mise/claude/codex) run inside each VM. Use for /vm-upgrade, "update the VMs", "patch the guests", or any routine VM maintenance.
 ---
 
 # vm-upgrade — weekly maintenance of the dev guests
@@ -36,7 +36,7 @@ is, not by convenience.
 
 | | how | runs as | for |
 |---|---|---|---|
-| **user** | `vm run <alias> -- …` | the configured user | brew, rustup, mise, claude, **user-scope winget** |
+| **user** | `vm run <alias> -- …` | the configured user | brew, rustup, mise, claude, codex, **user-scope winget** |
 | **elevated** | `vm run <alias> --elevated -- …` | root (Linux/macOS), SYSTEM (Windows) | apt, snap, softwareupdate, **machine-scope winget**, Windows Update |
 
 ```sh
@@ -51,7 +51,7 @@ vm run linux --elevated -- sh < step.sh              # a script: on stdin (see �
   root/SYSTEM.
 - **The two channels have different PATHs, and that is the point.** The user
   channel resolves `brew`, `mise`, `rustup`, `claude` (verified on all three
-  guests — no PATH prefix needed). The elevated channel gets the *system* PATH:
+  guests — no PATH prefix needed), and `codex` on the guests that have it. The elevated channel gets the *system* PATH:
   `apt`, `snap`, `softwareupdate`, `winget`, and nothing installed under the
   user's home. A user tool run `--elevated` will 127; a system tool run
   unelevated will refuse. Neither is worth debugging — just pick the right
@@ -89,20 +89,28 @@ Run the steps in order. A step failing does not stop the others — collect the
 failures and report them at the end. A tool the guest does not have is a **skip,
 not a failure** (guard with `command -v <tool> >/dev/null || exit 0`).
 
-### linux (elevated: apt, snap · user: rustup, mise, claude)
+### linux (elevated: apt, snap · user: rustup, mise, claude, codex)
 ```sh
 vm run linux --elevated -- sh < step.sh   # apt: DEBIAN_FRONTEND=noninteractive, then
                                           # apt-get update -q && apt-get upgrade -yq
                                           # && apt-get autoremove -yq
 vm run linux --elevated -- snap refresh
 vm run linux -- rustup update
-vm run linux -- 'mise self-update -y && mise upgrade'   # mise owns its binary here
+vm run linux -- 'mise self-update -y && mise upgrade'   # mise owns its binary here,
+                                          # and codex — `mise upgrade` updates it, so
+                                          # there is no separate codex line. Do NOT run
+                                          # `codex update` on this guest: it would fight
+                                          # mise for the binary
 vm run linux -- claude update
 vm run linux --elevated -- 'test -f /var/run/reboot-required && cat /var/run/reboot-required.pkgs'
                                           # REPORT it; never reboot a guest
 ```
 
 ### macos (elevated: softwareupdate · user: brew, rustup, mise, claude)
+
+codex is not installed on this guest; §4's skip rule covers it. If it is added
+later, match however it was installed (mise → `mise upgrade`; standalone →
+`codex update`).
 ```sh
 vm run macos -- 'brew update && brew upgrade && brew cleanup'  # brew REFUSES to run as root
 vm run macos -- rustup update
@@ -114,8 +122,10 @@ vm run macos --elevated -- softwareupdate --install --all      # and NEVER --res
 ### windows (elevated: winget machine-scope, Windows Update · user: winget user-scope, rustup, mise, claude)
 
 The two PowerShell scripts ship with this skill — **use them as they are**, they
-already handle every trap in §5. `SK=~/.claude/skills/vm-upgrade` (the skill
-directory; it is a symlink into the `vm` repo).
+already handle every trap in §5. `SK` is the directory this skill was loaded
+from: `~/.claude/skills/vm-upgrade` under Claude Code (a symlink into the `vm`
+repo), `~/.codex/skills/vm-upgrade` under Codex (a copy of the same files — see
+the repo's AGENTS.md).
 
 ```sh
 vm run windows --elevated -- powershell -NoProfile -NonInteractive -Command - < $SK/scripts/winget-machine.ps1

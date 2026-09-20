@@ -11,6 +11,7 @@ vm exec linux --writeback -- cargo clippy --fix
 vm exec linux --with-snapshot -- ./install-something-destructive.sh
 vm exec --or-native windows -- cargo nextest run  # native when the host is already Windows
 vm claude windows "fix the test that only fails on Windows"
+vm codex linux "port the mac-only path to Linux"          # or the other agent
 vm run linux --elevated -- apt-get upgrade -y          # the guest itself: no repo, no sync
 vm ls
 ```
@@ -50,8 +51,8 @@ vm ls
 
 A VM being down is not a state you have to fix before you can use it — it is a
 VM a short boot away from being up. So every command that needs a guest (`exec`,
-`sync`, `claude`, `deploy`, `clean`, `shot`, and `doctor <alias>`) starts it,
-and says so:
+`sync`, `claude`, `codex`, `deploy`, `clean`, `shot`, and `doctor <alias>`)
+starts it, and says so:
 
 ```
 vm ▸ linux ▸ 'Ubuntu 24.04' is stopped — starting it…
@@ -265,8 +266,9 @@ vm ▸ windows ▸ guest env: mise (detected mise.toml) — `mise trust` on firs
 ```
 
 Override per invocation with `--guest-env mise` (force it without a marker file)
-or `--guest-env none` (run the bare command, no setup, no wrap). `vm claude` is
-wrapped too, so the commands Claude runs inside the guest see the repo's tools.
+or `--guest-env none` (run the bare command, no setup, no wrap). `vm claude`
+and `vm codex` are wrapped too, so the commands the agent runs inside the guest
+see the repo's tools.
 This replaces the old `.vm.toml` (`on_first_sync` / `wrap`), which no longer
 exists.
 
@@ -388,23 +390,37 @@ to opt out of a file entirely. And it keeps *vm's* lines: a guest command's own
 output streams through to your terminal untouched, as it always has, and is not
 captured. `vm exec linux -- 'cargo test' > log.txt` is still how you keep that.
 
-## Claude in a VM
+## Coding agents in a VM
 
-`vm claude <alias> "<prompt>"` runs Claude Code headless (`claude -p`) in
-the guest checkout. The VM is the permission boundary, so Claude runs with
-`--dangerously-skip-permissions` — it can do anything inside the guest, but
-the host tree only ever receives the writeback diff (on by default; opt out
-with `--no-writeback`). Add `--with-snapshot` to roll the guest itself back
-afterwards, so nothing survives the run but the diff. `-e NAME=value` /
-`-e NAME` forward env vars to the guest claude process.
+`vm claude <alias> "<prompt>"` runs Claude Code headless, and
+`vm codex <alias> "<prompt>"` runs Codex. They are the same run with a different
+binary at the end of it:
 
-vm's own flags must come **before** the prompt; everything after it goes to
-`claude` verbatim (e.g. `--model sonnet`). A vm flag that lands in that tail is
-rejected (exit 2) rather than silently handed to claude — `--no-writeback` is
-what keeps vm out of your host tree, so quietly dropping it is not an option.
+| | guest command line |
+|---|---|
+| `vm claude` | `claude -p --dangerously-skip-permissions "<prompt>"` |
+| `vm codex`  | `codex exec --dangerously-bypass-approvals-and-sandbox "<prompt>"` |
 
-Requires the `claude` CLI installed and logged in inside the guest —
-`vm doctor` checks both.
+The VM is the permission boundary, so the agent runs with every confirmation
+turned off — it can do anything inside the guest, but the host tree only ever
+receives the writeback diff (on by default; opt out with `--no-writeback`). Add
+`--with-snapshot` to roll the guest itself back afterwards, so nothing survives
+the run but the diff. `-e NAME=value` / `-e NAME` forward env vars to the guest
+agent process.
+
+vm's own flags must come **before** the prompt; everything after it goes to the
+agent verbatim (e.g. `--model sonnet`). A vm flag that lands in that tail is
+rejected (exit 2) rather than silently handed on — `--no-writeback` is what
+keeps vm out of your host tree, so quietly dropping it is not an option.
+
+Neither agent reads vm's stdin: `git diff | vm codex lin "review this"` does
+*not* hand the diff over, because a guest command's stdin is the null device
+(vm says so with a note when you try). That is worth knowing for codex in
+particular, whose `exec` appends piped stdin to the prompt when it has any.
+
+Requires that agent's CLI installed and logged in inside the guest — `vm doctor`
+checks both, and skips the one a guest does not have rather than calling it a
+problem.
 
 ## Install
 
@@ -498,7 +514,7 @@ believe the diff.
 ## Issues
 
 Bugs and rough edges go to
-[github.com/akesson/vm/issues](https://github.com/akesson/vm/issues). Claude
+[github.com/akesson/vm/issues](https://github.com/akesson/vm/issues). Agent
 sessions driving `vm` are encouraged to do the same: when the tool itself
 misbehaves — not the project it's running against — file it with
 `gh issue create --repo akesson/vm`, including the failing `vm ▸ …` breadcrumb

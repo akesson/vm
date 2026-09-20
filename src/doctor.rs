@@ -2,11 +2,12 @@
 //!
 //! Installs nothing. It brings a VM up in exactly one case: when the caller
 //! *named* one (`vm doctor linux`), because the checks worth having — ssh,
-//! agent, git, claude — are the live ones, and there is no `vm start` to run
-//! first. A bare `vm doctor` surveys every configured VM, so it stays
+//! agent, git, claude, codex — are the live ones, and there is no `vm start` to
+//! run first. A bare `vm doctor` surveys every configured VM, so it stays
 //! read-only: booting a whole fleet to look at it would be a worse surprise
 //! than skipping the guests that are down.
 
+use crate::agent::Agent;
 use crate::config::{Config, GuestOs, VmConfig};
 use crate::proto::{PROTO_VERSION, VersionInfo};
 use crate::{commands, crumb, notice, prl, prldnd, ssh};
@@ -220,7 +221,8 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
             _ => r.fail("work_root", &format!("{} not writable", vm.work_root)),
         }
 
-        claude_checks(&mut r, &target);
+        agent_checks(&mut r, &target, Agent::Claude);
+        agent_checks(&mut r, &target, Agent::Codex);
         idle_checks(&mut r, name, vm);
 
         match vm.os {
@@ -241,48 +243,70 @@ pub fn doctor(alias: Option<&str>) -> Result<i32> {
     }
 }
 
-/// `vm claude` needs the claude CLI installed and authenticated in the guest.
-/// Not installed → skip (the feature is optional); installed but without
-/// credentials → fail (a half-configured guest would only surface later as a
-/// confusing `vm claude` runtime error).
-fn claude_checks(r: &mut Report, target: &ssh::SshTarget) {
+/// `vm claude` / `vm codex` need that agent's CLI installed and authenticated in
+/// the guest. Not installed → skip (both are optional, and a guest that has one
+/// and not the other is the ordinary case); installed but without credentials →
+/// fail (a half-configured guest would only surface later as a confusing
+/// runtime error from a run that had already synced and booted).
+fn agent_checks(r: &mut Report, target: &ssh::SshTarget, agent: Agent) {
     // Prepend the same per-user dirs the exec agent does (see
     // exec::guest::augmented_path): non-interactive ssh gets a bare PATH
-    // that misses ~/.local/bin, where claude usually lives.
+    // that misses ~/.local/bin, where both CLIs usually live.
     const PATH: &str = r#"PATH="$HOME/bin:$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.vm/bin:$PATH""#;
-    let version = format!("{PATH} claude --version");
+    let tool = agent.name();
+    let version = format!("{PATH} {tool} --version");
     match ssh::run_capture(target, &["sh", "-c", &ssh::shell_quote(&version)]) {
         Ok(out) if out.status.success() => {
-            r.ok("claude", String::from_utf8_lossy(&out.stdout).trim());
+            r.ok(tool, String::from_utf8_lossy(&out.stdout).trim());
         }
         _ => {
-            r.skip("claude", "not installed — needed only for `vm claude`");
+            r.skip(
+                tool,
+                &format!("not installed — needed only for `vm {tool}`"),
+            );
             return;
         }
     }
     // A real probe call rather than a credentials-presence check: a stale
-    // OAuth login looks authenticated on disk and only 401s on use. Costs
-    // one haiku call and a few seconds — doctor's slowest check.
-    let auth = format!(r#"{PATH} claude -p --model haiku "say hi""#);
+    // OAuth login looks authenticated on disk and only 401s on use. Costs one
+    // model call and a few seconds — doctor's slowest check, now twice over on
+    // a guest that has both agents. Both write their reply to stdout and their
+    // banner to stderr, so `first_line(stdout)` is the reply itself.
+    let auth = format!("{PATH} {}", agent.auth_probe());
+    let label = format!("{tool} auth");
     match ssh::run_capture(target, &["sh", "-c", &ssh::shell_quote(&auth)]) {
         Ok(out) if out.status.success() => {
             r.ok(
-                "claude auth",
+                &label,
                 &format!("probe replied: {}", first_line(&out.stdout)),
             );
         }
         Ok(out) => {
-            let detail = if out.stderr.is_empty() {
-                first_line(&out.stdout)
+            let text = if out.stderr.is_empty() {
+                &out.stdout
             } else {
-                first_line(&out.stderr)
+                &out.stderr
+            };
+            // Which end of the output carries the verdict, measured against a
+            // guest whose login had genuinely lapsed. claude says what went
+            // wrong in its first line and stops. codex narrates — a stdin
+            // banner, a config block, then ten reconnect attempts over ~15s —
+            // and puts the verdict last, so the *first* line of a failed codex
+            // probe is "Reading additional input from stdin...", which tells a
+            // reader nothing and sends them after the wrong thing.
+            let detail = match agent {
+                Agent::Claude => first_line(text),
+                Agent::Codex => last_line(text),
             };
             r.fail(
-                "claude auth",
-                &format!("probe failed: {detail} — log in inside the guest (run `claude`)"),
+                &label,
+                &format!(
+                    "probe failed: {detail} — log in inside the guest (run `{}`)",
+                    agent.login_hint()
+                ),
             );
         }
-        Err(err) => r.fail("claude auth", &format!("probe failed: {err:#}")),
+        Err(err) => r.fail(&label, &format!("probe failed: {err:#}")),
     }
 }
 
@@ -358,6 +382,18 @@ fn shutdown_checks(r: &mut Report, name: &str, target: &ssh::SshTarget) {
 fn first_line(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     text.trim().lines().next().unwrap_or("(no output)").into()
+}
+
+/// The other end of the same idea, for a tool that narrates on its way to the
+/// point (see [`agent_checks`]).
+fn last_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.trim()
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("(no output)")
+        .into()
 }
 
 /// Windows exec rides `prlctl exec --current-user` into the console session

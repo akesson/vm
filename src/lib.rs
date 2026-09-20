@@ -1,7 +1,7 @@
 //! Library half of the `vm` tool: everything except CLI parsing/dispatch,
 //! so integration tests can drive the machinery directly.
 
-pub mod claude;
+pub mod agent;
 pub mod clock;
 pub mod commands;
 pub mod config;

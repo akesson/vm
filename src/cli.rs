@@ -88,7 +88,15 @@ pub enum Command {
     /// the VM is the permission boundary — and applies source edits back to
     /// the host tree (writeback) when it finishes. Requires the claude CLI
     /// installed and authenticated in the guest (`vm doctor` verifies).
-    Claude(ClaudeArgs),
+    Claude(AgentArgs),
+    /// Run Codex headless in the guest checkout of the current repo
+    ///
+    /// The same run as `vm claude`, with the other agent: syncs the repo, runs
+    /// `codex exec` with approvals and sandbox bypassed — the VM is the
+    /// permission boundary — and applies source edits back to the host tree
+    /// (writeback) when it finishes. Requires the codex CLI installed and
+    /// authenticated in the guest (`vm doctor` verifies).
+    Codex(AgentArgs),
     /// Shut down VMs that no vm process is using and that have been idle a
     /// while (any `vm exec` boots them again)
     Reap {
@@ -196,8 +204,11 @@ pub struct RunArgs {
     pub cmd: Vec<String>,
 }
 
+/// The arguments of a headless agent run. Shared by `vm claude` and `vm codex`:
+/// the two differ in which binary they start in the guest, and in nothing vm
+/// itself takes an argument about.
 #[derive(Args)]
-pub struct ClaudeArgs {
+pub struct AgentArgs {
     /// VM alias from ~/.config/vm/config.toml
     pub target: String,
     /// Prompt for the headless run
@@ -206,11 +217,11 @@ pub struct ClaudeArgs {
     /// nothing; only the writeback diff survives the run
     #[arg(long)]
     pub with_snapshot: bool,
-    /// Leave Claude's source edits in the guest instead of applying them
+    /// Leave the agent's source edits in the guest instead of applying them
     /// back to the host tree
     #[arg(long)]
     pub no_writeback: bool,
-    /// Set an env var for the guest claude process: `-e NAME=value`, or
+    /// Set an env var for the guest agent process: `-e NAME=value`, or
     /// `-e NAME` to forward the host's current value. Repeatable; must come
     /// before the prompt
     #[arg(short = 'e', long = "env", value_name = "NAME[=VALUE]")]
@@ -224,11 +235,11 @@ pub struct ClaudeArgs {
     /// disables it. Default: auto-detect from the repo root
     #[arg(long, value_enum, value_name = "ENV")]
     pub guest_env: Option<GuestEnv>,
-    /// Extra arguments passed to claude verbatim (e.g. --model sonnet).
-    /// Everything from the first argument vm does not know onwards goes to
-    /// claude — so vm's own flags must come before the prompt
+    /// Extra arguments passed to the agent verbatim (e.g. `--model <name>`).
+    /// Everything from the first argument vm does not know onwards goes to the
+    /// agent — so vm's own flags must come before the prompt
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub claude_args: Vec<String>,
+    pub agent_args: Vec<String>,
 }
 
 #[derive(Args)]
@@ -616,7 +627,7 @@ mod tests {
         };
         assert_eq!(args.target, "lin");
         assert_eq!(args.prompt, "fix the test");
-        assert_eq!(args.claude_args, ["--model", "sonnet"]);
+        assert_eq!(args.agent_args, ["--model", "sonnet"]);
         assert!(!args.with_snapshot);
         assert!(!args.no_writeback);
     }
@@ -637,7 +648,7 @@ mod tests {
         assert!(args.with_snapshot);
         assert!(args.no_writeback);
         assert_eq!(args.prompt, "do it");
-        assert!(args.claude_args.is_empty());
+        assert!(args.agent_args.is_empty());
     }
 
     #[test]
@@ -650,12 +661,12 @@ mod tests {
         };
         assert_eq!(args.env, ["FOO=bar", "BAZ"]);
         assert_eq!(args.prompt, "do it");
-        assert!(args.claude_args.is_empty());
+        assert!(args.agent_args.is_empty());
     }
 
     /// The passthrough tail starts at the first argument vm does not know, and
     /// swallows everything after it — including names vm *does* know. So a vm
-    /// flag reaches vm before `--model`, and claude after it. `vm::claude`
+    /// flag reaches vm before `--model`, and claude after it. `vm::agent`
     /// rejects the second shape rather than letting the flag quietly vanish;
     /// this pins the parse behavior that makes that check necessary.
     #[test]
@@ -665,7 +676,7 @@ mod tests {
             panic!("expected claude");
         };
         assert!(args.no_writeback, "before the tail, it is vm's own flag");
-        assert!(args.claude_args.is_empty());
+        assert!(args.agent_args.is_empty());
 
         let cli = parse(&[
             "vm",
@@ -680,12 +691,67 @@ mod tests {
             panic!("expected claude");
         };
         assert!(!args.no_writeback, "inside the tail, vm never sees it");
-        assert_eq!(args.claude_args, ["--model", "sonnet", "--no-writeback"]);
+        assert_eq!(args.agent_args, ["--model", "sonnet", "--no-writeback"]);
     }
 
     #[test]
     fn claude_requires_a_prompt() {
         assert!(Cli::try_parse_from(["vm", "claude", "lin"]).is_err());
+    }
+
+    // ── vm codex ──────────────────────────────────────────────────────────────
+    //
+    // Both agents parse into the same `AgentArgs`, so the tests above cover the
+    // parse itself. What is worth pinning separately is that the second verb is
+    // genuinely wired up the same way — a `Codex(AgentArgs)` that had quietly
+    // been given its own struct, or its own flag names, would still compile.
+
+    #[test]
+    fn codex_parses_the_same_shape_as_claude() {
+        let cli = parse(&[
+            "vm",
+            "codex",
+            "lin",
+            "--with-snapshot",
+            "--no-writeback",
+            "-e",
+            "FOO=bar",
+            "--with-file",
+            ".env",
+            "fix the test",
+            "--model",
+            "gpt-5.1-codex",
+        ]);
+        let Command::Codex(args) = cli.command else {
+            panic!("expected codex");
+        };
+        assert_eq!(args.target, "lin");
+        assert_eq!(args.prompt, "fix the test");
+        assert!(args.with_snapshot);
+        assert!(args.no_writeback);
+        assert_eq!(args.env, ["FOO=bar"]);
+        assert_eq!(args.with_file, [".env"]);
+        assert_eq!(args.agent_args, ["--model", "gpt-5.1-codex"]);
+    }
+
+    /// `codex exec` is codex's own subcommand for a headless run, and vm supplies
+    /// it — so a caller typing it themselves is passing a word vm already passed.
+    /// It lands in the passthrough tail like any other unknown argument rather
+    /// than being read as vm's target or prompt, which keeps the failure the
+    /// caller sees codex's (`unexpected argument`) rather than vm's.
+    #[test]
+    fn a_codex_subcommand_the_caller_types_stays_in_the_tail() {
+        let cli = parse(&["vm", "codex", "lin", "do it", "exec"]);
+        let Command::Codex(args) = cli.command else {
+            panic!("expected codex");
+        };
+        assert_eq!(args.prompt, "do it");
+        assert_eq!(args.agent_args, ["exec"]);
+    }
+
+    #[test]
+    fn codex_requires_a_prompt() {
+        assert!(Cli::try_parse_from(["vm", "codex", "lin"]).is_err());
     }
 
     #[test]

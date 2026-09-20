@@ -3,7 +3,7 @@
 //! The rules themselves are exhaustively unit-tested in `exec::advise`; what is
 //! proved here is the *wiring* — that a note reaches stderr at all, that it is
 //! printed before vm touches a VM (so the reader sees it even when the run then
-//! fails), that it never fires on healthy commands, and that `vm claude`'s
+//! fails), that it never fires on healthy commands, and that the agent verbs'
 //! self-built argv is not run past the rules.
 //!
 //! Every case leans on 'lin' pointing at a Parallels VM that does not exist (as
@@ -207,20 +207,26 @@ fn stdin_redirected_from_a_file_draws_the_note_too() {
 
 #[cfg(unix)]
 #[test]
-fn vm_claude_with_piped_stdin_is_told_too() {
-    // `git diff | vm claude lin "review this"` looks like it hands claude the
-    // diff; it does not — claude's stdin is the null device like any other
-    // guest command's. Same path (claude drives exec::host::exec), same note.
-    let (dir, config) = workspace();
-    let (_, stderr) = run_vm_with_stdin(
-        &config,
-        dir.path(),
-        &["claude", "lin", "review this"],
-        std::process::Stdio::piped(),
-    );
-    let found = notes(&stderr);
-    assert_eq!(found.len(), 1, "stderr: {stderr}");
-    assert!(found[0].contains("piped into vm"), "{}", found[0]);
+fn an_agent_verb_with_piped_stdin_is_told_too() {
+    // `git diff | vm claude lin "review this"` looks like it hands the agent the
+    // diff; it does not — the agent's stdin is the null device like any other
+    // guest command's. Same path (both verbs drive exec::host::exec), same note.
+    //
+    // It matters more for codex than for claude: `codex exec` *does* read stdin
+    // and append it to the prompt, so a caller piping a diff into it has every
+    // reason to think it arrived. It gets EOF instead, and says nothing about it.
+    for verb in ["claude", "codex"] {
+        let (dir, config) = workspace();
+        let (_, stderr) = run_vm_with_stdin(
+            &config,
+            dir.path(),
+            &[verb, "lin", "review this"],
+            std::process::Stdio::piped(),
+        );
+        let found = notes(&stderr);
+        assert_eq!(found.len(), 1, "{verb}, stderr: {stderr}");
+        assert!(found[0].contains("piped into vm"), "{verb}: {}", found[0]);
+    }
 }
 
 // ── The PATH behind a command-not-found (#25) ────────────────────────────────
@@ -333,11 +339,13 @@ fn a_half_posix_path_is_flagged_on_windows_and_nowhere_else() {
 }
 
 #[test]
-fn vm_claude_is_not_run_past_the_exec_advisories() {
-    // claude's argv is built by vm, not typed by the caller, and its prompt is
+fn the_agent_verbs_are_not_run_past_the_exec_advisories() {
+    // An agent argv is built by vm, not typed by the caller, and its prompt is
     // one element — a prompt that happened to be `&&` must not draw a note about
     // shell syntax the user never wrote.
-    let (dir, config) = workspace();
-    let (_, stderr) = run_vm(&config, dir.path(), &["claude", "lin", "&&"]);
-    assert!(notes(&stderr).is_empty(), "stderr: {stderr}");
+    for verb in ["claude", "codex"] {
+        let (dir, config) = workspace();
+        let (_, stderr) = run_vm(&config, dir.path(), &[verb, "lin", "&&"]);
+        assert!(notes(&stderr).is_empty(), "{verb}, stderr: {stderr}");
+    }
 }

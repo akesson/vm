@@ -44,6 +44,8 @@ fn a_healthy_guest_gets_a_clean_bill() {
         "agent",
         "git",
         "work_root",
+        "claude",
+        "codex",
     ] {
         assert!(
             run.stderr.contains(check),
@@ -51,6 +53,120 @@ fn a_healthy_guest_gets_a_clean_bill() {
             run.stderr
         );
     }
+}
+
+/// Both agent verbs are optional, and a guest that has one CLI and not the other
+/// is the ordinary case — the whole reason the missing one is a `-` and not a
+/// `✗`. Get this wrong and every guest without codex on it reports a problem it
+/// does not have, which is the one failure mode doctor cannot afford.
+#[test]
+fn an_agent_cli_that_is_not_installed_is_skipped_not_failed() {
+    let fake = Fake::new("windows");
+    // `codex --version` is what doctor asks first; a guest without codex answers
+    // the way a shell answers a name it cannot resolve.
+    let mut rules = vec![fake.rule_ssh_fails("codex", "sh: 1: codex: not found")];
+    rules.extend(fake.healthy_guest());
+    fake.scenario(&running(), &rules);
+
+    let run = fake.vm(&["doctor", "windows"]);
+
+    assert_eq!(
+        run.code, 0,
+        "a guest without codex is not a broken guest: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("- codex: not installed"),
+        "and doctor says so, as a skip: {}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("codex auth"),
+        "with no auth probe behind it — there is nothing to probe: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("✓ claude"),
+        "the other agent is unaffected: {}",
+        run.stderr
+    );
+}
+
+/// The check that pays for itself the way the proto-version one does: a login
+/// that is fine on disk 401s on use, so doctor spends a real model call rather
+/// than looking for a credentials file. A guest whose probe comes back nonzero
+/// is a guest where `vm codex` would fail minutes into a run, after a boot and a
+/// sync — so it is a failure here, named, with the command that fixes it.
+///
+/// The stderr below is codex 0.155's own, trimmed: it opens with a line about
+/// stdin, spends ten attempts reconnecting, and only then says what was wrong.
+/// Reporting the *first* line of that — as doctor did until a lapsed login on
+/// the linux guest showed it — hands the reader "Reading additional input from
+/// stdin...", which is not a diagnosis and not even a complaint.
+#[test]
+fn a_stale_agent_login_reports_the_verdict_not_the_banner_above_it() {
+    let fake = Fake::new("windows");
+    let mut rules = vec![
+        // `codex --version` succeeds, the probe behind it does not: matched in
+        // order, so the version rule has to come first.
+        fake.rule_ssh("codex --version", "codex-cli 0.155.0"),
+        fake.rule_ssh_fails(
+            "codex exec",
+            "Reading additional input from stdin...\n\
+             OpenAI Codex v0.155.0\n\
+             ERROR: Reconnecting... 5/5\n\
+             ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication\n",
+        ),
+    ];
+    rules.extend(fake.healthy_guest());
+    fake.scenario(&running(), &rules);
+
+    let run = fake.vm(&["doctor", "windows"]);
+
+    assert_ne!(run.code, 0, "a guest that cannot authenticate is a problem");
+    assert!(
+        run.stderr.contains("✗ codex auth") && run.stderr.contains("401 Unauthorized"),
+        "the report has to carry the verdict the probe reached: {}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("Reading additional input"),
+        "and not the banner it narrated on the way there: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("codex login"),
+        "and the command that fixes it — `codex`'s login is its own subcommand: {}",
+        run.stderr
+    );
+}
+
+/// claude's output runs the other way: the complaint is its first line, and
+/// whatever follows is detail. Pinned alongside the codex case because the two
+/// are one `match` in `agent_checks`, and a tidy-up that made them share an arm
+/// would silently start reporting the wrong end of one of them.
+#[test]
+fn a_stale_claude_login_reports_its_first_line() {
+    let fake = Fake::new("windows");
+    let mut rules = vec![
+        fake.rule_ssh("claude --version", "2.1.250 (Claude Code)"),
+        fake.rule_ssh_fails(
+            "claude -p",
+            "Failed to authenticate: OAuth session expired and could not be refreshed\n\
+             (run `claude` to log in again)\n",
+        ),
+    ];
+    rules.extend(fake.healthy_guest());
+    fake.scenario(&running(), &rules);
+
+    let run = fake.vm(&["doctor", "windows"]);
+
+    assert_ne!(run.code, 0);
+    assert!(
+        run.stderr.contains("✗ claude auth") && run.stderr.contains("OAuth session expired"),
+        "the report has to carry what the probe said: {}",
+        run.stderr
+    );
 }
 
 /// The check that pays for itself. An agent left behind by an older vm speaks an
