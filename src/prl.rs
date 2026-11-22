@@ -196,19 +196,97 @@ fn wake(alias: &str, name: &str, status: &str) -> Result<bool> {
         ("resume", "resuming")
     };
     crumb!("vm ▸ {alias} ▸ '{name}' is {status} — {gerund} it…");
+    // Stamped before asking, so the VM's process can only begin after it: that
+    // ordering is what lets reap tell this boot from a later one by hand.
+    lock::mark_vm_start(alias)?;
     match prlctl(&[verb, name]) {
         Ok(_) => Ok(true),
-        Err(err) => match find(name) {
-            Ok(vm) if !is_off(&vm.status) => {
-                crumb!(
-                    "vm ▸ {alias} ▸ '{name}' is {} — something else brought it up; joining that wake",
-                    vm.status
-                );
-                Ok(true)
+        Err(err) => {
+            // Either way the boot is not vm's: it failed, or it was someone
+            // else's (the bring-up lock rules out another vm), so reap must not
+            // count it as one.
+            lock::clear_vm_start(alias);
+            match find(name) {
+                Ok(vm) if !is_off(&vm.status) => {
+                    crumb!(
+                        "vm ▸ {alias} ▸ '{name}' is {} — something else brought it up; joining that wake",
+                        vm.status
+                    );
+                    Ok(true)
+                }
+                _ => Err(err),
             }
-            _ => Err(err),
-        },
+        }
     }
+}
+
+/// The `ps` to run. A test seam like [`prlctl_bin`], and moved only by tests.
+fn ps_bin() -> std::ffi::OsString {
+    std::env::var_os("VM_PS").unwrap_or_else(|| "ps".into())
+}
+
+/// How long the Parallels process running this VM has been alive, or None
+/// when no such process exists.
+///
+/// Each running VM is one host process, launched by `prlctl start` and gone
+/// once the VM stops. That makes its age a boot identity, which Parallels
+/// itself does not offer: `prlctl list -i`'s `Uptime` adds up across boots
+/// (measured: 34561 stopped → 34572 after an 11s boot). It sits in a process's
+/// own args (Parallels 27.0, Apple silicon host):
+///
+/// ```text
+/// …/Parallels VM.app/Contents/MacOS/prl_vm_app --vm-name Ubuntu 26.04 --uuid {db670d16-…} …
+/// …/Parallels Mac VM.app/Contents/MacOS/prl_macvm_app --openvm …/macOS.macvm --uuid {6f1f9e76-…} …
+/// ```
+///
+/// Measured too: the process already exists when `prlctl start` returns
+/// (`etime` 00:00). `etime` rather than `lstart` because `lstart` is printed
+/// in the host's locale.
+pub fn vm_process_age(uuid: &str) -> Result<Option<Duration>> {
+    let out = Command::new(ps_bin())
+        .args(["-axww", "-o", "etime=,args="])
+        .output()
+        .context("failed to run ps")?;
+    if !out.status.success() {
+        bail!("ps failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(find_vm_process_age(
+        &String::from_utf8_lossy(&out.stdout),
+        uuid,
+    ))
+}
+
+/// The `ps -o etime=,args=` line for this VM's process, aged. Only the
+/// process whose *program* is a Parallels VM app counts: any command line that
+/// merely mentions the uuid matches too (measured: the very shell running a
+/// `grep` for it did).
+fn find_vm_process_age(ps: &str, uuid: &str) -> Option<Duration> {
+    let uuid = uuid.trim_matches(|c| c == '{' || c == '}');
+    let needle = format!(" --uuid {{{uuid}}}");
+    ps.lines().find_map(|line| {
+        let (etime, args) = line.trim_start().split_once(' ')?;
+        let args = args.trim_start();
+        // The program path has spaces in it ("Parallels Desktop.app"), so it
+        // runs up to the first option, not the first space.
+        let program = &args[..args.find(" --")?];
+        let app = program.rsplit('/').next()?;
+        let is_vm_app =
+            app.starts_with("prl_") && app.ends_with("_app") && !app.contains(char::is_whitespace);
+        (is_vm_app && args.contains(&needle)).then(|| parse_etime(etime))?
+    })
+}
+
+/// `ps`'s elapsed time, `[[dd-]hh:]mm:ss`.
+fn parse_etime(etime: &str) -> Option<Duration> {
+    let (days, clock) = match etime.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, etime),
+    };
+    let mut secs = 0u64;
+    for part in clock.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(Duration::from_secs(days * 86_400 + secs))
 }
 
 /// A VM brought up: where to reach it, and whether it was still coming up when
@@ -961,5 +1039,53 @@ mod tests {
             ip_configured: ip_configured.into(),
             name: "Windows 11".into(),
         }
+    }
+
+    /// `ps -axww -o etime=,args=` as measured on the host: both kinds of
+    /// Parallels VM process, plus the shell that was grepping for them, whose
+    /// command line carries the same uuid and the same `prl_` path fragment.
+    const PS: &str = concat!(
+        "   01:40 /Applications/Parallels Desktop.app/Contents/MacOS//Parallels VM.app/Contents/MacOS/prl_vm_app --vm-name Ubuntu 26.04 --uuid {db670d16-f152-4105-983f-80cf60c236d5} --dir-uuid {47d4c2c3-3b95-4d35-8c21-40647ea075e4}\n",
+        "   00:00 /bin/zsh -c ps -axww -o etime=,args= | grep -F -- --uuid {d2b7786c-6dd9-47c6-a0cf-01f1e5e1abf0}\n",
+        "   00:03 /Applications/Parallels Desktop.app/Contents/MacOS//Parallels VM.app/Contents/MacOS/prl_vm_app --vm-name Windows 11 --uuid {d2b7786c-6dd9-47c6-a0cf-01f1e5e1abf0} --dir-uuid {47d4c2c3-3b95-4d35-8c21-40647ea075e4}\n",
+        "13:30:03 /Applications/Parallels Desktop.app/Contents/MacOS/Parallels Mac VM.app/Contents/MacOS/prl_macvm_app --openvm /Users/x/Parallels/macOS.macvm --uuid {6f1f9e76-da32-49dd-9d09-853d759498f7} --dir-uuid {47d4c2c3-3b95-4d35-8c21-40647ea075e4}\n",
+    );
+
+    /// The shell line sorts first and names the same uuid. Taking it would
+    /// read a VM booted by hand an hour ago as one that began this second.
+    #[test]
+    fn a_command_line_that_only_mentions_the_uuid_is_not_the_vm() {
+        assert_eq!(
+            find_vm_process_age(PS, "d2b7786c-6dd9-47c6-a0cf-01f1e5e1abf0"),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[test]
+    fn both_kinds_of_parallels_vm_process_are_found() {
+        assert_eq!(
+            find_vm_process_age(PS, "db670d16-f152-4105-983f-80cf60c236d5"),
+            Some(Duration::from_secs(100))
+        );
+        assert_eq!(
+            find_vm_process_age(PS, "{6f1f9e76-da32-49dd-9d09-853d759498f7}"),
+            Some(Duration::from_secs(13 * 3600 + 30 * 60 + 3)),
+            "braced or not, it is the same uuid"
+        );
+        assert_eq!(
+            find_vm_process_age(PS, "00000000-0000-0000-0000-000000000000"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_etime_shape_ps_prints_is_read() {
+        assert_eq!(parse_etime("00:07"), Some(Duration::from_secs(7)));
+        assert_eq!(parse_etime("17:47:58"), Some(Duration::from_secs(64078)));
+        assert_eq!(
+            parse_etime("2-01:00:00"),
+            Some(Duration::from_secs(2 * 86400 + 3600))
+        );
+        assert_eq!(parse_etime("soon"), None);
     }
 }

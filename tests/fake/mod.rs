@@ -309,6 +309,9 @@ work_root = "~/work"
             .env("VM_CONFIG", self.dir.path().join("config.toml"))
             .env("VM_PRLCTL", fake_bin())
             .env("VM_SSH", fake_bin())
+            // and `ps`, which reap asks how long the VM's Parallels process has
+            // been alive — answered by a `ps_says` rule like any other call.
+            .env("VM_PS", fake_bin())
             .env("VM_TEST_TICK_MS", TICK_MS)
             .env("FAKE_PRLCTL_DIR", self.dir.path())
             .env("FAKE_PRLCTL_VM", VM_BIN)
@@ -337,6 +340,45 @@ work_root = "~/work"
                 .set_modified(when),
         )
         .expect("backdating the lock");
+    }
+
+    /// vm booted this VM itself `minutes` ago: the stamp vm writes before its
+    /// own `prlctl start`, backdated. Pair it with [`Fake::rule_ps_vm_process`]
+    /// for the same age, and reap reads the running boot as vm's.
+    pub fn vm_started_minutes_ago(&self, minutes: u64) {
+        let locks = self.dir.path().join("locks");
+        std::fs::create_dir_all(&locks).expect("a lock dir");
+        let file = std::fs::File::create(locks.join(format!("{}.started", self.alias)))
+            .expect("the start stamp");
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(minutes * 60);
+        file.set_modified(when).expect("backdating the start stamp");
+    }
+
+    /// Whether vm left the stamp that says it started this VM itself.
+    pub fn vm_start_stamped(&self) -> bool {
+        self.dir
+            .path()
+            .join("locks")
+            .join(format!("{}.started", self.alias))
+            .exists()
+    }
+
+    /// `ps` showing this VM's Parallels process, alive for `minutes`, in the
+    /// shape measured on the host (`etime`, then the program and its args).
+    pub fn rule_ps_vm_process(&self, minutes: u64) -> Value {
+        let line = format!(
+            "{:02}:{:02}:00 /Applications/Parallels Desktop.app/Contents/MacOS//Parallels VM.app/\
+             Contents/MacOS/prl_vm_app --vm-name {VM_NAME} \
+             --uuid {{deadbeef-0000-0000-0000-000000000000}} --log-dir /tmp",
+            minutes / 60,
+            minutes % 60
+        );
+        self.rule_ps_says(&line)
+    }
+
+    /// `ps` printing exactly `stdout`.
+    pub fn rule_ps_says(&self, stdout: &str) -> Value {
+        json!({ "match_prefix": ["-axww"], "responses": [{ "stdout": stdout }] })
     }
 
     /// Every prlctl (and ssh) invocation the runs made, in order.

@@ -62,6 +62,10 @@ fn a_cold_boot_holds_out_through_every_stopgap_address() {
         "a stopped VM is started once: {:?}",
         fake.calls()
     );
+    assert!(
+        fake.vm_start_stamped(),
+        "a VM vm booted must be stamped as vm's, or reap never shuts it down"
+    );
 }
 
 /// A suspended VM is resumed — once. Parallels reports the *old* status for a
@@ -236,6 +240,10 @@ fn a_start_that_loses_to_a_wake_already_in_flight_is_joined_not_failed() {
         "vm issued exactly one start — the one that lost the race: {:?}",
         fake.calls()
     );
+    assert!(
+        !fake.vm_start_stamped(),
+        "the boot that won was someone else's; reap must not take it for vm's"
+    );
 }
 
 /// A bring-up that finds the guest already `starting` joins that wake instead of
@@ -267,6 +275,10 @@ fn a_bring_up_joins_a_wake_in_flight_without_starting_again() {
         fake.calls_starting_with(&["start"]).is_empty(),
         "a guest already starting must not be started again: {:?}",
         fake.calls()
+    );
+    assert!(
+        !fake.vm_start_stamped(),
+        "joining a wake someone else began does not make the VM vm's"
     );
     assert!(
         run.stderr.contains(&format!("ready at {LEASE}")),

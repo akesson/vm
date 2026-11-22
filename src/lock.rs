@@ -152,6 +152,36 @@ pub fn last_use(alias: &str) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
+/// `locks/<alias>.started`: its mtime is the moment vm last asked Parallels to
+/// start or resume this VM itself. Reap shuts down only VMs vm booted, and this
+/// file is half of how it tells: the other half is when the VM's Parallels
+/// process actually began (see [`crate::reap`]), since the mark alone cannot
+/// say whether someone has stopped and restarted the VM by hand since.
+fn start_mark_path(alias: &str) -> Result<PathBuf> {
+    Ok(locks_dir()?.join(format!("{alias}.started")))
+}
+
+/// Stamp "vm is starting this VM now". Called just *before* the `prlctl
+/// start`, so the VM's process can only begin after the stamp.
+pub fn mark_vm_start(alias: &str) -> Result<()> {
+    let path = start_mark_path(alias)?;
+    std::fs::write(&path, "").with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// Undo [`mark_vm_start`]: the start was not vm's after all (it failed, or
+/// something else had brought the VM up first).
+pub fn clear_vm_start(alias: &str) {
+    if let Ok(path) = start_mark_path(alias) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// When vm last started this VM itself, if it ever has.
+pub fn vm_start_mark(alias: &str) -> Option<SystemTime> {
+    let path = start_mark_path(alias).ok()?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 #[cfg(unix)]
 fn lock_shared(file: &File) -> Result<()> {
     use std::os::unix::io::AsRawFd;

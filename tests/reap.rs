@@ -7,8 +7,10 @@
 //! the cost of getting one wrong is somebody's guest disappearing out from under
 //! their work.
 //!
-//! Five things stay its hand, and each is asserted here on the only evidence that
-//! matters: whether `prlctl stop` was called at all.
+//! Several things stay its hand, and each is asserted here on the only evidence
+//! that matters: whether `prlctl stop` was called at all. The first is whose VM
+//! it is: reap shuts down only the VMs vm booted, never one somebody started by
+//! hand, so every test that expects a shutdown first sets up a VM vm started.
 //!
 //! The last row is the uncomfortable one. The console-input probe *fails open* —
 //! if vm cannot tell whether someone is at the keyboard, it shuts the guest down
@@ -27,7 +29,11 @@ fn an_idle_vm_is_shut_down_and_the_journal_says_why() {
     let fake = Fake::new("windows");
     // The idle probe rides `prlctl exec` on a windows guest; the reply is
     // milliseconds since the last console input — an hour, here.
-    fake.scenario(&running(), &[fake.rule_exec_says("3600000")]);
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_vm_process(90)],
+    );
+    fake.vm_started_minutes_ago(90);
     fake.last_used_minutes_ago(60);
 
     let run = fake.vm(&["reap", "--idle-minutes", "30"]);
@@ -68,7 +74,11 @@ fn a_vm_that_is_already_down_is_left_alone() {
 #[test]
 fn a_recently_used_vm_is_kept() {
     let fake = Fake::new("windows");
-    fake.scenario(&running(), &[fake.rule_exec_says("3600000")]);
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_vm_process(90)],
+    );
+    fake.vm_started_minutes_ago(90);
 
     // 30 minutes: the lock file was just created, so its idle time is ~0.
     let run = fake.vm(&["reap", "--idle-minutes", "30"]);
@@ -90,7 +100,11 @@ fn a_recently_used_vm_is_kept() {
 fn a_vm_with_someone_at_its_console_is_kept() {
     let fake = Fake::new("windows");
     // Nobody has run a `vm` command against this guest in an hour…
-    fake.scenario(&running(), &[fake.rule_exec_says("5000")]);
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("5000"), fake.rule_ps_vm_process(90)],
+    );
+    fake.vm_started_minutes_ago(90);
     fake.last_used_minutes_ago(60);
 
     // …but its console was touched five seconds ago. Somebody is right there.
@@ -119,8 +133,12 @@ fn a_console_probe_that_fails_shuts_the_vm_down_but_never_quietly() {
     let fake = Fake::new("windows");
     fake.scenario(
         &running(),
-        &[fake.rule_fails("exec", "Unable to open new session")],
+        &[
+            fake.rule_fails("exec", "Unable to open new session"),
+            fake.rule_ps_vm_process(90),
+        ],
     );
+    fake.vm_started_minutes_ago(90);
     fake.last_used_minutes_ago(60);
 
     let run = fake.vm(&["-q", "reap", "--idle-minutes", "30"]);
@@ -161,7 +179,11 @@ fn a_console_probe_that_fails_shuts_the_vm_down_but_never_quietly() {
 #[test]
 fn a_vm_in_use_is_never_reaped() {
     let fake = Fake::new("windows");
-    fake.scenario(&running(), &[fake.rule_exec_says("3600000")]);
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_vm_process(90)],
+    );
+    fake.vm_started_minutes_ago(90);
 
     let lock_file = fake.path().join("locks").join(fake.alias());
     std::fs::create_dir_all(lock_file.parent().unwrap()).unwrap();
@@ -181,4 +203,137 @@ fn a_vm_in_use_is_never_reaped() {
         run.stderr
     );
     drop(held);
+}
+
+/// A VM somebody started themselves (the Parallels GUI, `prlctl start`) is
+/// theirs. vm has never touched it, so its lock file says "idle forever", and
+/// before reap checked whose VM it was, that alone got it shut down at the next
+/// sweep: minutes after its owner booted it.
+#[test]
+fn a_vm_started_by_hand_is_left_running_however_idle_it_looks() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_vm_process(5)],
+    );
+    fake.last_used_minutes_ago(600);
+
+    let run = fake.vm(&["-q", "reap", "--idle-minutes", "0"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        fake.calls_starting_with(&["stop"]).is_empty(),
+        "reap shut down a VM vm never started: {:?}",
+        fake.calls()
+    );
+    assert!(
+        fake.journal().contains("not started by vm"),
+        "a VM left running has to say why: {}",
+        fake.journal()
+    );
+}
+
+/// vm booted it, and since then somebody stopped it and started it again by
+/// hand. vm's stamp is still there, so the stamp alone would call this boot
+/// vm's. The VM's process began an hour after the stamp, and that gives it away.
+#[test]
+fn a_vm_restarted_by_hand_after_vm_booted_it_is_left_running() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_vm_process(10)],
+    );
+    fake.vm_started_minutes_ago(70);
+    fake.last_used_minutes_ago(60);
+
+    let run = fake.vm(&["reap", "--idle-minutes", "30"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        fake.calls_starting_with(&["stop"]).is_empty(),
+        "reap shut down a VM somebody had restarted by hand: {:?}",
+        fake.calls()
+    );
+    assert!(
+        run.stderr.contains("restarted outside vm"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// A running VM always has a Parallels process. When `ps` shows none, Parallels
+/// has changed how it runs VMs, and reap can no longer tell whose a VM is. It
+/// keeps the VM, and it says so loudly even under `-q`. If it stayed quiet,
+/// reaping would stop for good without anyone noticing.
+#[test]
+fn a_vm_whose_process_cannot_be_found_is_kept_and_reported() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_says("")],
+    );
+    fake.vm_started_minutes_ago(90);
+    fake.last_used_minutes_ago(60);
+
+    let run = fake.vm(&["-q", "reap", "--idle-minutes", "30"]);
+
+    assert!(
+        fake.calls_starting_with(&["stop"]).is_empty(),
+        "{:?}",
+        fake.calls()
+    );
+    assert_eq!(
+        run.code, 125,
+        "an undecidable VM is reap's own failure: {}",
+        run.stderr
+    );
+    assert!(
+        fake.journal().contains("no Parallels process"),
+        "{}",
+        fake.journal()
+    );
+}
+
+/// One VM that cannot be reaped must not cost the others their sweep. Reap
+/// walks VMs in alias order, and on 2026-11-22 a renamed linux VM (config still
+/// said "Ubuntu 24.04") ended every sweep at its first entry. The VMs after it,
+/// macos and windows, were never looked at.
+#[test]
+fn a_vm_that_cannot_be_reaped_does_not_stop_the_sweep_for_the_others() {
+    let fake = Fake::new("windows");
+    let config = fake.path().join("config.toml");
+    let mut body = std::fs::read_to_string(&config).unwrap();
+    // Sorts first, and names a VM Parallels does not have.
+    body.push_str(
+        r#"
+[vm.aaa]
+parallels_name = "Renamed In Parallels"
+os = "windows"
+user = "tester"
+work_root = "~/work"
+"#,
+    );
+    std::fs::write(&config, body).unwrap();
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_says("3600000"), fake.rule_ps_vm_process(90)],
+    );
+    fake.vm_started_minutes_ago(90);
+    fake.last_used_minutes_ago(60);
+
+    let run = fake.vm(&["-q", "reap", "--idle-minutes", "30"]);
+
+    assert_eq!(
+        fake.calls_starting_with(&["stop"]).len(),
+        1,
+        "the VM after the broken one still has to be reaped: {:?}",
+        fake.calls()
+    );
+    assert_eq!(run.code, 125, "but the sweep was not clean: {}", run.stderr);
+    assert!(
+        fake.journal().contains("aaa not reaped")
+            && fake.journal().contains("Renamed In Parallels"),
+        "{}",
+        fake.journal()
+    );
 }

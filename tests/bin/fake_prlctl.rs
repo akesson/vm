@@ -4,6 +4,8 @@
 //!
 //! vm reaches Parallels through exactly one name (`prl::prlctl_bin`) and ssh
 //! through one more (`ssh::ssh_bin`); `VM_PRLCTL` and `VM_SSH` point them here.
+//! So does `VM_PS` (`prl::ps_bin`): reap reads the host's process list to tell
+//! the VMs vm booted from the ones somebody started by hand.
 //! What that makes testable is everything wrapped around them: `wait_for_ip`'s
 //! status machine, reap's decision matrix, doctor's checks, the argv each one
 //! builds. All of it pure logic that had only ever been exercised by running it
