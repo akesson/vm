@@ -89,6 +89,24 @@ Run the steps in order. A step failing does not stop the others — collect the
 failures and report them at the end. A tool the guest does not have is a **skip,
 not a failure** (guard with `command -v <tool> >/dev/null || exit 0`).
 
+**Check free disk space first, on every guest.** If a guest runs out mid-sweep,
+every later step fails halfway through. On 2026-11-21 the linux guest had a few
+GB left. A large apt run used all of it, which left a package half-configured,
+and the rustup and codex installs that came after it then died with `No space
+left on device`.
+Under ~5 GB free, stop and report before upgrading anything:
+
+```sh
+vm run linux -- df -h / /home
+vm run macos -- df -h /
+vm run windows -- powershell -NoProfile -Command '[math]::Round((Get-PSDrive C).Free/1GB,1)'
+                                          # GB free; Spanish locale prints a decimal comma
+```
+
+The usual space hogs are Cargo `target/` dirs in `~/work`, unused rustup
+toolchains (check `rust-toolchain.toml` and CI pins before removing one), and
+disabled snap revisions. Deleting any of them is the user's call (§7).
+
 ### linux (elevated: apt, snap · user: rustup, mise, claude, codex)
 ```sh
 vm run linux --elevated -- sh < step.sh   # apt: DEBIAN_FRONTEND=noninteractive, then
@@ -106,13 +124,15 @@ vm run linux --elevated -- 'test -f /var/run/reboot-required && cat /var/run/reb
                                           # REPORT it; never reboot a guest
 ```
 
-### macos (elevated: softwareupdate · user: brew, rustup, mise, claude)
+### macos (elevated: softwareupdate · user: brew, rustup, mise, claude, codex)
 
-codex is not installed on this guest; §4's skip rule covers it. If it is added
-later, match however it was installed (mise → `mise upgrade`; standalone →
-`codex update`).
+Homebrew owns codex on this guest, so `brew upgrade` updates it and there is no
+separate codex line. Do NOT run `codex update` here: it would fight brew for the
+binary.
 ```sh
 vm run macos -- 'brew update && brew upgrade && brew cleanup'  # brew REFUSES to run as root
+                                          # a cask whose uninstaller calls sudo (e.g.
+                                          # git-credential-manager) fails here: report it
 vm run macos -- rustup update
 vm run macos -- mise upgrade              # brew owns the binary; do NOT self-update
 vm run macos -- claude update
@@ -250,7 +270,15 @@ explicit questions.
 - **Homebrew is skipping formulae from untrusted taps** (`Warning: Skipping <x>:
   tap formula is not trusted`). Those packages are **not being upgraded**. List
   them and ask whether to `brew trust --formula <tap>/<formula>`.
-- **apt held a package back** ("N not upgraded"). Say which.
+- **apt held a package back** ("N not upgraded"). Say which. If hundreds are
+  held back, compare `VERSION_CODENAME` in `/etc/os-release` with the versions
+  of the installed packages. On 2026-11-21 the linux guest was halfway through
+  a release upgrade (24.04 → 26.04) that had started on 2026-10-11 and sat
+  unfinished until `apt full-upgrade` finished it that evening. Only
+  `apt full-upgrade` completes that, and it removes packages, so show its `-s`
+  dry run and ask.
+- **A guest is low on disk** (see §4). List what is taking the space and ask
+  before deleting anything.
 - **A step failed twice**, or anything asks an interactive question.
 - **Anything destructive** — removing packages, changing a tap, resetting a
   toolchain — even if it looks like the obvious fix.
