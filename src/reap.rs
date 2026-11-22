@@ -40,8 +40,10 @@ use std::time::{Duration, SystemTime};
 /// costs nothing but the unlikely case of a hand restart inside it.
 const START_WINDOW: Duration = Duration::from_secs(120);
 
-/// `ps` reports whole seconds, so a process age read back as a start time can
-/// land up to a second before the true one, which is before the stamp.
+/// Rounding cannot put the start before the stamp: `now - floor(etime)` only
+/// ever lands at or after the true start. The slack is for the two clocks
+/// involved, the file's mtime and the kernel's process start, which can
+/// disagree by a step if the wall clock is adjusted between them.
 const CLOCK_SLACK: Duration = Duration::from_secs(2);
 
 pub fn reap(alias: Option<&str>, idle_minutes: u64) -> Result<i32> {
@@ -94,7 +96,7 @@ fn reap_one(name: &str, vm: &VmConfig, idle_limit: Duration) -> Result<()> {
         .checked_sub(age)
         .unwrap_or(SystemTime::UNIX_EPOCH);
     if !booted_by_vm(mark, began) {
-        crumb!("vm ▸ reap ▸ {name} was restarted outside vm since vm started it — left running");
+        crumb!("vm ▸ reap ▸ {name} is on a boot vm did not start — left running");
         return Ok(());
     }
     let Some(_claim) = lock::try_exclusive(name)? else {
@@ -391,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_vm_asked_for_is_vms() {
+    fn a_slow_start_is_not_mistaken_for_a_boot_by_hand() {
         assert!(booted_by_vm(at(0), at(0)));
         assert!(booted_by_vm(at(0), at(30)), "a slow start is still vm's");
         assert!(

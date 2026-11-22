@@ -197,26 +197,39 @@ fn wake(alias: &str, name: &str, status: &str) -> Result<bool> {
     };
     crumb!("vm ▸ {alias} ▸ '{name}' is {status} — {gerund} it…");
     // Stamped before asking, so the VM's process can only begin after it: that
-    // ordering is what lets reap tell this boot from a later one by hand.
-    lock::mark_vm_start(alias)?;
+    // ordering is what lets reap tell this boot from a later one by hand. Only
+    // a *start* is stamped. A paused VM keeps its process (measured, Parallels
+    // 27: same pid and a running etime across pause → resume), so a resume
+    // begins no new boot. The stamp, if any, of the start that began it is
+    // still the one that decides whose it is.
+    let stamped = verb == "start";
+    if stamped {
+        lock::mark_vm_start(alias)?;
+    }
     match prlctl(&[verb, name]) {
         Ok(_) => Ok(true),
-        Err(err) => {
-            // Either way the boot is not vm's: it failed, or it was someone
-            // else's (the bring-up lock rules out another vm), so reap must not
-            // count it as one.
-            lock::clear_vm_start(alias);
-            match find(name) {
-                Ok(vm) if !is_off(&vm.status) => {
-                    crumb!(
-                        "vm ▸ {alias} ▸ '{name}' is {} — something else brought it up; joining that wake",
-                        vm.status
-                    );
-                    Ok(true)
-                }
-                _ => Err(err),
+        Err(err) => match find(name) {
+            // The VM is coming up despite the error. That may be this very
+            // start: prlctl can report a failure for a job that went on to take
+            // effect. Or it may be a GUI start that landed first (the bring-up
+            // lock rules out another vm). The stamp stays, and reap compares it
+            // with when the VM's process began. Wrongly clearing it would leave
+            // a VM vm booted running for good.
+            Ok(vm) if !is_off(&vm.status) => {
+                crumb!(
+                    "vm ▸ {alias} ▸ '{name}' is {} — something else brought it up; joining that wake",
+                    vm.status
+                );
+                Ok(true)
             }
-        }
+            // Still off: no boot happened, so there is nothing to claim.
+            _ => {
+                if stamped {
+                    lock::clear_vm_start(alias);
+                }
+                Err(err)
+            }
+        },
     }
 }
 
@@ -240,7 +253,9 @@ fn ps_bin() -> std::ffi::OsString {
 /// ```
 ///
 /// Measured too: the process already exists when `prlctl start` returns
-/// (`etime` 00:00). `etime` rather than `lstart` because `lstart` is printed
+/// (`etime` 00:00), and it survives a `snapshot-switch` (the rollback
+/// `--with-snapshot` does) and a pause → resume, same pid, so neither makes a
+/// boot look new. `etime` rather than `lstart` because `lstart` is printed
 /// in the host's locale.
 pub fn vm_process_age(uuid: &str) -> Result<Option<Duration>> {
     let out = Command::new(ps_bin())
@@ -1062,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn both_kinds_of_parallels_vm_process_are_found() {
+    fn a_macos_guest_or_a_braced_uuid_is_not_missed() {
         assert_eq!(
             find_vm_process_age(PS, "db670d16-f152-4105-983f-80cf60c236d5"),
             Some(Duration::from_secs(100))

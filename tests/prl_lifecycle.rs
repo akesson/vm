@@ -104,6 +104,11 @@ fn a_suspended_vm_is_resumed_exactly_once() {
         fake.calls_starting_with(&["start"]).is_empty(),
         "a suspended VM is resumed, not started — `prlctl start` on one is an error"
     );
+    assert!(
+        !fake.vm_start_stamped(),
+        "a resume begins no new boot (a paused VM keeps its process), so it must \
+         not claim one: reap would then blame a hand restart that never happened"
+    );
 }
 
 /// The bug the grace window exists for (#17): vm asked Parallels to bring a VM
@@ -241,8 +246,9 @@ fn a_start_that_loses_to_a_wake_already_in_flight_is_joined_not_failed() {
         fake.calls()
     );
     assert!(
-        !fake.vm_start_stamped(),
-        "the boot that won was someone else's; reap must not take it for vm's"
+        fake.vm_start_stamped(),
+        "a start that errored may still be the one that booted the VM; clearing \
+         its stamp would leave a VM vm booted running for good"
     );
 }
 
@@ -364,4 +370,28 @@ fn no_prlctl_command_line_vm_builds_comes_near_the_size_that_hangs_it() {
             "a {total}-byte prlctl command line: {call:?}"
         );
     }
+}
+
+/// A start that fails with the VM still off booted nothing, so its stamp has to
+/// go. Left behind, a VM somebody then starts by hand within the start window
+/// would read as vm's and be shut down under them.
+#[test]
+fn a_start_that_failed_with_the_vm_still_off_leaves_no_claim() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &[phase("stopped", "-")],
+        &[fake.rule_fails("start", "Failed to start the VM: Operation canceled.")],
+    );
+
+    let run = fake.vm(&["doctor", "windows"]);
+
+    assert!(
+        run.stderr.contains("Operation canceled"),
+        "the start's own error is what gets reported: {}",
+        run.stderr
+    );
+    assert!(
+        !fake.vm_start_stamped(),
+        "a failed start must not stay claimed"
+    );
 }

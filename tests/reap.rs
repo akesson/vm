@@ -255,7 +255,7 @@ fn a_vm_restarted_by_hand_after_vm_booted_it_is_left_running() {
         fake.calls()
     );
     assert!(
-        run.stderr.contains("restarted outside vm"),
+        run.stderr.contains("a boot vm did not start"),
         "{}",
         run.stderr
     );

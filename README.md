@@ -71,7 +71,9 @@ you start yourself, from the Parallels GUI or `prlctl start`, stays running unti
 you stop it (`vm ▸ reap ▸ macos was not started by vm — left running`). vm
 recognises its own boots by comparing a stamp it writes before each start with
 the age of the VM's Parallels process, so a VM vm booted and you later restarted
-by hand counts as yours too. It also leaves a VM alone while someone is typing
+by hand counts as yours too. A VM that was already running when you installed
+a vm with this rule has no stamp, so reap leaves it running. Stop it once, and
+from the next time vm boots it, reap shuts it down as before. It also leaves a VM alone while someone is typing
 at its console, so a guest you are driving by hand in the Parallels GUI is not
 pulled out from under you. One VM that cannot be reaped (say, renamed in
 Parallels but not in the config) is reported, and the sweep carries on with the
