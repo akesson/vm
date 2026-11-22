@@ -4,6 +4,8 @@
 //!
 //! vm reaches Parallels through exactly one name (`prl::prlctl_bin`) and ssh
 //! through one more (`ssh::ssh_bin`); `VM_PRLCTL` and `VM_SSH` point them here.
+//! So does `VM_PS` (`prl::ps_bin`): reap reads the host's process list to tell
+//! the VMs vm booted from the ones somebody started by hand.
 //! What that makes testable is everything wrapped around them: `wait_for_ip`'s
 //! status machine, reap's decision matrix, doctor's checks, the argv each one
 //! builds. All of it pure logic that had only ever been exercised by running it
@@ -292,7 +294,13 @@ fn record(dir: &Path, args: &[String]) {
         .append(true)
         .open(dir.join("calls.log"))
     {
-        let _ = writeln!(f, "{line}");
+        // One write, newline included. `writeln!` on a bare File is two
+        // writes (the text, then "\n"), and the concurrent-vm tests append from
+        // several processes at once, so another call's line could land between
+        // them. The two lines would then fuse into one that no longer parses,
+        // and `Fake::calls` drops it. Seen in CI: a `start` that vm's own output
+        // shows it made was missing from the log.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 

@@ -130,7 +130,11 @@ fn concurrent_execs_against_a_cold_guest_all_run_and_start_it_once() {
 #[test]
 fn reap_cannot_take_a_guest_out_from_under_a_running_exec() {
     let fake = Fake::new("windows");
-    fake.scenario(&running(), &[fake.rule_exec_passthrough()]);
+    fake.scenario(
+        &running(),
+        &[fake.rule_exec_passthrough(), fake.rule_ps_vm_process(90)],
+    );
+    fake.vm_started_minutes_ago(90);
     fake.with_repo();
     // Nobody has *started* a vm command in an hour, and nobody is at the console
     // either: by every measure reap has, this guest is idle. Only the lock held by

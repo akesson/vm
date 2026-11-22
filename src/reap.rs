@@ -1,16 +1,27 @@
 //! `vm reap` — shut down VMs that nobody is using.
 //!
-//! For each configured (or the named) VM: skip it while any `vm` process
-//! holds a use on it, skip it inside the idle window, skip it while someone
-//! is at its console (guest input idle below the window — manual GUI use
-//! leaves no trace in the lock files), otherwise shut it down. The console
-//! probe fails open: reclaiming RAM stays guaranteed, and a wrongly
-//! stopped VM costs one boot (seconds).
+//! For each configured (or the named) VM: skip it unless vm started it, skip
+//! it while any `vm` process holds a use on it, skip it inside the idle
+//! window, skip it while someone is at its console (guest input idle below
+//! the window — manual GUI use leaves no trace in the lock files), otherwise
+//! shut it down. The console probe fails open: reclaiming RAM stays
+//! guaranteed, and a wrongly stopped VM costs one boot (seconds).
 //!
-//! Idleness is measured from the per-VM lock file, which only `vm` touches —
-//! so a VM started by hand (`prlctl start`) still looks idle here and gets
-//! shut down at the next sweep. That is working as intended, but it is worth
-//! knowing when a hand-started VM goes back down on its own.
+//! Only VMs vm booted are reaped. A VM you start yourself, from the Parallels
+//! GUI or `prlctl start`, is yours, and reap leaves it running however idle it
+//! looks. Telling the two apart takes two facts, because neither is enough
+//! alone. vm stamps `locks/<alias>.started` just before each start it issues
+//! ([`lock::mark_vm_start`]), and Parallels runs every VM as one host process
+//! whose age gives the moment this boot began ([`prl::vm_process_age`]). The
+//! VM is vm's only when that process began right after the stamp. A stamp
+//! with an older or newer process means someone stopped and restarted the VM
+//! by hand since. Whatever cannot be decided is kept running and said so:
+//! a VM wrongly left up costs RAM, one wrongly stopped costs somebody's work.
+//!
+//! Idleness is measured from the per-VM lock file, which only `vm` touches.
+//! One VM's failure does not end the sweep for the others: it is reported,
+//! the sweep moves on, and the run exits 125 at the end.
+//!
 //! Stop, not suspend: reap used to suspend, until suspension proved the
 //! unreliable half of the pair — see [`prl::stop`] for what went wrong. A
 //! boot costs seconds more than a resume, and that is the whole price.
@@ -18,10 +29,22 @@
 //! Meant to run from a launchd interval job (`vm reap --install`); no
 //! long-running daemon of our own.
 
-use crate::config::Config;
+use crate::config::{Config, VmConfig};
 use crate::{crumb, lock, notice, prl};
 use anyhow::{Context, Result, bail};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+/// How long after vm's stamp the VM's process may begin and still be the
+/// boot vm asked for. Measured, the process exists before `prlctl start`
+/// returns, so seconds would do; the margin is for a slow, loaded host, and
+/// costs nothing but the unlikely case of a hand restart inside it.
+const START_WINDOW: Duration = Duration::from_secs(120);
+
+/// Rounding cannot put the start before the stamp: `now - floor(etime)` only
+/// ever lands at or after the true start. The slack is for the two clocks
+/// involved, the file's mtime and the kernel's process start, which can
+/// disagree by a step if the wall clock is adjusted between them.
+const CLOCK_SLACK: Duration = Duration::from_secs(2);
 
 pub fn reap(alias: Option<&str>, idle_minutes: u64) -> Result<i32> {
     let cfg = Config::load()?;
@@ -30,51 +53,94 @@ pub fn reap(alias: Option<&str>, idle_minutes: u64) -> Result<i32> {
     }
     let idle_limit = Duration::from_secs(idle_minutes * 60);
 
+    let mut failed = Vec::new();
     for (name, vm) in &cfg.vm {
         if alias.is_some_and(|a| a != name) {
             continue;
         }
-        if prl::find(&vm.parallels_name)?.status != "running" {
-            continue;
+        // Each VM on its own: the sweep walks them in alias order, so one that
+        // errors (renamed in Parallels, a stop Parallels cancels) used to cost
+        // every VM after it its sweep, every five minutes, for as long as the
+        // error lasted.
+        if let Err(err) = reap_one(name, vm, idle_limit) {
+            notice!("vm ▸ reap ▸ {name} not reaped: {err:#}");
+            failed.push(name.as_str());
         }
-        let Some(_claim) = lock::try_exclusive(name)? else {
-            crumb!("vm ▸ reap ▸ {name} in use — skipped");
-            continue;
-        };
-        // Idle time counts from the end of the last use; a lock file that
-        // does not exist yet gets created by try_exclusive with mtime = now,
-        // so a never-used VM becomes reapable one idle window from now.
-        let idle = lock::last_use(name)
-            .and_then(|t| t.elapsed().ok())
-            .unwrap_or(Duration::ZERO);
-        if idle < idle_limit {
-            crumb!(
-                "vm ▸ reap ▸ {name} idle {}m of {}m — kept",
-                idle.as_secs() / 60,
-                idle_minutes
-            );
-            continue;
-        }
-        match crate::idle::input_idle(vm) {
-            Ok(input) if input < idle_limit => {
-                crumb!(
-                    "vm ▸ reap ▸ {name} console input {}m ago — kept",
-                    input.as_secs() / 60
-                );
-                continue;
-            }
-            Ok(_) => {}
-            Err(err) => notice!(
-                "vm ▸ reap ▸ {name} input-idle probe failed ({err:#}) — shutting down anyway"
-            ),
-        }
-        prl::stop(&vm.parallels_name)?;
-        crumb!(
-            "vm ▸ reap ▸ {name} shut down after {}m idle (any `vm exec` boots it)",
-            idle.as_secs() / 60
-        );
+    }
+    if !failed.is_empty() {
+        bail!("reap could not finish for: {}", failed.join(", "));
     }
     Ok(0)
+}
+
+fn reap_one(name: &str, vm: &VmConfig, idle_limit: Duration) -> Result<()> {
+    let idle_minutes = idle_limit.as_secs() / 60;
+    let found = prl::find(&vm.parallels_name)?;
+    if found.status != "running" {
+        return Ok(());
+    }
+    let Some(mark) = lock::vm_start_mark(name) else {
+        crumb!("vm ▸ reap ▸ {name} was not started by vm — left running");
+        return Ok(());
+    };
+    // A running VM always has its process. Finding none means Parallels has
+    // changed how it runs VMs, and reap can no longer tell whose a VM is.
+    let age = prl::vm_process_age(&found.uuid)?.with_context(|| {
+        format!(
+            "'{}' is running but no Parallels process for it was found, so it is \
+             unclear who started it; left running",
+            vm.parallels_name
+        )
+    })?;
+    let began = SystemTime::now()
+        .checked_sub(age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    if !booted_by_vm(mark, began) {
+        crumb!("vm ▸ reap ▸ {name} is on a boot vm did not start — left running");
+        return Ok(());
+    }
+    let Some(_claim) = lock::try_exclusive(name)? else {
+        crumb!("vm ▸ reap ▸ {name} in use — skipped");
+        return Ok(());
+    };
+    // Idle time counts from the end of the last use; a lock file that
+    // does not exist yet gets created by try_exclusive with mtime = now,
+    // so a never-used VM becomes reapable one idle window from now.
+    let idle = lock::last_use(name)
+        .and_then(|t| t.elapsed().ok())
+        .unwrap_or(Duration::ZERO);
+    if idle < idle_limit {
+        crumb!(
+            "vm ▸ reap ▸ {name} idle {}m of {}m — kept",
+            idle.as_secs() / 60,
+            idle_minutes
+        );
+        return Ok(());
+    }
+    match crate::idle::input_idle(vm) {
+        Ok(input) if input < idle_limit => {
+            crumb!(
+                "vm ▸ reap ▸ {name} console input {}m ago — kept",
+                input.as_secs() / 60
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(err) => {
+            notice!("vm ▸ reap ▸ {name} input-idle probe failed ({err:#}) — shutting down anyway")
+        }
+    }
+    prl::stop(&vm.parallels_name)?;
+    crumb!(
+        "vm ▸ reap ▸ {name} shut down after {}m idle (any `vm exec` boots it)",
+        idle.as_secs() / 60
+    );
+    Ok(())
+}
+
+/// Whether the boot that began at `began` is the one vm asked for at `mark`.
+fn booted_by_vm(mark: SystemTime, began: SystemTime) -> bool {
+    began + CLOCK_SLACK >= mark && began <= mark + START_WINDOW
 }
 
 pub const LAUNCHD_LABEL: &str = "com.akesson.vm.reap";
@@ -320,5 +386,28 @@ mod tests {
         let no_quiet = sample().replace("        <string>--quiet</string>\n", "");
         assert!(!no_quiet.contains("--quiet"));
         assert!(is_stale(&no_quiet));
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + secs)
+    }
+
+    #[test]
+    fn a_slow_start_is_not_mistaken_for_a_boot_by_hand() {
+        assert!(booted_by_vm(at(0), at(0)));
+        assert!(booted_by_vm(at(0), at(30)), "a slow start is still vm's");
+        assert!(
+            booted_by_vm(at(1), at(0)),
+            "ps's whole seconds can put the start just before the stamp"
+        );
+    }
+
+    /// Two hand restarts look different and are both somebody else's VM: one
+    /// whose process predates vm's stamp (vm's own start failed, and the VM
+    /// running is one that was already up), and one that began long after it.
+    #[test]
+    fn a_boot_outside_the_window_is_somebody_elses() {
+        assert!(!booted_by_vm(at(600), at(0)));
+        assert!(!booted_by_vm(at(0), at(3600)));
     }
 }

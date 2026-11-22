@@ -66,9 +66,18 @@ in ~15s rather than sitting out the full timeout.
 
 The other half is `vm reap`, which **shuts down** VMs that no vm process is
 using and that have been idle a while (30m by default; `vm reap --install` runs
-it every 5 minutes from launchd). It leaves a VM alone while someone is typing
+it every 5 minutes from launchd). It reaps only VMs that vm itself booted: a VM
+you start yourself, from the Parallels GUI or `prlctl start`, stays running until
+you stop it (`vm ▸ reap ▸ macos was not started by vm — left running`). vm
+recognises its own boots by comparing a stamp it writes before each start with
+the age of the VM's Parallels process, so a VM vm booted and you later restarted
+by hand counts as yours too. A VM that was already running when you installed
+a vm with this rule has no stamp, so reap leaves it running. Stop it once, and
+from the next time vm boots it, reap shuts it down as before. It also leaves a VM alone while someone is typing
 at its console, so a guest you are driving by hand in the Parallels GUI is not
-pulled out from under you. Nobody is watching a launchd job, so every sweep's
+pulled out from under you. One VM that cannot be reaped (say, renamed in
+Parallels but not in the config) is reported, and the sweep carries on with the
+others. Nobody is watching a launchd job, so every sweep's
 decision — kept, skipped, shut down, and why — goes to [the
 journal](#the-journal) with the time it was made. If you upgraded from a vm that
 predates the journal, `vm doctor` will tell you to re-run `vm reap --install`:
@@ -477,8 +486,9 @@ the agent inside a guest.
 ## Tests
 
 `mise run test` is the whole suite, and it needs no VM: Parallels is reached
-through one name (`prlctl`) and the network through one more (`ssh`), and
-`$VM_PRLCTL` / `$VM_SSH` point both at a scriptable stand-in
+through one name (`prlctl`), the network through one more (`ssh`), and the
+host's process list (which reap reads to tell vm's boots from yours) through
+`ps`. `$VM_PRLCTL` / `$VM_SSH` / `$VM_PS` point all three at a scriptable stand-in
 (`tests/bin/fake_prlctl.rs`). A guest that wakes up through six addresses, a VM
 that never comes up, a reap sweep firing into a run in flight, two execs racing
 each other on one guest — all of it runs in CI on all three OSes, in seconds,

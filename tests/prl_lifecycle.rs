@@ -62,6 +62,10 @@ fn a_cold_boot_holds_out_through_every_stopgap_address() {
         "a stopped VM is started once: {:?}",
         fake.calls()
     );
+    assert!(
+        fake.vm_start_stamped(),
+        "a VM vm booted must be stamped as vm's, or reap never shuts it down"
+    );
 }
 
 /// A suspended VM is resumed — once. Parallels reports the *old* status for a
@@ -99,6 +103,11 @@ fn a_suspended_vm_is_resumed_exactly_once() {
     assert!(
         fake.calls_starting_with(&["start"]).is_empty(),
         "a suspended VM is resumed, not started — `prlctl start` on one is an error"
+    );
+    assert!(
+        !fake.vm_start_stamped(),
+        "a resume begins no new boot (a paused VM keeps its process), so it must \
+         not claim one: reap would then blame a hand restart that never happened"
     );
 }
 
@@ -236,6 +245,11 @@ fn a_start_that_loses_to_a_wake_already_in_flight_is_joined_not_failed() {
         "vm issued exactly one start — the one that lost the race: {:?}",
         fake.calls()
     );
+    assert!(
+        fake.vm_start_stamped(),
+        "a start that errored may still be the one that booted the VM; clearing \
+         its stamp would leave a VM vm booted running for good"
+    );
 }
 
 /// A bring-up that finds the guest already `starting` joins that wake instead of
@@ -267,6 +281,10 @@ fn a_bring_up_joins_a_wake_in_flight_without_starting_again() {
         fake.calls_starting_with(&["start"]).is_empty(),
         "a guest already starting must not be started again: {:?}",
         fake.calls()
+    );
+    assert!(
+        !fake.vm_start_stamped(),
+        "joining a wake someone else began does not make the VM vm's"
     );
     assert!(
         run.stderr.contains(&format!("ready at {LEASE}")),
@@ -352,4 +370,28 @@ fn no_prlctl_command_line_vm_builds_comes_near_the_size_that_hangs_it() {
             "a {total}-byte prlctl command line: {call:?}"
         );
     }
+}
+
+/// A start that fails with the VM still off booted nothing, so its stamp has to
+/// go. Left behind, a VM somebody then starts by hand within the start window
+/// would read as vm's and be shut down under them.
+#[test]
+fn a_start_that_failed_with_the_vm_still_off_leaves_no_claim() {
+    let fake = Fake::new("windows");
+    fake.scenario(
+        &[phase("stopped", "-")],
+        &[fake.rule_fails("start", "Failed to start the VM: Operation canceled.")],
+    );
+
+    let run = fake.vm(&["doctor", "windows"]);
+
+    assert!(
+        run.stderr.contains("Operation canceled"),
+        "the start's own error is what gets reported: {}",
+        run.stderr
+    );
+    assert!(
+        !fake.vm_start_stamped(),
+        "a failed start must not stay claimed"
+    );
 }

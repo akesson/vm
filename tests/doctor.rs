@@ -280,7 +280,10 @@ fn stale_snapshots_from_killed_runs_are_reported() {
 #[test]
 fn doctor_of_a_running_guest_counts_as_a_use_and_stays_reaps_hand() {
     let fake = Fake::new("windows");
-    fake.scenario(&running(), &fake.healthy_guest());
+    let mut rules = fake.healthy_guest();
+    rules.push(fake.rule_ps_vm_process(90));
+    fake.scenario(&running(), &rules);
+    fake.vm_started_minutes_ago(90);
     // Nothing has used this guest in an hour; reap's window here is 30 minutes,
     // so without the doctor counting as a use it would be shut down.
     fake.last_used_minutes_ago(60);
