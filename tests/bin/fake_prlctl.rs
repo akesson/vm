@@ -294,7 +294,13 @@ fn record(dir: &Path, args: &[String]) {
         .append(true)
         .open(dir.join("calls.log"))
     {
-        let _ = writeln!(f, "{line}");
+        // One write, newline included. `writeln!` on a bare File is two
+        // writes (the text, then "\n"), and the concurrent-vm tests append from
+        // several processes at once, so another call's line could land between
+        // them. The two lines would then fuse into one that no longer parses,
+        // and `Fake::calls` drops it. Seen in CI: a `start` that vm's own output
+        // shows it made was missing from the log.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 
