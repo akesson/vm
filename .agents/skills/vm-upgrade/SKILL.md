@@ -94,7 +94,19 @@ every later step fails halfway through. On 2026-11-21 the linux guest had a few
 GB left. A large apt run used all of it, which left a package half-configured,
 and the rustup and codex installs that came after it then died with `No space
 left on device`.
-Under ~5 GB free, stop and report before upgrading anything:
+
+What the free space allows, per guest. A low guest affects only its own steps.
+The other guests' sweeps go ahead as normal:
+
+| free | that guest |
+|---|---|
+| under ~5 GB | upgrade nothing on it; report it under §7 |
+| ~5–20 GB | tools only (apt/snap, brew, rustup, mise, claude, codex); skip `softwareupdate` / `windows-update.ps1` and say so |
+| over ~20 GB | everything |
+
+The 20 GB bar is for the OS updates: a macOS point release or a Windows
+feature update downloads several GB and needs room to unpack and stage them on
+top of that. 5 GB passes a guest that then fails halfway through one.
 
 ```sh
 vm run linux -- df -h / /home
@@ -106,6 +118,13 @@ vm run windows -- powershell -NoProfile -Command '[math]::Round((Get-PSDrive C).
 The usual space hogs are Cargo `target/` dirs in `~/work`, unused rustup
 toolchains (check `rust-toolchain.toml` and CI pins before removing one), and
 disabled snap revisions. Deleting any of them is the user's call (§7).
+
+A guest that ran out of space mid-apt can be left with dpkg interrupted, and
+apt then refuses to do anything (`E: dpkg was interrupted, you must manually
+run 'dpkg --configure -a'`). Once there is space again, run
+`vm run linux --elevated -- dpkg --configure -a`, then the apt step, and report
+it. It only finishes configuring packages that are already unpacked, and
+removes nothing. If it fails, stop there and ask (§7).
 
 ### linux (elevated: apt, snap · user: rustup, mise, claude, codex)
 ```sh
@@ -130,9 +149,12 @@ Homebrew owns codex on this guest, so `brew upgrade` updates it and there is no
 separate codex line. Do NOT run `codex update` here: it would fight brew for the
 binary.
 ```sh
-vm run macos -- 'brew update && brew upgrade && brew cleanup'  # brew REFUSES to run as root
+vm run macos -- 'brew update && brew upgrade; brew cleanup'   # brew REFUSES to run as root
                                           # a cask whose uninstaller calls sudo (e.g.
-                                          # git-credential-manager) fails here: report it
+                                          # git-credential-manager) fails here: report it.
+                                          # `;` not `&&`: that failure makes brew upgrade
+                                          # exit 1, and cleanup must run anyway or old
+                                          # versions pile up on the disk
 vm run macos -- rustup update
 vm run macos -- mise upgrade              # brew owns the binary; do NOT self-update
 vm run macos -- claude update
